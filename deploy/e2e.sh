@@ -87,16 +87,17 @@ for _ in $(seq 1 60); do "${CURL[@]}" -o /dev/null http://127.0.0.1:3320/healthz
 # servers, grants, the HOST's API key, release, deploy -> GOOD
 KEY="$(python3 -I deploy/e2e_mcp_setup.py "$REG" "$GW_ID" "$ADMIN" "$OPERATOR" "$REVIEWER")"
 [[ -n "$KEY" ]] || { echo "BLOCKED: MCP provisioning produced no key" >&2; exit 2; }
-printf '%s\n' "$KEY" > .local/host.key; chmod 644 .local/host.key   # the HOST container (uid 10001) reads it
-"${C[@]}" up -d host
+printf '%s\n' "$KEY" > .local/host.key; chmod 644 .local/host.key   # the HOST containers (uid 10001) read it
+"${C[@]}" up -d host host-worker
 for _ in $(seq 1 60); do "${CURL[@]}" -o /dev/null "$HOST/healthz" && break; sleep 0.5; done
 
 echo "published ports: $(docker ps --filter label=com.docker.compose.project=idp-host-go --format '{{.Ports}}' | tr ',' '\n' | grep -- '->' | sed 's/^ *//' | sort -u | tr '\n' ' ')"
 set +e
 IDP_E2E_HOST="$HOST" IDP_E2E_HOST_TENANT="$HTENANT" IDP_E2E_HOST_SECRET="$IDP_DEV_SECRET" IDP_E2E_MODEL="$MODEL" IDP_E2E_MODEL_NAME="$MODEL_NAME" \
-IDP_E2E_REGISTRY="$REG" IDP_E2E_MCP_TENANT="$TENANT" IDP_E2E_MCP_SECRET="$IDP_DEV_ADMIN_SECRET" IDP_E2E_METRICS=http://127.0.0.1:9465/metrics \
+IDP_E2E_REGISTRY="$REG" IDP_E2E_MCP_TENANT="$TENANT" IDP_E2E_MCP_SECRET="$IDP_DEV_ADMIN_SECRET" \
+IDP_E2E_METRICS=http://127.0.0.1:9465/metrics IDP_E2E_WORKER_METRICS=http://127.0.0.1:9466/metrics \
   go test -count=1 -v -run '^TestComposeHost$' ./tests/e2e/
 status=$?
 set -e
-[[ $status == 0 ]] || "${C[@]}" logs --tail 40 host mcp-gateway registry 2>/dev/null
+[[ $status == 0 ]] || "${C[@]}" logs --tail 40 host host-worker mcp-gateway registry 2>/dev/null
 exit $status

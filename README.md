@@ -24,7 +24,7 @@ IDP TELOS 的 Agent Hosting & Coordination：`idp-host` 一个二进制，同时
 
 | 路径 | 内容 |
 |---|---|
-| `cmd/idp-host` | 可执行程序（`serve` / `migrate` / `ensure-login` / `seed-tenant` / `dev-token` / `new-key`；配置见文件头部注释） |
+| `cmd/idp-host` | 可执行程序（`serve` = API + Worker 池；`worker` = 只跑 Worker 池，可独立扩缩；`migrate` / `ensure-login` / `seed-tenant` / `dev-token` / `new-key`；配置见文件头部注释） |
 | `internal/agent` | AgentRelease：定义、校验、密封与打开 |
 | `internal/run`、`harness`、`worker` | Run 模型；推理循环；认领与心跳 |
 | `internal/agui`、`api` | AG-UI 消息、RunAgentInput 与事件；REST + AG-UI + SSE |

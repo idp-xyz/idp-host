@@ -18,3 +18,8 @@ What is here:
 Rollout order: `idp-host new-key` → Secrets → migrate Job → Deployment. Replicas claim runs from
 the database with leases and fencing epochs, so scaling needs no coordination; a replica that dies
 mid-run loses its lease after `IDP_HOST_LEASE` and another one continues the run.
+
+The Deployment here runs API and workers together (`serve`). To scale them separately, add a second
+Deployment with `command: ["/usr/local/bin/idp-host", "worker"]` (no Service, no API port, same
+Secrets and ConfigMaps) and set `IDP_HOST_WORKERS: "0"` on the API Deployment - the compose topology
+in `deploy/compose.yaml` runs exactly that split.

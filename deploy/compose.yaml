@@ -126,7 +126,24 @@ services:
       IDP_DEV_SECRET: ${IDP_DEV_SECRET:?run deploy/e2e.sh}
       IDP_HOST_CREDENTIAL_KEY: ${IDP_HOST_CREDENTIAL_KEY:?run deploy/e2e.sh}
       IDP_HOST_CONFIG: /etc/idp/host.yaml
-      IDP_HOST_WORKERS: '2'
+      IDP_HOST_WORKERS: '0'     # API only; the worker pool runs in host-worker
       IDP_METRICS_LISTEN: 0.0.0.0:9465
+    volumes: ['../.local/host.yaml:/etc/idp/host.yaml:ro', '../.local/host.key:/etc/idp/host.key:ro']
+    depends_on: [registry, mcp-gateway]
+
+  # the worker pool as its own process (idp-host worker): scales independently of the API
+  host-worker:
+    <<: *hardened
+    image: ${IDP_HOST_IMAGE:-idp-host:dev}
+    command: [worker]
+    networks: [edge, upstream, data]
+    ports: ['127.0.0.1:9466:9466']   # the worker's own metrics (model steps, tool calls, runs)
+    environment:
+      IDP_DATABASE_URL: postgres://idp_host_svc:${IDP_HOST_DB_PASSWORD:?run deploy/e2e.sh}@postgres:5432/idp_host?sslmode=disable
+      IDP_DEV_MODE: 'true'
+      IDP_HOST_CREDENTIAL_KEY: ${IDP_HOST_CREDENTIAL_KEY:?run deploy/e2e.sh}
+      IDP_HOST_CONFIG: /etc/idp/host.yaml
+      IDP_HOST_WORKERS: '2'
+      IDP_METRICS_LISTEN: 0.0.0.0:9466
     volumes: ['../.local/host.yaml:/etc/idp/host.yaml:ro', '../.local/host.key:/etc/idp/host.key:ro']
     depends_on: [registry, mcp-gateway]

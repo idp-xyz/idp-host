@@ -232,15 +232,24 @@ func TestComposeHost(t *testing.T) {
 		}
 		check("gateway-audited-host-calls", st == 200 && seen["minimal__sum/svc-host/ALLOW"] && seen["minimal__echo/svc-host/ALLOW"], st, seen)
 	}
-	if e.metrics != "" {
-		resp, err := e.http.Get(e.metrics)
-		body := ""
-		if err == nil {
-			b, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			body = string(b)
+	// each process exposes its own metrics: the API its HTTP counters, the worker its runs and model steps
+	fetch := func(u string) string {
+		resp, err := e.http.Get(u)
+		if err != nil {
+			return ""
 		}
-		check("metrics-exposed", err == nil && strings.Contains(body, "idp_host_runs_finished_total") && strings.Contains(body, "idp_host_model_steps_total") && !strings.Contains(body, "carol"), err)
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return string(b)
+	}
+	if e.metrics != "" {
+		body := fetch(e.metrics)
+		check("api-metrics-exposed", strings.Contains(body, "idp_host_http_requests_total") && !strings.Contains(body, "carol"), len(body))
+	}
+	if wm := os.Getenv("IDP_E2E_WORKER_METRICS"); wm != "" {
+		body := fetch(wm)
+		check("worker-metrics-exposed", strings.Contains(body, "idp_host_runs_finished_total") && strings.Contains(body, "idp_host_model_steps_total") &&
+			strings.Contains(body, "idp_host_tool_calls_total") && !strings.Contains(body, "carol"), len(body))
 	}
 	t.Logf("compose end-to-end: %d checks", len(results))
 }

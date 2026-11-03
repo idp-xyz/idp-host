@@ -1,6 +1,7 @@
 // Command idp-host is the IDP HOST: Agent Hosting & Coordination (ADR-0001).
 //
-//	idp-host [serve]                          run the API and the worker pool (default)
+//	idp-host [serve]                          run the API and the worker pool (default; IDP_HOST_WORKERS=0 for API only)
+//	idp-host worker                           run the worker pool only (no API listener; scales independently)
 //	idp-host migrate                          apply schema migrations (owner connection)
 //	idp-host ensure-login USER                create/update a login role in idp_host_app;
 //	                                          password from IDP_APP_DB_PASSWORD[_FILE]
@@ -92,7 +93,9 @@ func main() {
 	var err error
 	switch cmd {
 	case "serve":
-		err = serve(log)
+		err = serve(log, true)
+	case "worker":
+		err = serve(log, false)
 	case "migrate":
 		var applied []string
 		applied, err = postgres.Migrate(context.Background(), env("IDP_MIGRATION_DATABASE_URL", ""))
@@ -144,7 +147,8 @@ func profile() identity.Profile {
 		TenantClaim: env("IDP_HOST_TENANT_CLAIM", "tenant_id"), RolesClaim: env("IDP_HOST_ROLES_CLAIM", "roles")}
 }
 
-func serve(log *slog.Logger) error {
+// serve runs the process: the API with a worker pool (apiEnabled), or the worker pool alone.
+func serve(log *slog.Logger, apiEnabled bool) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	tp, stopTracing, err := observability.Setup("idp-host", version, log)
@@ -165,6 +169,7 @@ func serve(log *slog.Logger) error {
 	prof := profile()
 	var verifier *identity.Verifier
 	switch {
+	case !apiEnabled: // the worker authenticates nobody
 	case prof.JWKSURL != "":
 		verifier = identity.NewVerifier(prof, &identity.JWKS{URL: prof.JWKSURL, HTTP: identityHTTP, TTL: 10 * time.Minute, MinRefresh: 30 * time.Second})
 	case dev && secret("IDP_DEV_SECRET") != "":
@@ -259,25 +264,21 @@ func serve(log *slog.Logger) error {
 	}
 
 	metrics := observability.NewMetrics()
-	srvAPI := &api.API{Store: store, Auth: verifier, Gateways: gatewayAuth, Providers: registry.Names(), Log: log, Metrics: metrics, Version: version}
 	if ms := observability.ServeMetrics(env("IDP_METRICS_LISTEN", ""), metrics, log); ms != nil {
 		defer ms.Close()
-	}
-	srv := &http.Server{Addr: env("IDP_HOST_LISTEN", "127.0.0.1:8450"), Handler: observability.HTTPMiddleware(tp, "idp-host/api", srvAPI.Handler()),
-		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 0, IdleTimeout: 120 * time.Second}
-	if cert := env("IDP_HOST_TLS_CERT_FILE", ""); cert != "" {
-		if srv.TLSConfig, err = transport.ServerTLS(cert, env("IDP_HOST_TLS_KEY_FILE", "")); err != nil {
-			return fmt.Errorf("TLS: %w", err)
-		}
 	}
 	workers, _ := strconv.Atoi(env("IDP_HOST_WORKERS", "2"))
 	lease, err := time.ParseDuration(env("IDP_HOST_LEASE", "30s"))
 	if err != nil {
 		return fmt.Errorf("IDP_HOST_LEASE: %w", err)
 	}
+	if !apiEnabled && workers <= 0 {
+		return errors.New("idp-host worker needs IDP_HOST_WORKERS >= 1")
+	}
 	hostname, _ := os.Hostname()
 	var wg sync.WaitGroup
 	wctx, cancelWorkers := context.WithCancel(ctx)
+	defer cancelWorkers()
 	if workers > 0 {
 		h := &harness.Harness{Store: store, Providers: registry, Gateways: gateways, Metrics: worker.NewMetrics(metrics), Log: log}
 		w := &worker.Worker{ID: env("IDP_HOST_INSTANCE", hostname), Store: store, Harness: h, Concurrency: workers, Lease: lease, Log: log}
@@ -286,6 +287,21 @@ func serve(log *slog.Logger) error {
 			defer wg.Done()
 			w.Run(wctx)
 		}()
+	}
+	if !apiEnabled {
+		log.Info("idp-host worker running", "instance", env("IDP_HOST_INSTANCE", hostname), "workers", workers, "providers", registry.Names(), "gateways", len(gateways))
+		<-ctx.Done()
+		cancelWorkers()
+		wg.Wait()
+		return nil
+	}
+	srvAPI := &api.API{Store: store, Auth: verifier, Gateways: gatewayAuth, Providers: registry.Names(), Log: log, Metrics: metrics, Version: version}
+	srv := &http.Server{Addr: env("IDP_HOST_LISTEN", "127.0.0.1:8450"), Handler: observability.HTTPMiddleware(tp, "idp-host/api", srvAPI.Handler()),
+		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 0, IdleTimeout: 120 * time.Second}
+	if cert := env("IDP_HOST_TLS_CERT_FILE", ""); cert != "" {
+		if srv.TLSConfig, err = transport.ServerTLS(cert, env("IDP_HOST_TLS_KEY_FILE", "")); err != nil {
+			return fmt.Errorf("TLS: %w", err)
+		}
 	}
 	errc := make(chan error, 1)
 	go func() {
