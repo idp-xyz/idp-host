@@ -91,6 +91,28 @@ services:
     command: [reference]
     networks: [upstream]
 
+  # MODE=oidc: development Keycloak with standard token exchange and delegation enabled
+  # (deploy/keycloak/realm.py generates the realm). Issuer = the URL clients use
+  # (http://127.0.0.1:7080/realms/idp); containers reach it as keycloak:7080 (backchannel). TEST DOUBLE.
+  keycloak:
+    image: ${IDP_KEYCLOAK_IMAGE:-quay.io/keycloak/keycloak:26.8.1}
+    profiles: [oidc]
+    command: [start-dev, --import-realm, --features, 'token-exchange-standard,token-exchange-delegation,parameterized-scopes']
+    networks: [edge, upstream]
+    ports: ['127.0.0.1:7080:7080']
+    environment:
+      KC_HTTP_PORT: '7080'
+      KC_HOSTNAME: http://127.0.0.1:7080
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: 'true'
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KC_BOOTSTRAP_ADMIN_USERNAME:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_BOOTSTRAP_ADMIN_PASSWORD:-admin}
+    volumes: ['../.local/keycloak:/opt/keycloak/data/import:ro']
+    healthcheck:
+      test: ['CMD', 'bash', '-c', 'exec 3<>/dev/tcp/127.0.0.1/7080']
+      interval: 3s
+      timeout: 3s
+      retries: 80
+
   # the deterministic model double (MODEL=fake); a live model is reached through host.docker.internal instead
   fakemodel:
     <<: *hardened
@@ -124,6 +146,10 @@ services:
       IDP_HOST_LISTEN: 0.0.0.0:8450
       IDP_DEV_MODE: 'true'
       IDP_DEV_SECRET: ${IDP_DEV_SECRET:?run deploy/e2e.sh}
+      # MODE=oidc: user tokens verified against Keycloak's JWKS (the dev secret is then unused)
+      IDP_HOST_JWKS_URL: ${IDP_HOST_JWKS_URL:-}
+      IDP_HOST_ISSUER: ${IDP_HOST_ISSUER:-idp-host-dev}
+      IDP_HOST_AUDIENCE: idp-host
       IDP_HOST_CREDENTIAL_KEY: ${IDP_HOST_CREDENTIAL_KEY:?run deploy/e2e.sh}
       IDP_HOST_CONFIG: /etc/idp/host.yaml
       IDP_HOST_WORKERS: '0'     # API only; the worker pool runs in host-worker

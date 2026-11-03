@@ -2,7 +2,7 @@
 
 IDP TELOS 的 Agent Hosting & Coordination：`idp-host` 一个二进制，同时是 API 与 Worker。设计决策见 [`docs/adr/ADR-0001-host-design.md`](docs/adr/ADR-0001-host-design.md)。
 
-状态：**M1（PATH A 全链路）已完成并实测**：Agent 定义与不可变发布（四眼）、Session / Thread / Run、持久化 Run 状态机与事件日志、租约 + fencing 的 Worker、Go 自研 harness、OpenAI 兼容与 Anthropic 两个模型适配器、经 idp-mcp 网关的工具调用（静态凭据或 RFC 8693 委派）、用户确认、AG-UI 流式接口、RLS、审计、指标、追踪、TLS、Kubernetes 清单；契约 `idp.telos.host` 1.0.0 已发布。真实模型门禁在本地 Qwen（OpenAI 与 Anthropic 两种线上格式）上通过。
+状态：**M1（PATH A 全链路）与 M2（可对外服务）已完成并实测**：Agent 定义与不可变发布（四眼）、Skill 注册与发布（嵌入 agent release）、Session / Thread / Run、持久化 Run 状态机与事件日志、租约 + fencing 的 Worker（可独立扩缩）、Go 自研 harness、OpenAI 兼容 / Anthropic / Gemini 三个模型适配器、经 idp-mcp 网关的工具调用（静态凭据或 RFC 8693 委派，与真实 Keycloak 联调通过）、用户确认、租户级配额与预算、AG-UI 流式接口、RLS、审计、指标、追踪、TLS、Kubernetes 清单；契约 `idp.telos.host` 1.1.0 已发布。真实模型门禁在本地 Qwen（OpenAI 与 Anthropic 两种线上格式）上通过。
 
 ## 组成
 
@@ -43,6 +43,7 @@ IDP TELOS 的 Agent Hosting & Coordination：`idp-host` 一个二进制，同时
 make test               # gofmt、vet、单元测试（-race）：适配器、harness、契约、OpenAPI、清单
 make test-integration   # Docker 中起临时 PostgreSQL，跑全链路集成测试（API + Worker + 假模型 + 假网关）
 bash deploy/e2e.sh      # 构建镜像，起 compose 拓扑（真实 idp-mcp 网关与 MCP SDK 上游、模型替身容器），跑端到端；KEEP=1 保留
+MODE=oidc bash deploy/e2e.sh  # 同上，身份来自 Keycloak：用户令牌经 JWKS 校验，HOST 以 RFC 8693 委派令牌调网关（审计主体 = 用户，actor = idp-host）
 IDP_LIVE_OPENAI_URL=http://127.0.0.1:8080/v1 IDP_LIVE_ANTHROPIC_URL=http://127.0.0.1:8080 IDP_LIVE_MODEL=<model> make test-live
 go test ./internal/run -run TestContract -update   # 改了 AgentRelease / Run 后重新生成契约示例
 ```

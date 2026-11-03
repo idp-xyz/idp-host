@@ -2,7 +2,8 @@
 register and approve the two upstreams, grant their tools to the operator role, mint an API key for
 the HOST's service identity, compile, approve and deploy a release, and print the key.
 
-Usage: python3 -I deploy/e2e_mcp_setup.py REGISTRY_URL GATEWAY_ID ADMIN_TOKEN OPERATOR_TOKEN REVIEWER_TOKEN
+Usage: python3 -I deploy/e2e_mcp_setup.py REGISTRY_URL GATEWAY_ID ADMIN_TOKEN OPERATOR_TOKEN REVIEWER_TOKEN [MODE]
+MODE=oidc skips the API key (the gateway is in jwt mode; the HOST brings delegated tokens).
 """
 import json
 import sys
@@ -11,6 +12,7 @@ import urllib.error
 import urllib.request
 
 reg, gateway_id, admin, operator, reviewer = sys.argv[1:6]
+mode = sys.argv[6] if len(sys.argv) > 6 else 'apikey'
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
@@ -45,7 +47,9 @@ for body in ({'serverId': ids['minimal'], 'tools': ['echo', 'sum'], 'roles': ['o
              {'serverId': ids['reference'], 'tools': ['test_simple_text'], 'roles': ['operator']}):
     g = must(operator, 'POST', '/api/v1/grants', body)
     must(reviewer, 'POST', f"/api/v1/grants/{g['grantId']}/approve")
-key = must(admin, 'POST', f'/api/v1/gateways/{gateway_id}/api-keys', {'subject': 'svc-host', 'roles': ['operator']})['key']
+key = ''
+if mode != 'oidc':
+    key = must(admin, 'POST', f'/api/v1/gateways/{gateway_id}/api-keys', {'subject': 'svc-host', 'roles': ['operator']})['key']
 rel = must(operator, 'POST', '/api/v1/releases', {'gatewayId': gateway_id})
 must(reviewer, 'POST', f"/api/v1/releases/{rel['releaseId']}/approve")
 must(admin, 'POST', f"/api/v1/releases/{rel['releaseId']}/deploy")

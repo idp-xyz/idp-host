@@ -5,10 +5,12 @@ package e2e
 
 import (
 	"bufio"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -45,12 +47,64 @@ func setup(t *testing.T) *env {
 var hostProfile = identity.Profile{Issuer: "idp-host-dev", Audience: "idp-host", TenantClaim: "tenant_id", RolesClaim: "roles"}
 var mcpProfile = identity.Profile{Issuer: "idp-mcp-dev", Audience: "idp-mcp-registry", TenantClaim: "tenant_id", RolesClaim: "roles"}
 
+// token returns a HOST credential for a test identity: an HS256 development token, or in MODE=oidc
+// a real Keycloak user's token obtained through the password grant (the users are defined in
+// deploy/keycloak/realm.py with the same roles).
 func (e *env) token(sub string, roles ...string) string {
-	tok, err := identity.DevToken([]byte(e.hostSecret), hostProfile, sub, e.hostTenant, roles, time.Hour)
+	if os.Getenv("IDP_E2E_MODE") != "oidc" {
+		tok, err := identity.DevToken([]byte(e.hostSecret), hostProfile, sub, e.hostTenant, roles, time.Hour)
+		if err != nil {
+			e.t.Fatal(err)
+		}
+		return tok
+	}
+	user := map[string]string{"alice": "alice", "bob": "hostapprover", "carol": "alice"}[sub]
+	for _, r := range roles {
+		if r == authorization.RoleAdmin {
+			user = "hostadmin"
+		}
+	}
+	raw, err := os.ReadFile(os.Getenv("IDP_E2E_KEYCLOAK_CLIENTS"))
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	return tok
+	var clients struct {
+		Users map[string]string `json:"users"`
+		Login struct {
+			ClientID string `json:"clientId"`
+			Secret   string `json:"secret"`
+		} `json:"host-login"`
+	}
+	_ = json.Unmarshal(raw, &clients)
+	resp, err := e.http.PostForm(os.Getenv("IDP_E2E_KEYCLOAK")+"/protocol/openid-connect/token", url.Values{"grant_type": {"password"},
+		"client_id": {clients.Login.ClientID}, "client_secret": {clients.Login.Secret}, "username": {user}, "password": {clients.Users[user]}})
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var out struct {
+		AccessToken string `json:"access_token"`
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = json.Unmarshal(body, &out)
+	if out.AccessToken == "" {
+		e.t.Fatalf("keycloak login for %s failed: HTTP %d %s", user, resp.StatusCode, body)
+	}
+	return out.AccessToken
+}
+
+// subjectOf decodes the sub claim of a JWT (no verification: test inspection only).
+func subjectOf(tok string) string {
+	parts := strings.Split(tok, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	raw, _ := base64.RawURLEncoding.DecodeString(parts[1])
+	var c struct {
+		Sub string `json:"sub"`
+	}
+	_ = json.Unmarshal(raw, &c)
+	return c.Sub
 }
 
 func (e *env) mcpToken(sub string, roles ...string) string {
@@ -215,22 +269,29 @@ func TestComposeHost(t *testing.T) {
 		check("confirmed-call-executed", dec["state"] == run.CallConfirmed && done["status"] == run.StatusCompleted && tool["role"] == "tool" && strings.Contains(fmt.Sprint(tool["content"]), "hi"), dec, done, tool)
 	}
 
-	// the gateway audited the HOST's calls under its service identity (records are shipped in batches)
+	// the gateway audited the HOST's calls: under its service identity (static key), or - with
+	// delegation - under the USER's identity with the HOST recorded as the actor (records ship in batches)
 	if e.registry != "" && e.mcpSecret != "" {
+		subject, actor := "svc-host", ""
+		if os.Getenv("IDP_E2E_MODE") == "oidc" {
+			subject, actor = subjectOf(usr), "idp-host"
+		}
+		want := func(tool string) string { return tool + "/" + subject + "/" + actor + "/ALLOW" }
 		var st int
 		seen := map[string]bool{}
-		for i := 0; i < 50 && !(seen["minimal__sum/svc-host/ALLOW"] && seen["minimal__echo/svc-host/ALLOW"]); i++ {
+		for i := 0; i < 50 && !(seen[want("minimal__sum")] && seen[want("minimal__echo")]); i++ {
 			var inv map[string]any
 			st, inv, _ = e.do(e.registry, e.mcpToken("bob", "reviewer"), "GET", "/api/v1/invocations", nil)
 			if st == 200 {
 				for _, it := range inv["items"].([]any) {
 					m := it.(map[string]any)
-					seen[fmt.Sprint(m["tool"])+"/"+fmt.Sprint(m["subject"])+"/"+fmt.Sprint(m["decision"])] = true
+					act, _ := m["actor"].(string)
+					seen[fmt.Sprint(m["tool"])+"/"+fmt.Sprint(m["subject"])+"/"+act+"/"+fmt.Sprint(m["decision"])] = true
 				}
 			}
 			time.Sleep(300 * time.Millisecond)
 		}
-		check("gateway-audited-host-calls", st == 200 && seen["minimal__sum/svc-host/ALLOW"] && seen["minimal__echo/svc-host/ALLOW"], st, seen)
+		check("gateway-audited-host-calls", st == 200 && seen[want("minimal__sum")] && seen[want("minimal__echo")], st, subject, actor, seen)
 	}
 	// each process exposes its own metrics: the API its HTTP counters, the worker its runs and model steps
 	fetch := func(u string) string {
