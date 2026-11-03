@@ -1,0 +1,366 @@
+// Package fakemodel is a deterministic model server for tests: it speaks the OpenAI Chat
+// Completions wire format (streaming and non-streaming, /v1/chat/completions) and the Anthropic
+// Messages wire format (streaming, /v1/messages). What it answers is decided by a Script over the
+// normalized conversation, so adapter tests, harness tests and the end-to-end suite share one
+// upstream. It is a test double, never a product component.
+package fakemodel
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strings"
+	"sync"
+	"sync/atomic"
+)
+
+// Turn is what the model answers.
+type Turn struct {
+	Text      string
+	Reasoning string
+	ToolCalls []Call
+	Status    int // non-zero: answer this HTTP status instead
+}
+
+// Call is a requested tool call.
+type Call struct {
+	Name string
+	Args string // JSON
+}
+
+// Message is the normalized view of the conversation a Script sees.
+type Message struct {
+	Role       string // system, user, assistant, tool
+	Content    string
+	ToolCalls  []Call
+	ToolCallID string
+}
+
+// Script decides the answer from the conversation and the offered tool names.
+type Script func(messages []Message, tools []string) Turn
+
+// Server is the fake.
+type Server struct {
+	Script Script
+	calls  atomic.Int64
+	mu     sync.Mutex
+	last   []Message
+	models []string
+}
+
+// New returns a server with the default script.
+func New() *Server {
+	return &Server{Script: DefaultScript, models: []string{"fake-1"}}
+}
+
+// Calls reports how many completion requests were served.
+func (s *Server) Calls() int64 { return s.calls.Load() }
+
+// Last returns the conversation of the last request.
+func (s *Server) Last() []Message {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]Message(nil), s.last...)
+}
+
+// DefaultScript: a user message mentioning "sum" calls sum_weights when offered; after a tool
+// result it reports the result; a user message starting with "fail:" makes the server answer 500;
+// otherwise it echoes.
+func DefaultScript(messages []Message, tools []string) Turn {
+	last := messages[len(messages)-1]
+	has := func(name string) bool {
+		for _, t := range tools {
+			if t == name || strings.HasSuffix(t, "__"+name) {
+				return true
+			}
+		}
+		return false
+	}
+	toolName := func(name string) string {
+		for _, t := range tools {
+			if t == name || strings.HasSuffix(t, "__"+name) {
+				return t
+			}
+		}
+		return name
+	}
+	switch last.Role {
+	case "tool":
+		return Turn{Text: "Result: " + last.Content}
+	case "user":
+		if strings.HasPrefix(last.Content, "fail:") {
+			return Turn{Status: 500}
+		}
+		if strings.Contains(strings.ToLower(last.Content), "sum") && has("sum") {
+			return Turn{Reasoning: "need the tool", ToolCalls: []Call{{Name: toolName("sum"), Args: `{"a":1,"b":2}`}}}
+		}
+		if strings.Contains(strings.ToLower(last.Content), "echo") && has("echo") {
+			return Turn{ToolCalls: []Call{{Name: toolName("echo"), Args: `{"text":"hi"}`}}}
+		}
+		return Turn{Text: "Echo: " + last.Content}
+	}
+	return Turn{Text: "ok"}
+}
+
+// Handler serves both wire formats.
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, r *http.Request) {
+		var data []map[string]any
+		for _, m := range s.models {
+			data = append(data, map[string]any{"id": m, "object": "model"})
+		}
+		writeJSON(w, 200, map[string]any{"object": "list", "data": data})
+	})
+	mux.HandleFunc("POST /v1/chat/completions", s.openai)
+	mux.HandleFunc("POST /v1/messages", s.anthropic)
+	return mux
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func (s *Server) decide(msgs []Message, tools []string) Turn {
+	s.calls.Add(1)
+	s.mu.Lock()
+	s.last = msgs
+	s.mu.Unlock()
+	return s.Script(msgs, tools)
+}
+
+// ---- OpenAI wire ----
+
+type oaiRequest struct {
+	Model    string `json:"model"`
+	Stream   bool   `json:"stream"`
+	Messages []struct {
+		Role       string          `json:"role"`
+		Content    json.RawMessage `json:"content"`
+		ToolCallID string          `json:"tool_call_id"`
+		ToolCalls  []struct {
+			ID       string `json:"id"`
+			Function struct {
+				Name      string `json:"name"`
+				Arguments string `json:"arguments"`
+			} `json:"function"`
+		} `json:"tool_calls"`
+	} `json:"messages"`
+	Tools []struct {
+		Function struct {
+			Name string `json:"name"`
+		} `json:"function"`
+	} `json:"tools"`
+	StreamOptions *struct {
+		IncludeUsage bool `json:"include_usage"`
+	} `json:"stream_options"`
+}
+
+func (s *Server) openai(w http.ResponseWriter, r *http.Request) {
+	var req oaiRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<20)).Decode(&req); err != nil {
+		writeJSON(w, 400, map[string]any{"error": map[string]any{"message": "bad json"}})
+		return
+	}
+	var msgs []Message
+	for _, m := range req.Messages {
+		var content string
+		_ = json.Unmarshal(m.Content, &content)
+		msg := Message{Role: m.Role, Content: content, ToolCallID: m.ToolCallID}
+		for _, c := range m.ToolCalls {
+			msg.ToolCalls = append(msg.ToolCalls, Call{Name: c.Function.Name, Args: c.Function.Arguments})
+		}
+		msgs = append(msgs, msg)
+	}
+	var tools []string
+	for _, t := range req.Tools {
+		tools = append(tools, t.Function.Name)
+	}
+	if len(msgs) == 0 {
+		writeJSON(w, 400, map[string]any{"error": map[string]any{"message": "no messages"}})
+		return
+	}
+	turn := s.decide(msgs, tools)
+	if turn.Status != 0 {
+		writeJSON(w, turn.Status, map[string]any{"error": map[string]any{"message": "scripted failure"}})
+		return
+	}
+	finish := "stop"
+	var toolCalls []map[string]any
+	for i, c := range turn.ToolCalls {
+		toolCalls = append(toolCalls, map[string]any{"index": i, "id": fmt.Sprintf("call_%d_%d", s.calls.Load(), i), "type": "function",
+			"function": map[string]any{"name": c.Name, "arguments": c.Args}})
+	}
+	if len(toolCalls) > 0 {
+		finish = "tool_calls"
+	}
+	usage := map[string]any{"prompt_tokens": 10 * len(msgs), "completion_tokens": 7, "total_tokens": 10*len(msgs) + 7}
+	if !req.Stream {
+		msg := map[string]any{"role": "assistant", "content": turn.Text}
+		if turn.Reasoning != "" {
+			msg["reasoning_content"] = turn.Reasoning
+		}
+		if len(toolCalls) > 0 {
+			msg["content"] = nil
+			msg["tool_calls"] = toolCalls
+		}
+		writeJSON(w, 200, map[string]any{"id": "chatcmpl-fake", "object": "chat.completion", "model": req.Model,
+			"choices": []any{map[string]any{"index": 0, "message": msg, "finish_reason": finish}}, "usage": usage})
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(200)
+	f, _ := w.(http.Flusher)
+	send := func(v any) {
+		b, _ := json.Marshal(v)
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
+		if f != nil {
+			f.Flush()
+		}
+	}
+	chunk := func(delta map[string]any, finish any) map[string]any {
+		return map[string]any{"id": "chatcmpl-fake", "object": "chat.completion.chunk", "model": req.Model,
+			"choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}}}
+	}
+	send(chunk(map[string]any{"role": "assistant", "content": ""}, nil))
+	if turn.Reasoning != "" {
+		send(chunk(map[string]any{"reasoning_content": turn.Reasoning}, nil))
+	}
+	for _, piece := range split(turn.Text, 5) {
+		send(chunk(map[string]any{"content": piece}, nil))
+	}
+	for i, c := range turn.ToolCalls {
+		id := fmt.Sprintf("call_%d_%d", s.calls.Load(), i)
+		send(chunk(map[string]any{"tool_calls": []any{map[string]any{"index": i, "id": id, "type": "function", "function": map[string]any{"name": c.Name, "arguments": ""}}}}, nil))
+		for _, piece := range split(c.Args, 4) {
+			send(chunk(map[string]any{"tool_calls": []any{map[string]any{"index": i, "function": map[string]any{"arguments": piece}}}}, nil))
+		}
+	}
+	send(chunk(map[string]any{}, finish))
+	if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
+		send(map[string]any{"id": "chatcmpl-fake", "object": "chat.completion.chunk", "model": req.Model, "choices": []any{}, "usage": usage})
+	}
+	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	if f != nil {
+		f.Flush()
+	}
+}
+
+// ---- Anthropic wire ----
+
+type antRequest struct {
+	Model    string `json:"model"`
+	Stream   bool   `json:"stream"`
+	System   string `json:"system"`
+	Messages []struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	} `json:"messages"`
+	Tools []struct {
+		Name string `json:"name"`
+	} `json:"tools"`
+}
+
+func (s *Server) anthropic(w http.ResponseWriter, r *http.Request) {
+	var req antRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<20)).Decode(&req); err != nil {
+		writeJSON(w, 400, map[string]any{"type": "error", "error": map[string]any{"type": "invalid_request_error", "message": "bad json"}})
+		return
+	}
+	var msgs []Message
+	if req.System != "" {
+		msgs = append(msgs, Message{Role: "system", Content: req.System})
+	}
+	for _, m := range req.Messages {
+		var text string
+		if err := json.Unmarshal(m.Content, &text); err == nil {
+			msgs = append(msgs, Message{Role: m.Role, Content: text})
+			continue
+		}
+		var blocks []map[string]any
+		_ = json.Unmarshal(m.Content, &blocks)
+		for _, b := range blocks {
+			switch b["type"] {
+			case "text":
+				t, _ := b["text"].(string)
+				msgs = append(msgs, Message{Role: m.Role, Content: t})
+			case "tool_use":
+				args, _ := json.Marshal(b["input"])
+				name, _ := b["name"].(string)
+				msgs = append(msgs, Message{Role: "assistant", ToolCalls: []Call{{Name: name, Args: string(args)}}})
+			case "tool_result":
+				id, _ := b["tool_use_id"].(string)
+				c, _ := b["content"].(string)
+				msgs = append(msgs, Message{Role: "tool", Content: c, ToolCallID: id})
+			}
+		}
+	}
+	var tools []string
+	for _, t := range req.Tools {
+		tools = append(tools, t.Name)
+	}
+	if len(msgs) == 0 {
+		writeJSON(w, 400, map[string]any{"type": "error", "error": map[string]any{"type": "invalid_request_error", "message": "no messages"}})
+		return
+	}
+	turn := s.decide(msgs, tools)
+	if turn.Status != 0 {
+		writeJSON(w, turn.Status, map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": "scripted failure"}})
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(200)
+	f, _ := w.(http.Flusher)
+	send := func(event string, v any) {
+		b, _ := json.Marshal(v)
+		_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
+		if f != nil {
+			f.Flush()
+		}
+	}
+	send("message_start", map[string]any{"type": "message_start", "message": map[string]any{"id": "msg_fake", "type": "message", "role": "assistant",
+		"model": req.Model, "content": []any{}, "usage": map[string]any{"input_tokens": 10 * len(msgs), "output_tokens": 0}}})
+	idx := 0
+	if turn.Reasoning != "" {
+		send("content_block_start", map[string]any{"type": "content_block_start", "index": idx, "content_block": map[string]any{"type": "thinking", "thinking": ""}})
+		send("content_block_delta", map[string]any{"type": "content_block_delta", "index": idx, "delta": map[string]any{"type": "thinking_delta", "thinking": turn.Reasoning}})
+		send("content_block_stop", map[string]any{"type": "content_block_stop", "index": idx})
+		idx++
+	}
+	if turn.Text != "" {
+		send("content_block_start", map[string]any{"type": "content_block_start", "index": idx, "content_block": map[string]any{"type": "text", "text": ""}})
+		for _, piece := range split(turn.Text, 5) {
+			send("content_block_delta", map[string]any{"type": "content_block_delta", "index": idx, "delta": map[string]any{"type": "text_delta", "text": piece}})
+		}
+		send("content_block_stop", map[string]any{"type": "content_block_stop", "index": idx})
+		idx++
+	}
+	stop := "end_turn"
+	for i, c := range turn.ToolCalls {
+		id := fmt.Sprintf("toolu_%d_%d", s.calls.Load(), i)
+		send("content_block_start", map[string]any{"type": "content_block_start", "index": idx, "content_block": map[string]any{"type": "tool_use", "id": id, "name": c.Name, "input": map[string]any{}}})
+		for _, piece := range split(c.Args, 4) {
+			send("content_block_delta", map[string]any{"type": "content_block_delta", "index": idx, "delta": map[string]any{"type": "input_json_delta", "partial_json": piece}})
+		}
+		send("content_block_stop", map[string]any{"type": "content_block_stop", "index": idx})
+		idx++
+		stop = "tool_use"
+	}
+	send("message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stop, "stop_sequence": nil}, "usage": map[string]any{"output_tokens": 7}})
+	send("message_stop", map[string]any{"type": "message_stop"})
+}
+
+func split(s string, n int) []string {
+	var out []string
+	r := []rune(s)
+	for i := 0; i < len(r); i += n {
+		j := i + n
+		if j > len(r) {
+			j = len(r)
+		}
+		out = append(out, string(r[i:j]))
+	}
+	return out
+}

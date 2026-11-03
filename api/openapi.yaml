@@ -1,0 +1,195 @@
+openapi: 3.1.0
+info:
+  title: IDP HOST API
+  version: 1.0.0
+  description: |
+    Agent Hosting & Coordination (docs/adr/ADR-0001-host-design.md). Three surfaces on one listener:
+    the administrative API (`/api/v1`, roles host-admin / host-approver) for agents and releases, the
+    user API (`/v1`, role host-user) for sessions, threads, runs and confirmations, and the AG-UI
+    endpoint (`/ag-ui`) that runs an agent and streams AG-UI events. Every request carries an OAuth
+    bearer token; objects are isolated per tenant by the database's row-level security.
+    internal/api/openapi_test.go keeps the paths in step with the router.
+servers:
+  - url: http://127.0.0.1:8450
+security:
+  - bearerAuth: []
+paths:
+  /healthz:
+    get: {summary: Liveness, security: [], responses: {'200': {description: alive}}}
+  /readyz:
+    get: {summary: Readiness (database reachable), security: [], responses: {'200': {description: ready}, '503': {description: not ready}}}
+  /version:
+    get: {summary: Service and version, security: [], responses: {'200': {description: version}}}
+  /api/v1/providers:
+    get:
+      summary: Configured model providers
+      responses: {'200': {description: provider names, content: {application/json: {schema: {type: object, properties: {providers: {type: array, items: {type: string}}}}}}}}
+  /api/v1/agents:
+    post:
+      summary: Create an agent with its draft definition
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/NewAgent'}}}}
+      responses: {'201': {description: created, content: {application/json: {schema: {$ref: '#/components/schemas/Agent'}}}}, '409': {$ref: '#/components/responses/Problem'}, '422': {$ref: '#/components/responses/Problem'}}
+    get:
+      summary: List the tenant's agents
+      responses: {'200': {description: agents, content: {application/json: {schema: {type: object, properties: {agents: {type: array, items: {$ref: '#/components/schemas/Agent'}}}}}}}}
+  /api/v1/agents/{ref}:
+    parameters: [{$ref: '#/components/parameters/ref'}]
+    get:
+      summary: Get an agent
+      responses: {'200': {description: agent, content: {application/json: {schema: {$ref: '#/components/schemas/Agent'}}}}, '404': {$ref: '#/components/responses/Problem'}}
+    patch:
+      summary: Update the display name and/or the draft definition
+      requestBody: {required: true, content: {application/json: {schema: {type: object, properties: {displayName: {type: string}, definition: {$ref: '#/components/schemas/Definition'}}}}}}
+      responses: {'200': {description: agent, content: {application/json: {schema: {$ref: '#/components/schemas/Agent'}}}}, '404': {$ref: '#/components/responses/Problem'}, '422': {$ref: '#/components/responses/Problem'}}
+  /api/v1/agents/{ref}/releases:
+    parameters: [{$ref: '#/components/parameters/ref'}]
+    post:
+      summary: Compile the draft definition into a candidate release
+      responses: {'201': {description: candidate, content: {application/json: {schema: {$ref: '#/components/schemas/Release'}}}}, '422': {$ref: '#/components/responses/Problem'}}
+    get:
+      summary: List releases, newest first
+      responses: {'200': {description: releases, content: {application/json: {schema: {type: object, properties: {releases: {type: array, items: {$ref: '#/components/schemas/Release'}}}}}}}}
+  /api/v1/agents/{ref}/set-current:
+    parameters: [{$ref: '#/components/parameters/ref'}]
+    post:
+      summary: Point the agent at an approved release (rollback / roll-forward)
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [releaseId], properties: {releaseId: {type: string}}}}}}
+      responses: {'200': {description: agent, content: {application/json: {schema: {$ref: '#/components/schemas/Agent'}}}}, '409': {$ref: '#/components/responses/Problem'}}
+  /api/v1/releases/{id}:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    get:
+      summary: Get a release
+      responses: {'200': {description: release, content: {application/json: {schema: {$ref: '#/components/schemas/Release'}}}}, '404': {$ref: '#/components/responses/Problem'}}
+  /api/v1/releases/{id}/envelope:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    get:
+      summary: The sealed envelope (document + digest) of an approved release
+      responses: {'200': {description: envelope (idp.telos.host Envelope)}, '404': {$ref: '#/components/responses/Problem'}}
+  /api/v1/releases/{id}/approve:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    post:
+      summary: Approve a candidate (four eyes - never its creator) and make it current
+      responses: {'200': {description: approved, content: {application/json: {schema: {$ref: '#/components/schemas/Release'}}}}, '403': {$ref: '#/components/responses/Problem'}, '409': {$ref: '#/components/responses/Problem'}}
+  /api/v1/releases/{id}/reject:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    post:
+      summary: Reject a candidate
+      requestBody: {required: true, content: {application/json: {schema: {type: object, properties: {reason: {type: string}}}}}}
+      responses: {'200': {description: rejected, content: {application/json: {schema: {$ref: '#/components/schemas/Release'}}}}, '409': {$ref: '#/components/responses/Problem'}}
+  /api/v1/audit:
+    get:
+      summary: Administrative audit events (newest first)
+      parameters: [{name: limit, in: query, schema: {type: integer}}]
+      responses: {'200': {description: events}}
+  /v1/sessions:
+    post:
+      summary: Create a session
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [title], properties: {title: {type: string}}}}}}
+      responses: {'201': {description: session, content: {application/json: {schema: {$ref: '#/components/schemas/Session'}}}}}
+    get:
+      summary: List the caller's sessions
+      responses: {'200': {description: sessions}}
+  /v1/sessions/{id}:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    get: {summary: Get a session, responses: {'200': {description: session, content: {application/json: {schema: {$ref: '#/components/schemas/Session'}}}}, '404': {$ref: '#/components/responses/Problem'}}}
+  /v1/threads:
+    post:
+      summary: Create a thread (id optional, session optional)
+      requestBody: {required: true, content: {application/json: {schema: {type: object, properties: {threadId: {type: string}, sessionId: {type: string}}}}}}
+      responses: {'201': {description: thread, content: {application/json: {schema: {$ref: '#/components/schemas/Thread'}}}}, '409': {$ref: '#/components/responses/Problem'}}
+  /v1/threads/{id}:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    get: {summary: Get a thread, responses: {'200': {description: thread, content: {application/json: {schema: {$ref: '#/components/schemas/Thread'}}}}, '404': {$ref: '#/components/responses/Problem'}}}
+  /v1/threads/{id}/messages:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    get: {summary: The thread's messages in order (AG-UI messages), responses: {'200': {description: messages}}}
+  /v1/threads/{id}/runs:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    get: {summary: The thread's runs, oldest first, responses: {'200': {description: runs}}}
+  /v1/agents/{ref}/runs:
+    parameters: [{$ref: '#/components/parameters/ref'}]
+    post:
+      summary: Queue a run (RunAgentInput); Idempotency-Key makes retries safe
+      parameters: [{name: Idempotency-Key, in: header, required: false, schema: {type: string}, description: defaults to runId}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/RunAgentInput'}}}}
+      responses: {'202': {description: queued, content: {application/json: {schema: {$ref: '#/components/schemas/Run'}}}}, '200': {description: replayed (same key, same content)}, '403': {$ref: '#/components/responses/Problem'}, '409': {$ref: '#/components/responses/Problem'}, '422': {$ref: '#/components/responses/Problem'}}
+  /v1/runs/{id}:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    get: {summary: Get a run, responses: {'200': {description: run, content: {application/json: {schema: {$ref: '#/components/schemas/Run'}}}}, '404': {$ref: '#/components/responses/Problem'}}}
+  /v1/runs/{id}/tool-calls:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    get: {summary: The run's tool calls (pending confirmations included), responses: {'200': {description: tool calls}}}
+  /v1/runs/{id}/tool-calls/{call}/decide:
+    parameters: [{$ref: '#/components/parameters/id'}, {name: call, in: path, required: true, schema: {type: string}}]
+    post:
+      summary: The owner confirms or rejects a pending tool call; the run resumes when none is pending
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [decision], properties: {decision: {type: string, enum: [confirm, reject]}}}}}}
+      responses: {'200': {description: decided, content: {application/json: {schema: {$ref: '#/components/schemas/ToolCall'}}}}, '403': {$ref: '#/components/responses/Problem'}, '409': {$ref: '#/components/responses/Problem'}}
+  /v1/runs/{id}/cancel:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    post: {summary: Cancel a queued or waiting run at once; ask a running one to stop, responses: {'200': {description: run, content: {application/json: {schema: {$ref: '#/components/schemas/Run'}}}}}}
+  /v1/runs/{id}/events:
+    parameters: [{$ref: '#/components/parameters/id'}, {name: after, in: query, schema: {type: integer}, description: event id to resume after (also Last-Event-ID)}, {name: limit, in: query, schema: {type: integer}}]
+    get:
+      summary: The run's AG-UI events, as a JSON page or, with Accept text/event-stream, as a resumable stream that ends at RUN_FINISHED / RUN_ERROR
+      responses: {'200': {description: events (JSON or SSE)}, '404': {$ref: '#/components/responses/Problem'}}
+  /ag-ui/agents/{ref}:
+    parameters: [{$ref: '#/components/parameters/ref'}]
+    post:
+      summary: AG-UI run - RunAgentInput in, AG-UI events out (Server-Sent Events); X-Run-Id names the run
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/RunAgentInput'}}}}
+      responses: {'200': {description: event stream, content: {text/event-stream: {}}}, '403': {$ref: '#/components/responses/Problem'}, '409': {$ref: '#/components/responses/Problem'}, '422': {$ref: '#/components/responses/Problem'}}
+components:
+  securitySchemes:
+    bearerAuth: {type: http, scheme: bearer, bearerFormat: JWT}
+  parameters:
+    ref: {name: ref, in: path, required: true, schema: {type: string}, description: agent id or name}
+    id: {name: id, in: path, required: true, schema: {type: string}}
+  responses:
+    Problem:
+      description: error
+      content: {application/json: {schema: {type: object, properties: {error: {type: object, properties: {code: {type: string}, message: {type: string}}}}}}}
+  schemas:
+    Definition:
+      description: The editable part of an agent; fixed by a release (contract idp.telos.host Definition).
+      type: object
+      required: [instructions, model, tools, confirmation, limits]
+      properties:
+        instructions: {type: string}
+        model: {type: object, required: [provider, model], properties: {provider: {type: string}, model: {type: string}, temperature: {type: number}, maxOutputTokens: {type: integer}, fallbacks: {type: array, items: {type: object, properties: {provider: {type: string}, model: {type: string}}}}}}
+        tools: {type: object, required: [allow], properties: {gateway: {type: string}, allow: {type: array, items: {type: string}}}}
+        confirmation: {type: object, required: [default], properties: {default: {type: string, enum: [auto, confirm]}, tools: {type: object, additionalProperties: {type: string, enum: [auto, confirm]}}}}
+        limits: {type: object, properties: {maxSteps: {type: integer}, maxToolCallsPerStep: {type: integer}, runTimeoutSeconds: {type: integer}, confirmationTimeoutSeconds: {type: integer}}}
+    NewAgent:
+      type: object
+      required: [name, displayName, definition]
+      properties: {name: {type: string}, displayName: {type: string}, definition: {$ref: '#/components/schemas/Definition'}}
+    Agent:
+      type: object
+      properties: {agentId: {type: string}, name: {type: string}, displayName: {type: string}, definition: {$ref: '#/components/schemas/Definition'}, currentReleaseId: {type: [string, 'null']}, createdBy: {type: string}, createdAt: {type: string, format: date-time}, updatedAt: {type: string, format: date-time}}
+    Release:
+      type: object
+      properties: {releaseId: {type: string}, agentId: {type: string}, version: {type: integer}, status: {type: string, enum: [CANDIDATE, APPROVED, REJECTED, SUPERSEDED]}, digest: {type: [string, 'null']}, document: {type: object}, createdBy: {type: string}, approvedBy: {type: [string, 'null']}, createdAt: {type: string, format: date-time}, approvedAt: {type: [string, 'null'], format: date-time}}
+    Session:
+      type: object
+      properties: {sessionId: {type: string}, owner: {type: string}, title: {type: string}, createdAt: {type: string, format: date-time}}
+    Thread:
+      type: object
+      properties: {threadId: {type: string}, sessionId: {type: [string, 'null']}, owner: {type: string}, agentId: {type: [string, 'null']}, messageCount: {type: integer}, createdAt: {type: string, format: date-time}}
+    Message:
+      description: AG-UI message (developer, system, user, assistant, tool)
+      type: object
+      required: [id, role]
+      properties: {id: {type: string}, role: {type: string}, content: {type: string}, name: {type: string}, toolCalls: {type: array, items: {type: object}}, toolCallId: {type: string}, error: {type: string}}
+    RunAgentInput:
+      description: AG-UI RunAgentInput; tools are frontend tools the HOST never executes, state is ignored
+      type: object
+      required: [messages]
+      properties: {threadId: {type: string}, runId: {type: string}, parentRunId: {type: string}, state: {}, messages: {type: array, items: {$ref: '#/components/schemas/Message'}}, tools: {type: array, items: {type: object}}, context: {type: array, items: {type: object}}, forwardedProps: {}}
+    Run:
+      description: contract idp.telos.host AgentRun
+      type: object
+      properties: {runId: {type: string}, threadId: {type: string}, agentId: {type: string}, releaseId: {type: string}, releaseDigest: {type: string}, owner: {type: string}, status: {type: string, enum: [QUEUED, RUNNING, AWAITING_INPUT, COMPLETED, FAILED, CANCELED]}, stepCount: {type: integer}, cancelRequested: {type: boolean}, failureCode: {type: string}, failureMessage: {type: string}, executionRef: {type: string}, traceId: {type: string}, deadlineAt: {type: string, format: date-time}, createdAt: {type: string, format: date-time}, startedAt: {type: string, format: date-time}, finishedAt: {type: string, format: date-time}}
+    ToolCall:
+      type: object
+      properties: {runId: {type: string}, toolCallId: {type: string}, step: {type: integer}, messageId: {type: string}, tool: {type: string}, arguments: {type: string}, argumentsSha256: {type: string}, state: {type: string, enum: [PENDING_CONFIRMATION, CONFIRMED, REJECTED, EXPIRED, EXECUTING, DONE, FAILED, FRONTEND, DENIED]}, confirmationExpiresAt: {type: string, format: date-time}, decidedBy: {type: string}, decidedAt: {type: string, format: date-time}, result: {type: string}, isError: {type: boolean}, createdAt: {type: string, format: date-time}, finishedAt: {type: string, format: date-time}}

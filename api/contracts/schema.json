@@ -1,0 +1,152 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:idp:telos:host:1.0.0",
+  "title": "idp.telos.host 1.0.0",
+  "description": "idp-host（Agent Hosting & Coordination）对外发布的契约：AgentRelease（agent 行为的不可变发布件，ADR-0001 D2）、Envelope（AgentRelease 加内容摘要）和 AgentRun（一次运行的记录，API 返回的形态）。生产者是 idp-host，权威副本在 idp-host/api/contracts/，由 go test ./internal/run -run TestContract 保证与实现一致；idp-contracts 中的副本只能与之逐字节相同。JSON Schema 只描述形状与可本地判定的规则；摘要是否匹配由 agent.Open 判定，运行时不变量由 HOST 的状态机判定。",
+  "oneOf": [
+    {"$ref": "#/$defs/AgentRelease"},
+    {"$ref": "#/$defs/Envelope"},
+    {"$ref": "#/$defs/AgentRun"}
+  ],
+  "$defs": {
+    "AgentRelease": {
+      "title": "AgentRelease",
+      "description": "一个 agent 的一次发布：编号、创建与审批信息，以及固定下来的定义（指令、模型、工具、确认策略、限制）。审批人参与摘要。schemaVersion 固定为 idp.host.agent/v1。",
+      "x-idp-telos-owner": "idp.telos.host",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "releaseId", "tenantId", "agentId", "agentName", "version", "createdAt", "createdBy", "definition"],
+      "properties": {
+        "schemaVersion": {"const": "idp.host.agent/v1"},
+        "releaseId": {"type": "string", "minLength": 1},
+        "tenantId": {"type": "string", "minLength": 1},
+        "agentId": {"type": "string", "minLength": 1},
+        "agentName": {"type": "string", "pattern": "^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$"},
+        "version": {"type": "integer", "minimum": 1},
+        "createdAt": {"type": "string", "format": "date-time"},
+        "createdBy": {"type": "string", "minLength": 1},
+        "approvedBy": {"type": "string", "minLength": 1},
+        "definition": {"$ref": "#/$defs/Definition"}
+      }
+    },
+    "Definition": {
+      "title": "Definition",
+      "description": "agent 行为的全部输入：系统指令、模型配置、工具策略、确认策略与限制。",
+      "x-idp-telos-owner": "idp.telos.host",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["instructions", "model", "tools", "confirmation", "limits"],
+      "properties": {
+        "instructions": {"type": "string", "minLength": 1, "maxLength": 65536},
+        "model": {"$ref": "#/$defs/ModelProfile"},
+        "tools": {"$ref": "#/$defs/ToolPolicy"},
+        "confirmation": {"$ref": "#/$defs/ConfirmationPolicy"},
+        "limits": {"$ref": "#/$defs/Limits"}
+      }
+    },
+    "ModelProfile": {
+      "title": "ModelProfile",
+      "description": "模型选择：provider 是 HOST 配置里登记的名字，fallbacks 按序在主 provider 失败时尝试。",
+      "x-idp-telos-owner": "idp.telos.host",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "model"],
+      "properties": {
+        "provider": {"type": "string", "pattern": "^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$"},
+        "model": {"type": "string", "minLength": 1, "maxLength": 256},
+        "temperature": {"type": "number", "minimum": 0, "maximum": 2},
+        "maxOutputTokens": {"type": "integer", "minimum": 0},
+        "fallbacks": {"type": "array", "items": {"$ref": "#/$defs/ModelRef"}}
+      }
+    },
+    "ModelRef": {
+      "title": "ModelRef",
+      "description": "一个 provider 与模型 id。",
+      "x-idp-telos-owner": "idp.telos.host",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "model"],
+      "properties": {
+        "provider": {"type": "string", "pattern": "^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$"},
+        "model": {"type": "string", "minLength": 1}
+      }
+    },
+    "ToolPolicy": {
+      "title": "ToolPolicy",
+      "description": "agent 可用的工具：gateway 是 HOST 配置里登记的 MCP 网关名，allow 是网关对调用者暴露的工具名（\"*\" = 全部）；空 allow 表示没有工具。",
+      "x-idp-telos-owner": "idp.telos.host",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allow"],
+      "properties": {
+        "gateway": {"type": "string", "pattern": "^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$"},
+        "allow": {"type": "array", "items": {"type": "string", "pattern": "^([A-Za-z0-9_.-]{1,128}|\\*)$"}}
+      }
+    },
+    "ConfirmationPolicy": {
+      "title": "ConfirmationPolicy",
+      "description": "哪些工具调用要先经 Run 所有者确认（ADR-0001 D7）：default 对所有工具生效，tools 按工具覆盖。",
+      "x-idp-telos-owner": "idp.telos.host",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["default"],
+      "properties": {
+        "default": {"enum": ["auto", "confirm"]},
+        "tools": {"type": "object", "additionalProperties": {"enum": ["auto", "confirm"]}}
+      }
+    },
+    "Limits": {
+      "title": "Limits",
+      "description": "一次 Run 的上限：步数、每步工具调用数、运行时限、确认等待时限（秒）。",
+      "x-idp-telos-owner": "idp.telos.host",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["maxSteps", "maxToolCallsPerStep", "runTimeoutSeconds", "confirmationTimeoutSeconds"],
+      "properties": {
+        "maxSteps": {"type": "integer", "minimum": 1, "maximum": 200},
+        "maxToolCallsPerStep": {"type": "integer", "minimum": 1, "maximum": 64},
+        "runTimeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 86400},
+        "confirmationTimeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 86400}
+      }
+    },
+    "Envelope": {
+      "title": "Envelope",
+      "description": "存储与分发的形态：AgentRelease 加其摘要（规范化 JSON 的 sha256:<hex>）。",
+      "x-idp-telos-owner": "idp.telos.host",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["digest", "document"],
+      "properties": {
+        "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "document": {"$ref": "#/$defs/AgentRelease"}
+      }
+    },
+    "AgentRun": {
+      "title": "AgentRun",
+      "description": "一次运行的记录（HOST 的权威状态，ADR-0001 D3）：线程、agent 与运行它的 release 摘要、所有者、状态机状态、步数、失败原因、给 EER 预留的 executionRef、追踪 id 与时间。其他系统用 runId 引用它，不复制它的状态。",
+      "x-idp-telos-owner": "idp.telos.host",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runId", "threadId", "agentId", "releaseId", "releaseDigest", "owner", "status", "stepCount", "cancelRequested", "deadlineAt", "createdAt"],
+      "properties": {
+        "runId": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"},
+        "threadId": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"},
+        "agentId": {"type": "string", "minLength": 1},
+        "releaseId": {"type": "string", "minLength": 1},
+        "releaseDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "owner": {"type": "string", "minLength": 1},
+        "status": {"enum": ["QUEUED", "RUNNING", "AWAITING_INPUT", "COMPLETED", "FAILED", "CANCELED"]},
+        "stepCount": {"type": "integer", "minimum": 0},
+        "cancelRequested": {"type": "boolean"},
+        "failureCode": {"type": "string", "minLength": 1},
+        "failureMessage": {"type": "string", "minLength": 1},
+        "executionRef": {"type": "string", "minLength": 1, "description": "EER 的 Execution 引用，预留（ADR-0001 D10）"},
+        "traceId": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "deadlineAt": {"type": "string", "format": "date-time"},
+        "createdAt": {"type": "string", "format": "date-time"},
+        "startedAt": {"type": "string", "format": "date-time"},
+        "finishedAt": {"type": "string", "format": "date-time"}
+      }
+    }
+  }
+}

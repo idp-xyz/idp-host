@@ -1,0 +1,188 @@
+# idp-host: API and worker pool in one Deployment. Replicas claim runs from the shared database
+# (lease + fencing), so any number may run; each names its leases after its pod (IDP_HOST_INSTANCE).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: idp-host
+  namespace: idp-host
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: idp-host-env
+  namespace: idp-host
+data:
+  IDP_HOST_LISTEN: "0.0.0.0:8450"
+  IDP_HOST_CONFIG: "/etc/idp/config/host.yaml"
+  IDP_HOST_WORKERS: "2"
+  IDP_HOST_LEASE: "30s"
+  IDP_HOST_ISSUER: "https://idp.example.com/realms/idp"
+  IDP_HOST_AUDIENCE: "idp-host"
+  IDP_HOST_JWKS_URL: "https://idp.example.com/realms/idp/protocol/openid-connect/certs"
+  IDP_HOST_TENANT_CLAIM: "tenant_id"
+  IDP_HOST_ROLES_CLAIM: "roles"
+  IDP_HOST_TLS_CERT_FILE: "/etc/idp/tls/tls.crt"
+  IDP_HOST_TLS_KEY_FILE: "/etc/idp/tls/tls.key"
+  IDP_IDENTITY_CA_FILE: "/etc/idp/identity-ca/ca.crt"
+  IDP_HOST_CREDENTIAL_KEY_FILE: "/etc/idp/credential-key/key"
+  IDP_METRICS_LISTEN: "0.0.0.0:9465"
+  IDP_LOG_LEVEL: "info"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector.observability.svc.cluster.local:4318"
+---
+# Providers and gateways (no secrets inside: credentials are referenced as files from the Secrets).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: idp-host-providers
+  namespace: idp-host
+data:
+  host.yaml: |
+    providers:
+      - name: default
+        kind: openai
+        baseUrl: https://models.example.com/v1
+        apiKeyFile: /etc/idp/provider-keys/default
+    gateways:
+      - name: edge
+        endpoint: https://idp-mcp-gateway-edge-1.idp-mcp.svc.cluster.local:3220/mcp
+        caFile: /etc/idp/gateway-ca/ca.crt
+        auth:
+          mode: delegation
+          tokenEndpoint: https://idp.example.com/realms/idp/protocol/openid-connect/token
+          clientId: idp-host
+          clientSecretFile: /etc/idp/gateway-client/client-secret
+          audience: https://mcp.example.com/mcp
+          actorToken: true
+          caFile: /etc/idp/identity-ca/ca.crt
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: idp-host
+  namespace: idp-host
+  labels:
+    app.kubernetes.io/component: host
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: host
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: host
+    spec:
+      serviceAccountName: idp-host
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: host
+          image: idp-host
+          command: ["/usr/local/bin/idp-host", "serve"]
+          ports:
+            - name: api
+              containerPort: 8450
+            - name: metrics
+              containerPort: 9465
+          envFrom:
+            - configMapRef:
+                name: idp-host-env
+          env:
+            - name: IDP_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: idp-host-db
+                  key: service-url
+            - name: IDP_HOST_INSTANCE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: config
+              mountPath: /etc/idp/config
+              readOnly: true
+            - name: tls
+              mountPath: /etc/idp/tls
+              readOnly: true
+            - name: identity-ca
+              mountPath: /etc/idp/identity-ca
+              readOnly: true
+            - name: credential-key
+              mountPath: /etc/idp/credential-key
+              readOnly: true
+            - name: provider-keys
+              mountPath: /etc/idp/provider-keys
+              readOnly: true
+            - name: gateway-client
+              mountPath: /etc/idp/gateway-client
+              readOnly: true
+            - name: gateway-ca
+              mountPath: /etc/idp/gateway-ca
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: api
+              scheme: HTTPS
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: api
+              scheme: HTTPS
+            periodSeconds: 20
+          resources:
+            requests: {cpu: 200m, memory: 128Mi}
+            limits: {cpu: "2", memory: 1Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: config
+          configMap:
+            name: idp-host-providers
+        - name: tls
+          secret:
+            secretName: idp-host-tls
+        - name: identity-ca
+          secret:
+            secretName: idp-host-identity-ca
+        - name: credential-key
+          secret:
+            secretName: idp-host-credential-key
+        - name: provider-keys
+          secret:
+            secretName: idp-host-provider-keys
+        - name: gateway-client
+          secret:
+            secretName: idp-host-gateway-client
+        - name: gateway-ca
+          secret:
+            secretName: idp-host-gateway-ca
+            optional: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: idp-host
+  namespace: idp-host
+  labels:
+    app.kubernetes.io/component: host
+spec:
+  selector:
+    app.kubernetes.io/component: host
+  ports:
+    - name: api
+      port: 8450
+      targetPort: api

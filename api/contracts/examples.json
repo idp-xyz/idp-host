@@ -1,0 +1,194 @@
+{
+  "description": "idp.telos.host 1.0.0 的示例：每一个都是 idp-host 实际产出的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录）。",
+  "generatedBy": "go test ./internal/run -run TestContract -update",
+  "examples": [
+    {
+      "definition": "AgentRelease",
+      "value": {
+        "agentId": "9e8d7c6b-0000-4000-8000-000000000002",
+        "agentName": "parcel-assistant",
+        "approvedBy": "bob",
+        "createdAt": "2026-11-03T12:00:00Z",
+        "createdBy": "alice",
+        "definition": {
+          "confirmation": {
+            "default": "auto",
+            "tools": {
+              "parcel__create_shipment": "confirm"
+            }
+          },
+          "instructions": "You help operators with parcels. Use tools for facts; never invent shipment data.",
+          "limits": {
+            "confirmationTimeoutSeconds": 1800,
+            "maxSteps": 12,
+            "maxToolCallsPerStep": 4,
+            "runTimeoutSeconds": 600
+          },
+          "model": {
+            "fallbacks": [
+              {
+                "model": "claude-sonnet-5-5",
+                "provider": "cloud"
+              }
+            ],
+            "maxOutputTokens": 2048,
+            "model": "qwen3.8-flash",
+            "provider": "local",
+            "temperature": 0.2
+          },
+          "tools": {
+            "allow": [
+              "parcel__create_shipment",
+              "parcel__get_shipment"
+            ],
+            "gateway": "edge"
+          }
+        },
+        "releaseId": "7f3c1a2e-5b6d-4c8e-9f01-23456789abcd",
+        "schemaVersion": "idp.host.agent/v1",
+        "tenantId": "1a2b3c4d-0000-4000-8000-000000000001",
+        "version": 3
+      }
+    },
+    {
+      "definition": "AgentRelease",
+      "value": {
+        "agentId": "4f5e6d7c-0000-4000-8000-000000000003",
+        "agentName": "faq",
+        "createdAt": "2026-11-03T12:30:00Z",
+        "createdBy": "alice",
+        "definition": {
+          "confirmation": {
+            "default": "auto"
+          },
+          "instructions": "Answer questions about the handbook.",
+          "limits": {
+            "confirmationTimeoutSeconds": 900,
+            "maxSteps": 10,
+            "maxToolCallsPerStep": 8,
+            "runTimeoutSeconds": 300
+          },
+          "model": {
+            "model": "qwen3.8-flash",
+            "provider": "local"
+          },
+          "tools": {
+            "allow": []
+          }
+        },
+        "releaseId": "0b1c2d3e-5b6d-4c8e-9f01-23456789abce",
+        "schemaVersion": "idp.host.agent/v1",
+        "tenantId": "1a2b3c4d-0000-4000-8000-000000000001",
+        "version": 1
+      }
+    },
+    {
+      "definition": "Envelope",
+      "value": {
+        "digest": "sha256:583f24bdda30076cc81434508d7c51f8dc9c0874293f70a331207f966e274cac",
+        "document": {
+          "agentId": "9e8d7c6b-0000-4000-8000-000000000002",
+          "agentName": "parcel-assistant",
+          "approvedBy": "bob",
+          "createdAt": "2026-11-03T12:00:00Z",
+          "createdBy": "alice",
+          "definition": {
+            "confirmation": {
+              "default": "auto",
+              "tools": {
+                "parcel__create_shipment": "confirm"
+              }
+            },
+            "instructions": "You help operators with parcels. Use tools for facts; never invent shipment data.",
+            "limits": {
+              "confirmationTimeoutSeconds": 1800,
+              "maxSteps": 12,
+              "maxToolCallsPerStep": 4,
+              "runTimeoutSeconds": 600
+            },
+            "model": {
+              "fallbacks": [
+                {
+                  "model": "claude-sonnet-5-5",
+                  "provider": "cloud"
+                }
+              ],
+              "maxOutputTokens": 2048,
+              "model": "qwen3.8-flash",
+              "provider": "local",
+              "temperature": 0.2
+            },
+            "tools": {
+              "allow": [
+                "parcel__create_shipment",
+                "parcel__get_shipment"
+              ],
+              "gateway": "edge"
+            }
+          },
+          "releaseId": "7f3c1a2e-5b6d-4c8e-9f01-23456789abcd",
+          "schemaVersion": "idp.host.agent/v1",
+          "tenantId": "1a2b3c4d-0000-4000-8000-000000000001",
+          "version": 3
+        }
+      }
+    },
+    {
+      "definition": "AgentRun",
+      "value": {
+        "agentId": "9e8d7c6b-0000-4000-8000-000000000002",
+        "cancelRequested": false,
+        "createdAt": "2026-11-03T13:00:00Z",
+        "deadlineAt": "2026-11-03T13:10:00Z",
+        "finishedAt": "2026-11-03T13:00:09Z",
+        "owner": "carol",
+        "releaseDigest": "sha256:583f24bdda30076cc81434508d7c51f8dc9c0874293f70a331207f966e274cac",
+        "releaseId": "7f3c1a2e-5b6d-4c8e-9f01-23456789abcd",
+        "runId": "run_01JD7Q3Z8M8T0G3C6N4V9S2A1B",
+        "startedAt": "2026-11-03T13:00:01Z",
+        "status": "COMPLETED",
+        "stepCount": 2,
+        "threadId": "thr-ops-42",
+        "traceId": "4bf92f3577b34da6a3ce929d0e0e4736"
+      }
+    },
+    {
+      "definition": "AgentRun",
+      "value": {
+        "agentId": "9e8d7c6b-0000-4000-8000-000000000002",
+        "cancelRequested": false,
+        "createdAt": "2026-11-03T13:10:00Z",
+        "deadlineAt": "2026-11-03T13:20:00Z",
+        "owner": "carol",
+        "releaseDigest": "sha256:583f24bdda30076cc81434508d7c51f8dc9c0874293f70a331207f966e274cac",
+        "releaseId": "7f3c1a2e-5b6d-4c8e-9f01-23456789abcd",
+        "runId": "run_01JD7Q3Z8M8T0G3C6N4V9S2A1C",
+        "startedAt": "2026-11-03T13:10:01Z",
+        "status": "AWAITING_INPUT",
+        "stepCount": 1,
+        "threadId": "thr-ops-42"
+      }
+    },
+    {
+      "definition": "AgentRun",
+      "value": {
+        "agentId": "9e8d7c6b-0000-4000-8000-000000000002",
+        "cancelRequested": false,
+        "createdAt": "2026-11-03T13:20:00Z",
+        "deadlineAt": "2026-11-03T13:30:00Z",
+        "executionRef": "eer:execution:0192f3a1",
+        "failureCode": "STEP_LIMIT",
+        "failureMessage": "the run reached its limit of 12 steps",
+        "finishedAt": "2026-11-03T13:25:00Z",
+        "owner": "carol",
+        "releaseDigest": "sha256:583f24bdda30076cc81434508d7c51f8dc9c0874293f70a331207f966e274cac",
+        "releaseId": "7f3c1a2e-5b6d-4c8e-9f01-23456789abcd",
+        "runId": "run_01JD7Q3Z8M8T0G3C6N4V9S2A1D",
+        "startedAt": "2026-11-03T13:20:01Z",
+        "status": "FAILED",
+        "stepCount": 12,
+        "threadId": "thr-ops-43"
+      }
+    }
+  ]
+}

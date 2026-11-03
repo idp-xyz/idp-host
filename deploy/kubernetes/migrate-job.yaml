@@ -1,0 +1,43 @@
+# Schema migrations, run as the schema owner before a new image version is rolled out
+# (`idp-host serve` refuses to start on a schema that is not at the version it needs).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: idp-host-migrate
+  namespace: idp-host
+  labels:
+    app.kubernetes.io/component: migrate
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: idp-host
+          command: ["/usr/local/bin/idp-host", "migrate"]
+          env:
+            - name: IDP_MIGRATION_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: idp-host-db
+                  key: owner-url
+          resources:
+            requests: {cpu: 50m, memory: 32Mi}
+            limits: {cpu: 500m, memory: 128Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

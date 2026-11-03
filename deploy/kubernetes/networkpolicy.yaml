@@ -1,0 +1,116 @@
+# Network policy: default deny, then exactly the flows the HOST needs. Model endpoints and the IdP
+# are outside the cluster here (ipBlock placeholders); replace them with your addresses.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: idp-host
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: idp-host
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+# host: ingress on the API port from client namespaces and the ingress controller, metrics from
+# the monitoring namespace; egress to PostgreSQL, the MCP gateway, the IdP, the model endpoints and
+# the trace collector.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: host
+  namespace: idp-host
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: host
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              idp-host/clients: "true"
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress
+      ports:
+        - {protocol: TCP, port: 8450}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+      ports:
+        - {protocol: TCP, port: 9465}
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: databases
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgresql
+      ports:
+        - {protocol: TCP, port: 5432}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: idp-mcp
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/component: gateway
+      ports:
+        - {protocol: TCP, port: 3220}
+    - to:
+        - ipBlock:
+            cidr: 203.0.113.10/32       # the IdP (JWKS, token endpoint)
+      ports:
+        - {protocol: TCP, port: 443}
+    - to:
+        - ipBlock:
+            cidr: 203.0.113.20/32       # model endpoints
+      ports:
+        - {protocol: TCP, port: 443}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+      ports:
+        - {protocol: TCP, port: 4318}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: migrate
+  namespace: idp-host
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: migrate
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: databases
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgresql
+      ports:
+        - {protocol: TCP, port: 5432}

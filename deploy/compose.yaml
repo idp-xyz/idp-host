@@ -1,0 +1,132 @@
+# idp-host development topology: the HOST + the real MCP Infrastructure (idp-mcp registry and
+# gateway, from its published image) + PostgreSQL + two real MCP SDK servers as the gateway's
+# upstreams + a model endpoint on the Docker host (the deterministic double by default, a live
+# server with MODEL=live). Driven by deploy/e2e.sh, which generates the secrets in .local/compose.env
+# and the HOST's providers/gateways file in .local/host.yaml. The host sees 127.0.0.1:8450 (HOST),
+# 127.0.0.1:8250 (registry), 127.0.0.1:3320 (gateway) and 127.0.0.1:9465 (HOST metrics).
+# DEV ONLY: HS256 development tokens, plaintext http on the private networks.
+name: idp-host-go
+
+x-hardened: &hardened
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ['no-new-privileges:true']
+
+networks:
+  edge: {}                     # published ports only
+  upstream: {internal: true}   # gateway, registry (discovery), upstream MCP servers, host -> gateway
+  data: {internal: true}       # registry, host, postgres
+
+volumes:
+  pgdata: {}
+
+services:
+  postgres:
+    image: ${IDP_PG_IMAGE:-public.ecr.aws/docker/library/postgres:17-alpine}
+    networks: [data]
+    environment:
+      POSTGRES_PASSWORD: ${IDP_PG_OWNER_PASSWORD:?run deploy/e2e.sh}
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -h 127.0.0.1 -U postgres']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # ---- MCP Infrastructure (idp-mcp, published image) ----
+  registry-admin:
+    <<: *hardened
+    image: ${IDP_MCP_IMAGE:-idp-mcp:dev}
+    profiles: [tools]
+    entrypoint: [/usr/local/bin/registry-service]
+    networks: [data]
+    environment:
+      IDP_MIGRATION_DATABASE_URL: postgres://postgres:${IDP_PG_OWNER_PASSWORD:?run deploy/e2e.sh}@postgres:5432/postgres?sslmode=disable
+      IDP_APP_DB_PASSWORD: ${IDP_APP_DB_PASSWORD:?run deploy/e2e.sh}
+      IDP_DEV_MODE: 'true'
+      IDP_DEV_ADMIN_SECRET: ${IDP_DEV_ADMIN_SECRET:?run deploy/e2e.sh}
+    depends_on: {postgres: {condition: service_healthy}}
+
+  registry:
+    <<: *hardened
+    image: ${IDP_MCP_IMAGE:-idp-mcp:dev}
+    entrypoint: [/usr/local/bin/registry-service]
+    command: [serve]
+    networks: [edge, upstream, data]
+    ports: ['127.0.0.1:8250:8250']
+    environment:
+      IDP_DATABASE_URL: postgres://idp_mcp_svc:${IDP_APP_DB_PASSWORD:?run deploy/e2e.sh}@postgres:5432/postgres?sslmode=disable
+      IDP_REGISTRY_LISTEN: 0.0.0.0:8250
+      IDP_DEV_MODE: 'true'
+      IDP_DEV_ADMIN_SECRET: ${IDP_DEV_ADMIN_SECRET:?run deploy/e2e.sh}
+      IDP_ALLOWED_UPSTREAM_HOSTS: minimal,reference
+      IDP_PRIVATE_UPSTREAM_HOSTS: minimal,reference
+    depends_on: {postgres: {condition: service_healthy}}
+
+  mcp-gateway:
+    <<: *hardened
+    image: ${IDP_MCP_IMAGE:-idp-mcp:dev}
+    entrypoint: [/usr/local/bin/mcp-gateway]
+    networks: [edge, upstream]
+    ports: ['127.0.0.1:3320:3320']
+    tmpfs: ['/var/cache/idp:uid=10001,gid=10001,mode=0700']
+    environment:
+      IDP_GATEWAY_ID: ${IDP_GATEWAY_ID:-pending}
+      IDP_GATEWAY_TOKEN: ${IDP_GATEWAY_TOKEN:-pending}
+      IDP_REGISTRY_URL: http://registry:8250
+      IDP_GATEWAY_LISTEN: 0.0.0.0:3320
+      IDP_GATEWAY_ALLOWED_HOSTS: mcp-gateway,mcp-gateway:3320   # the HOST calls it by service name
+      IDP_RELEASE_CACHE: /var/cache/idp/release.json
+    depends_on: [registry, minimal, reference]
+
+  minimal:
+    <<: *hardened
+    image: ${IDP_FIXTURE_IMAGE:-idp-fixture-upstream:local}
+    command: [minimal]
+    networks: [upstream]
+
+  reference:
+    <<: *hardened
+    image: ${IDP_FIXTURE_IMAGE:-idp-fixture-upstream:local}
+    command: [reference]
+    networks: [upstream]
+
+  # the deterministic model double (MODEL=fake); a live model is reached through host.docker.internal instead
+  fakemodel:
+    <<: *hardened
+    image: ${IDP_FAKEMODEL_IMAGE:-idp-host-fakemodel:dev}
+    networks: [upstream]
+    environment:
+      IDP_FAKEMODEL_LISTEN: 0.0.0.0:18080
+
+  # ---- HOST ----
+  host-admin:
+    <<: *hardened
+    image: ${IDP_HOST_IMAGE:-idp-host:dev}
+    profiles: [tools]
+    networks: [data]
+    environment:
+      IDP_MIGRATION_DATABASE_URL: postgres://postgres:${IDP_PG_OWNER_PASSWORD:?run deploy/e2e.sh}@postgres:5432/idp_host?sslmode=disable
+      IDP_APP_DB_PASSWORD: ${IDP_HOST_DB_PASSWORD:?run deploy/e2e.sh}
+      IDP_DEV_MODE: 'true'
+      IDP_DEV_SECRET: ${IDP_DEV_SECRET:?run deploy/e2e.sh}
+    depends_on: {postgres: {condition: service_healthy}}
+
+  host:
+    <<: *hardened
+    image: ${IDP_HOST_IMAGE:-idp-host:dev}
+    command: [serve]
+    networks: [edge, upstream, data]
+    ports: ['127.0.0.1:8450:8450', '127.0.0.1:9465:9465']
+    extra_hosts: ['host.docker.internal:host-gateway']   # the model endpoint on the Docker host
+    environment:
+      IDP_DATABASE_URL: postgres://idp_host_svc:${IDP_HOST_DB_PASSWORD:?run deploy/e2e.sh}@postgres:5432/idp_host?sslmode=disable
+      IDP_HOST_LISTEN: 0.0.0.0:8450
+      IDP_DEV_MODE: 'true'
+      IDP_DEV_SECRET: ${IDP_DEV_SECRET:?run deploy/e2e.sh}
+      IDP_HOST_CREDENTIAL_KEY: ${IDP_HOST_CREDENTIAL_KEY:?run deploy/e2e.sh}
+      IDP_HOST_CONFIG: /etc/idp/host.yaml
+      IDP_HOST_WORKERS: '2'
+      IDP_METRICS_LISTEN: 0.0.0.0:9465
+    volumes: ['../.local/host.yaml:/etc/idp/host.yaml:ro', '../.local/host.key:/etc/idp/host.key:ro']
+    depends_on: [registry, mcp-gateway]

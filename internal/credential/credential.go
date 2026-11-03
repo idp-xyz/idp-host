@@ -1,0 +1,143 @@
+// Package credential keeps the delegated gateway token of a run (ADR-0001 D8): obtained from the
+// authorization server by RFC 8693 token exchange when the run is created, stored encrypted with
+// the HOST's key, decrypted only by the worker that executes the run's tool calls.
+package credential
+
+import (
+	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+)
+
+// Box encrypts and decrypts with AES-256-GCM.
+type Box struct{ aead cipher.AEAD }
+
+// NewBox takes a 32-byte key.
+func NewBox(key []byte) (*Box, error) {
+	if len(key) != 32 {
+		return nil, errors.New("credential key must be 32 bytes")
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	return &Box{aead: aead}, nil
+}
+
+// Seal encrypts plain (nonce prepended).
+func (b *Box) Seal(plain []byte) ([]byte, error) {
+	nonce := make([]byte, b.aead.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, err
+	}
+	return append(nonce, b.aead.Seal(nil, nonce, plain, nil)...), nil
+}
+
+// Open decrypts a sealed value.
+func (b *Box) Open(sealed []byte) ([]byte, error) {
+	n := b.aead.NonceSize()
+	if len(sealed) < n {
+		return nil, errors.New("sealed value too short")
+	}
+	return b.aead.Open(nil, sealed[:n], sealed[n:], nil)
+}
+
+// Exchanger performs RFC 8693 token exchange: the user's access token (subject) is exchanged, by
+// the HOST acting as an OAuth client, for a token whose audience is the gateway resource and whose
+// act claim names the HOST (delegation). The authorization server decides whether the user may be
+// represented by this client (Keycloak: may_act on the subject token).
+type Exchanger struct {
+	TokenEndpoint string
+	ClientID      string
+	ClientSecret  string
+	Audience      string // the gateway's client / resource identifier at the authorization server
+	HTTP          *http.Client
+}
+
+// Token is an exchanged token.
+type Token struct {
+	AccessToken string
+	ExpiresAt   time.Time
+}
+
+// Exchange trades subjectToken for a delegated token. actorToken, when non-empty, is sent as the
+// actor_token (delegation profile); otherwise the client credentials identify the actor.
+func (e *Exchanger) Exchange(ctx context.Context, subjectToken, actorToken string) (*Token, error) {
+	form := url.Values{}
+	form.Set("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange")
+	form.Set("subject_token", subjectToken)
+	form.Set("subject_token_type", "urn:ietf:params:oauth:token-type:access_token")
+	form.Set("requested_token_type", "urn:ietf:params:oauth:token-type:access_token")
+	if e.Audience != "" {
+		form.Set("audience", e.Audience)
+	}
+	if actorToken != "" {
+		form.Set("actor_token", actorToken)
+		form.Set("actor_token_type", "urn:ietf:params:oauth:token-type:access_token")
+	}
+	return e.post(ctx, form)
+}
+
+// ClientCredentials obtains the HOST's own token (used as actor_token when the server requires it).
+func (e *Exchanger) ClientCredentials(ctx context.Context) (*Token, error) {
+	form := url.Values{}
+	form.Set("grant_type", "client_credentials")
+	return e.post(ctx, form)
+}
+
+func (e *Exchanger) post(ctx context.Context, form url.Values) (*Token, error) {
+	form.Set("client_id", e.ClientID)
+	form.Set("client_secret", e.ClientSecret)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.TokenEndpoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	resp, err := e.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("token endpoint unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		var e struct {
+			Error string `json:"error"`
+		}
+		_ = json.Unmarshal(body, &e)
+		return nil, fmt.Errorf("token exchange refused (HTTP %d%s)", resp.StatusCode, suffix(e.Error))
+	}
+	var out struct {
+		AccessToken string `json:"access_token"`
+		ExpiresIn   int64  `json:"expires_in"`
+		TokenType   string `json:"token_type"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil || out.AccessToken == "" {
+		return nil, errors.New("token endpoint returned no access token")
+	}
+	exp := time.Now().Add(time.Duration(out.ExpiresIn) * time.Second)
+	if out.ExpiresIn <= 0 {
+		exp = time.Now().Add(5 * time.Minute)
+	}
+	return &Token{AccessToken: out.AccessToken, ExpiresAt: exp}, nil
+}
+
+func suffix(code string) string {
+	if code == "" {
+		return ""
+	}
+	return ", " + code
+}
