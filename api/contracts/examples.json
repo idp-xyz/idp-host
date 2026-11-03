@@ -1,5 +1,5 @@
 {
-  "description": "idp.telos.host 1.0.0 的示例：每一个都是 idp-host 实际产出的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录）。",
+  "description": "idp.telos.host 1.2.0 的示例：每一个都是 idp-host 实际产出或原样接受的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录，RunOptions 经 run.ParseOptions 解析后原样往返）。",
   "generatedBy": "go test ./internal/run -run TestContract -update",
   "examples": [
     {
@@ -287,6 +287,21 @@
         "status": "FAILED",
         "stepCount": 12,
         "threadId": "thr-ops-43"
+      }
+    },
+    {
+      "definition": "RunOptions",
+      "value": {
+        "idp.host/executionRef": "execution:shipment-7f3a",
+        "idp.host/maxOutputTokens": 1024,
+        "idp.host/releaseDigest": "sha256:99c909fc3287bae693b7ca356444e14cd6a840ad5e4963c091b93c24d498f2ef",
+        "idp.host/toolExecution": "caller"
+      }
+    },
+    {
+      "definition": "RunOptions",
+      "value": {
+        "idp.host/releaseDigest": "sha256:99c909fc3287bae693b7ca356444e14cd6a840ad5e4963c091b93c24d498f2ef"
       }
     }
   ]

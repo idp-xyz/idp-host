@@ -1,10 +1,11 @@
 package run_test
 
-// The published contract idp.telos.host 1.0.0 (idp-contracts/idp.telos.host/1.0.0) is produced
-// here. api/contracts/schema.json is written by hand; these tests prove it describes exactly what
-// the agent package seals and what the API serves as a run record. api/contracts/examples.json is
-// generated from Go values (go test ./internal/run -run TestContract -update) and checked on every
-// run, so every published example is a document the implementation actually produces.
+// The published contract idp.telos.host (idp-contracts/idp.telos.host/<version>) is produced here.
+// api/contracts/schema.json is written by hand; these tests prove it describes exactly what the
+// agent package seals, what the API serves as a run record and which caller options the API
+// accepts. api/contracts/examples.json is generated from Go values (go test ./internal/run -run
+// TestContract -update) and checked on every run, so every published example is a document the
+// implementation actually produces (releases, runs) or accepts unchanged (run options).
 
 import (
 	"bytes"
@@ -30,7 +31,7 @@ var update = flag.Bool("update", false, "regenerate api/contracts/examples.json 
 
 const (
 	contractDir = "../../api/contracts"
-	contractID  = "urn:idp:telos:host:1.1.0"
+	contractID  = "urn:idp:telos:host:1.2.0"
 )
 
 type noLoader struct{}
@@ -84,7 +85,7 @@ func (k *contract) schema(def string) *jsonschema.Schema {
 	return s
 }
 
-var roots = map[string]bool{"AgentRelease": true, "SkillRelease": true, "Envelope": true, "AgentRun": true}
+var roots = map[string]bool{"AgentRelease": true, "SkillRelease": true, "Envelope": true, "AgentRun": true, "RunOptions": true}
 
 func (k *contract) validate(def string, raw []byte) error {
 	inst, err := jsonschema.UnmarshalJSON(bytes.NewReader(raw))
@@ -142,6 +143,14 @@ func exampleRuns(releaseID, digest string) []run.Run {
 	}
 }
 
+// exampleOptions: what EER sends for one agent turn, and a caller that only pins a release.
+func exampleOptions(digest string) []run.Options {
+	return []run.Options{
+		{ExecutionRef: "execution:shipment-7f3a", ToolExecution: run.ToolExecutionCaller, ReleaseDigest: digest, MaxOutputTokens: 1024},
+		{ReleaseDigest: digest},
+	}
+}
+
 type example struct {
 	Definition string          `json:"definition"`
 	Value      json.RawMessage `json:"value"`
@@ -184,8 +193,11 @@ func buildExamples(t *testing.T) []byte {
 	for _, r := range exampleRuns(full.ReleaseID, fullEnv.Digest) {
 		add("AgentRun", r)
 	}
+	for _, o := range exampleOptions(fullEnv.Digest) {
+		add("RunOptions", o)
+	}
 	b, err := json.MarshalIndent(examplesFile{
-		Description: "idp.telos.host 1.0.0 的示例：每一个都是 idp-host 实际产出的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录）。",
+		Description: "idp.telos.host 1.2.0 的示例：每一个都是 idp-host 实际产出或原样接受的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录，RunOptions 经 run.ParseOptions 解析后原样往返）。",
 		GeneratedBy: "go test ./internal/run -run TestContract -update",
 		Examples:    out,
 	}, "", "  ")
@@ -254,6 +266,16 @@ func TestContractExamplesAreGeneratedAndValid(t *testing.T) {
 			if want, _ := canonical.Canonical(x.Value); !bytes.Equal(back, want) {
 				t.Errorf("example %d: run record does not round-trip:\n%s\n%s", i, want, back)
 			}
+		case "RunOptions":
+			o, err := run.ParseOptions(x.Value)
+			if err != nil {
+				t.Errorf("example %d: the API rejects the published RunOptions: %v", i, err)
+				continue
+			}
+			back, _ := canonical.Canonical(o)
+			if want, _ := canonical.Canonical(x.Value); !bytes.Equal(back, want) {
+				t.Errorf("example %d: run options do not round-trip:\n%s\n%s", i, want, back)
+			}
 		}
 	}
 	for def := range roots {
@@ -286,7 +308,8 @@ func TestContractFieldsMatchGo(t *testing.T) {
 	}
 	closed := map[string]any{"AgentRelease": agent.Document{}, "Definition": agent.Definition{}, "ModelProfile": agent.ModelProfile{}, "ModelRef": agent.ModelRef{},
 		"ToolPolicy": agent.ToolPolicy{}, "ConfirmationPolicy": agent.ConfirmationPolicy{}, "Limits": agent.Limits{}, "Envelope": agent.Envelope{}, "AgentRun": run.Run{},
-		"SkillRef": agent.SkillRef{}, "SkillDefinition": agent.SkillDefinition{}, "EmbeddedSkill": agent.EmbeddedSkill{}, "SkillRelease": agent.SkillDocument{}}
+		"SkillRef": agent.SkillRef{}, "SkillDefinition": agent.SkillDefinition{}, "EmbeddedSkill": agent.EmbeddedSkill{}, "SkillRelease": agent.SkillDocument{},
+		"RunOptions": run.Options{}}
 	for def, zero := range closed {
 		d, ok := defs[def].(map[string]any)
 		if !ok {
@@ -441,5 +464,41 @@ func TestContractRejectsWhatOpenRejects(t *testing.T) {
 		if err := k.validate("AgentRun", raw); err == nil {
 			t.Errorf("run %s: schema accepts it", name)
 		}
+	}
+	// every option value the API refuses (422) is refused by the schema too
+	optionCases := map[string]struct {
+		key   string
+		value any
+	}{
+		"unknown option":            {"idp.host/unknown", 1},
+		"tool execution both":       {run.OptToolExecution, "both"},
+		"tool execution null":       {run.OptToolExecution, nil},
+		"digest malformed":          {run.OptReleaseDigest, "sha256:zz"},
+		"digest uppercase":          {run.OptReleaseDigest, "sha256:" + strings.Repeat("AB", 32)},
+		"max tokens zero":           {run.OptMaxOutputTokens, 0},
+		"max tokens over the cap":   {run.OptMaxOutputTokens, 1<<20 + 1},
+		"max tokens as text":        {run.OptMaxOutputTokens, "512"},
+		"execution ref empty":       {run.OptExecutionRef, ""},
+		"execution ref with space":  {run.OptExecutionRef, "has space"},
+		"execution ref too long":    {run.OptExecutionRef, strings.Repeat("x", 257)},
+		"execution ref not visible": {run.OptExecutionRef, "tab\there"},
+	}
+	opts := exampleOptions(env.Digest)[0]
+	for name, c := range optionCases {
+		b, _ := json.Marshal(opts)
+		var m map[string]any
+		_ = json.Unmarshal(b, &m)
+		m[c.key] = c.value
+		raw, _ := canonical.Canonical(m)
+		if err := k.validate("RunOptions", raw); err == nil {
+			t.Errorf("options %s: schema accepts it", name)
+		}
+		if _, err := run.ParseOptions(raw); err == nil {
+			t.Errorf("options %s: the API accepts it", name)
+		}
+	}
+	// the schema describes only the idp.host/ keys: the API ignores the caller's other keys
+	if _, err := run.ParseOptions(json.RawMessage(`{"app/theme":"dark","idp.host/toolExecution":"server"}`)); err != nil {
+		t.Errorf("the API rejects a caller's own forwardedProps key: %v", err)
 	}
 }

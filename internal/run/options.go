@@ -18,12 +18,13 @@ const (
 	OptMaxOutputTokens = "idp.host/maxOutputTokens"
 )
 
-// Options are the parsed caller options.
+// Options are the parsed caller options. Their JSON form is the contract object RunOptions
+// (idp.telos.host 1.2.0): the idp.host/ keys of forwardedProps.
 type Options struct {
-	ExecutionRef    string // reference to the caller's execution (EER), recorded on the run
-	ToolExecution   string // "" or ToolExecutionCaller
-	ReleaseDigest   string // run exactly this approved release of the agent
-	MaxOutputTokens int
+	ExecutionRef    string `json:"idp.host/executionRef,omitempty"`    // reference to the caller's execution (EER), recorded on the run
+	ToolExecution   string `json:"idp.host/toolExecution,omitempty"`   // "" (server) or ToolExecutionCaller
+	ReleaseDigest   string `json:"idp.host/releaseDigest,omitempty"`   // run exactly this approved release of the agent
+	MaxOutputTokens int    `json:"idp.host/maxOutputTokens,omitempty"` // caps the release's model output limit
 }
 
 var (

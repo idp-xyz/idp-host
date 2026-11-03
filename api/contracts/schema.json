@@ -1,13 +1,14 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:idp:telos:host:1.1.0",
-  "title": "idp.telos.host 1.1.0",
-  "description": "idp-host（Agent Hosting & Coordination）对外发布的契约：AgentRelease（agent 行为的不可变发布件，ADR-0001 D2；1.1.0 起可嵌入 Skill，D17）、SkillRelease（skill 的不可变发布件）、Envelope（发布件加内容摘要）和 AgentRun（一次运行的记录，API 返回的形态）。生产者是 idp-host，权威副本在 idp-host/api/contracts/，由 go test ./internal/run -run TestContract 保证与实现一致；idp-contracts 中的副本只能与之逐字节相同。JSON Schema 只描述形状与可本地判定的规则；摘要是否匹配由 agent.Open / agent.OpenSkill 判定，运行时不变量由 HOST 的状态机判定。",
+  "$id": "urn:idp:telos:host:1.2.0",
+  "title": "idp.telos.host 1.2.0",
+  "description": "idp-host（Agent Hosting & Coordination）对外发布的契约：AgentRelease（agent 行为的不可变发布件，ADR-0001 D2；1.1.0 起可嵌入 Skill，D17）、SkillRelease（skill 的不可变发布件）、Envelope（发布件加内容摘要）、AgentRun（一次运行的记录，API 返回的形态）和 RunOptions（1.2.0 起：创建运行时的调用方选项，D19）。生产者是 idp-host，权威副本在 idp-host/api/contracts/，由 go test ./internal/run -run TestContract 保证与实现一致；idp-contracts 中的副本只能与之逐字节相同。JSON Schema 只描述形状与可本地判定的规则；摘要是否匹配由 agent.Open / agent.OpenSkill 判定，运行时不变量由 HOST 的状态机判定。",
   "oneOf": [
     {"$ref": "#/$defs/AgentRelease"},
     {"$ref": "#/$defs/SkillRelease"},
     {"$ref": "#/$defs/Envelope"},
-    {"$ref": "#/$defs/AgentRun"}
+    {"$ref": "#/$defs/AgentRun"},
+    {"$ref": "#/$defs/RunOptions"}
   ],
   "$defs": {
     "AgentRelease": {
@@ -186,7 +187,7 @@
     },
     "AgentRun": {
       "title": "AgentRun",
-      "description": "一次运行的记录（HOST 的权威状态，ADR-0001 D3）：线程、agent 与运行它的 release 摘要、所有者、状态机状态、步数、失败原因、给 EER 预留的 executionRef、追踪 id 与时间。其他系统用 runId 引用它，不复制它的状态。",
+      "description": "一次运行的记录（HOST 的权威状态，ADR-0001 D3）：线程、agent 与运行它的 release 摘要、所有者、状态机状态、步数、失败原因、调用方（EER）的 executionRef、追踪 id 与时间。其他系统用 runId 引用它，不复制它的状态。",
       "x-idp-telos-owner": "idp.telos.host",
       "type": "object",
       "additionalProperties": false,
@@ -203,12 +204,26 @@
         "cancelRequested": {"type": "boolean"},
         "failureCode": {"type": "string", "minLength": 1},
         "failureMessage": {"type": "string", "minLength": 1},
-        "executionRef": {"type": "string", "minLength": 1, "description": "EER 的 Execution 引用，预留（ADR-0001 D10）"},
+        "executionRef": {"type": "string", "minLength": 1, "description": "调用方（EER）的 Execution 引用，由 RunOptions 的 idp.host/executionRef 设置（ADR-0001 D10、D19）"},
         "traceId": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
         "deadlineAt": {"type": "string", "format": "date-time"},
         "createdAt": {"type": "string", "format": "date-time"},
         "startedAt": {"type": "string", "format": "date-time"},
         "finishedAt": {"type": "string", "format": "date-time"}
+      }
+    },
+    "RunOptions": {
+      "title": "RunOptions",
+      "description": "创建运行时的调用方选项（ADR-0001 D19）：RunAgentInput.forwardedProps 中 idp.host/ 开头的键组成的对象，AG-UI（POST /ag-ui/agents/{ref}）与 REST（POST /v1/agents/{ref}/runs）两个入口都接受。本定义只描述 idp.host/ 键：forwardedProps 里其他命名空间的键属于调用方，HOST 原样保存、不解释，不在本契约内；idp.host/ 下的未知键与任何不合规的值都使请求被拒绝（422），调用方不会误以为某个选项生效了。四项都进入幂等摘要：同一 runId / Idempotency-Key 带不同选项被拒绝（409）。",
+      "x-idp-telos-owner": "idp.telos.host",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [],
+      "properties": {
+        "idp.host/toolExecution": {"enum": ["server", "caller"], "description": "server（缺省）：按 release 的工具策略经 MCP 网关执行工具。caller：工具由调用方执行——模型只看到请求里的前端工具（tools），看不到 release 的网关工具；HOST 不换取网关凭据、不接触网关；只调用一次模型；模型提出的调用作为前端工具调用交回（运行以 interrupt 结束，调用记为 FRONTEND），调用方在下一次运行中回传结果。模型若调用未声明的工具，运行以 STEP_LIMIT 失败。"},
+        "idp.host/releaseDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "运行该 agent 的这一份发布件（AgentRelease 的 Envelope.digest），它必须是已批准的或已被取代的发布件，否则请求被拒绝（409）。缺省运行当前发布件。运行记录的 AgentRun.releaseDigest 就是实际运行的发布件。"},
+        "idp.host/executionRef": {"type": "string", "pattern": "^[\\x21-\\x7e]{1,256}$", "description": "调用方的执行引用（EER 的 execution id），记录为 AgentRun.executionRef，用于两边的审计关联。"},
+        "idp.host/maxOutputTokens": {"type": "integer", "minimum": 1, "maximum": 1048576, "description": "本次运行的模型输出上限：只能压低 release 的 model.maxOutputTokens，不能放大。"}
       }
     }
   }
