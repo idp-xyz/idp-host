@@ -83,12 +83,13 @@ func (c ConfirmationPolicy) For(tool string) string {
 	return c.Default
 }
 
-// Limits bound a run.
+// Limits bound a run. MaxTokensPerRun 0 means "the tenant policy's default" (ADR-0001 D15).
 type Limits struct {
-	MaxSteps                   int `json:"maxSteps"`
-	MaxToolCallsPerStep        int `json:"maxToolCallsPerStep"`
-	RunTimeoutSeconds          int `json:"runTimeoutSeconds"`
-	ConfirmationTimeoutSeconds int `json:"confirmationTimeoutSeconds"`
+	MaxSteps                   int   `json:"maxSteps"`
+	MaxToolCallsPerStep        int   `json:"maxToolCallsPerStep"`
+	RunTimeoutSeconds          int   `json:"runTimeoutSeconds"`
+	ConfirmationTimeoutSeconds int   `json:"confirmationTimeoutSeconds"`
+	MaxTokensPerRun            int64 `json:"maxTokensPerRun,omitempty"`
 }
 
 // Defaults applied by Normalize.
@@ -164,7 +165,8 @@ func (d *Definition) Validate() error {
 	}
 	l := d.Limits
 	if l.MaxSteps < 1 || l.MaxSteps > 200 || l.MaxToolCallsPerStep < 1 || l.MaxToolCallsPerStep > 64 ||
-		l.RunTimeoutSeconds < 1 || l.RunTimeoutSeconds > 86400 || l.ConfirmationTimeoutSeconds < 1 || l.ConfirmationTimeoutSeconds > 86400 {
+		l.RunTimeoutSeconds < 1 || l.RunTimeoutSeconds > 86400 || l.ConfirmationTimeoutSeconds < 1 || l.ConfirmationTimeoutSeconds > 86400 ||
+		l.MaxTokensPerRun < 0 || l.MaxTokensPerRun > 100_000_000 {
 		bad("limits out of range")
 	}
 	if len(errs) > 0 {

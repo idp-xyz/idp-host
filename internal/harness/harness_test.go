@@ -97,7 +97,7 @@ func (m *memStore) AppendMessages(_ context.Context, _ *run.Claim, msgs []agui.M
 	return m.appendEvents(events)
 }
 
-func (m *memStore) StartStep(_ context.Context, _ *run.Claim, maxSteps int, provider, mdl string) (int, bool, error) {
+func (m *memStore) StartStep(_ context.Context, _ *run.Claim, maxSteps int, _ int64, provider, mdl string) (int, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if err := m.check(); err != nil {

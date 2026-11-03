@@ -46,6 +46,7 @@ const (
 	FailModel       = "MODEL_ERROR"
 	FailGateway     = "GATEWAY_ERROR"
 	FailCredential  = "CREDENTIAL_EXPIRED"
+	FailBudget      = "BUDGET_EXCEEDED"
 	FailInternal    = "INTERNAL"
 	FailReleaseGone = "RELEASE_UNAVAILABLE"
 )

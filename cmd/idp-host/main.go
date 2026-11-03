@@ -49,6 +49,7 @@ import (
 
 	"idp-host/adapters/identity"
 	"idp-host/adapters/providers/anthropic"
+	"idp-host/adapters/providers/gemini"
 	"idp-host/adapters/providers/openai"
 	"idp-host/adapters/store/postgres"
 	"idp-host/internal/api"
@@ -224,6 +225,12 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 			providers = append(providers, prov)
 		case "anthropic":
 			prov, err := anthropic.New(anthropic.Config{Name: p.Name, BaseURL: p.BaseURL, APIKey: p.APIKey, HTTP: hc, AllowPlainHTTP: p.Insecure})
+			if err != nil {
+				return err
+			}
+			providers = append(providers, prov)
+		case "gemini":
+			prov, err := gemini.New(gemini.Config{Name: p.Name, BaseURL: p.BaseURL, APIKey: p.APIKey, HTTP: hc, AllowPlainHTTP: p.Insecure})
 			if err != nil {
 				return err
 			}

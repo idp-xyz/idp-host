@@ -76,6 +76,18 @@ paths:
       summary: Reject a candidate
       requestBody: {required: true, content: {application/json: {schema: {type: object, properties: {reason: {type: string}}}}}}
       responses: {'200': {description: rejected, content: {application/json: {schema: {$ref: '#/components/schemas/Release'}}}}, '409': {$ref: '#/components/responses/Problem'}}
+  /api/v1/policy:
+    get:
+      summary: The tenant's governance policy (defaults when none is stored)
+      responses: {'200': {description: policy, content: {application/json: {schema: {$ref: '#/components/schemas/Policy'}}}}}
+    put:
+      summary: Replace the tenant's governance policy
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/Policy'}}}}
+      responses: {'200': {description: policy, content: {application/json: {schema: {$ref: '#/components/schemas/Policy'}}}}, '422': {$ref: '#/components/responses/Problem'}}
+  /api/v1/usage:
+    get:
+      summary: The tenant's consumption against its policy (active runs, rolling-day runs and tokens)
+      responses: {'200': {description: usage}}
   /api/v1/audit:
     get:
       summary: Administrative audit events (newest first)
@@ -159,7 +171,11 @@ components:
         model: {type: object, required: [provider, model], properties: {provider: {type: string}, model: {type: string}, temperature: {type: number}, maxOutputTokens: {type: integer}, fallbacks: {type: array, items: {type: object, properties: {provider: {type: string}, model: {type: string}}}}}}
         tools: {type: object, required: [allow], properties: {gateway: {type: string}, allow: {type: array, items: {type: string}}}}
         confirmation: {type: object, required: [default], properties: {default: {type: string, enum: [auto, confirm]}, tools: {type: object, additionalProperties: {type: string, enum: [auto, confirm]}}}}
-        limits: {type: object, properties: {maxSteps: {type: integer}, maxToolCallsPerStep: {type: integer}, runTimeoutSeconds: {type: integer}, confirmationTimeoutSeconds: {type: integer}}}
+        limits: {type: object, properties: {maxSteps: {type: integer}, maxToolCallsPerStep: {type: integer}, runTimeoutSeconds: {type: integer}, confirmationTimeoutSeconds: {type: integer}, maxTokensPerRun: {type: integer, description: 0 = the tenant policy's default}}}
+    Policy:
+      description: Tenant governance (zero = unlimited); runs beyond the limits are refused with 429 QUOTA_EXCEEDED, runs that exhaust a budget mid-way fail with BUDGET_EXCEEDED
+      type: object
+      properties: {maxConcurrentRuns: {type: integer}, tokensPerDay: {type: integer}, maxTokensPerRun: {type: integer}, updatedBy: {type: string}, updatedAt: {type: string, format: date-time}, default: {type: boolean}}
     NewAgent:
       type: object
       required: [name, displayName, definition]

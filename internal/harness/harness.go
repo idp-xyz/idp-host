@@ -28,7 +28,7 @@ type Store interface {
 	Context(ctx context.Context, c *run.Claim) (*run.Context, error)
 	AppendEvents(ctx context.Context, c *run.Claim, events []agui.Event) error
 	AppendMessages(ctx context.Context, c *run.Claim, msgs []agui.Message, events []agui.Event) error
-	StartStep(ctx context.Context, c *run.Claim, maxSteps int, provider, model string) (step int, cancelRequested bool, err error)
+	StartStep(ctx context.Context, c *run.Claim, maxSteps int, maxTokensPerRun int64, provider, model string) (step int, cancelRequested bool, err error)
 	FinishStep(ctx context.Context, c *run.Claim, st run.Step, events []agui.Event) error
 	RecordToolCalls(ctx context.Context, c *run.Claim, calls []run.ToolCall, events []agui.Event) error
 	UpdateToolCall(ctx context.Context, c *run.Claim, id, state, result string, isError bool, events []agui.Event) error
@@ -341,9 +341,13 @@ func (t *turn) loop() error {
 			return h.fail(t.ctx, t.claim, run.FailTimeout, "the run exceeded its time limit")
 		}
 		primary := t.def.Model
-		step, cancelRequested, err := h.Store.StartStep(t.ctx, t.claim, t.def.Limits.MaxSteps, primary.Provider, primary.Model)
+		step, cancelRequested, err := h.Store.StartStep(t.ctx, t.claim, t.def.Limits.MaxSteps, t.def.Limits.MaxTokensPerRun, primary.Provider, primary.Model)
 		if errors.Is(err, run.ErrStepLimit) {
 			return h.fail(t.ctx, t.claim, run.FailStepLimit, fmt.Sprintf("the run reached its limit of %d steps", t.def.Limits.MaxSteps))
+		}
+		var f *run.Failure
+		if errors.As(err, &f) { // a budget decision (D15)
+			return h.fail(t.ctx, t.claim, f.Code, f.Message)
 		}
 		if err != nil {
 			return err

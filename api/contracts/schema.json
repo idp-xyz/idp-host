@@ -97,7 +97,7 @@
     },
     "Limits": {
       "title": "Limits",
-      "description": "一次 Run 的上限：步数、每步工具调用数、运行时限、确认等待时限（秒）。",
+      "description": "一次 Run 的上限：步数、每步工具调用数、运行时限、确认等待时限（秒）、token 上限（缺省或 0 = 租户策略的默认值）。",
       "x-idp-telos-owner": "idp.telos.host",
       "type": "object",
       "additionalProperties": false,
@@ -106,7 +106,8 @@
         "maxSteps": {"type": "integer", "minimum": 1, "maximum": 200},
         "maxToolCallsPerStep": {"type": "integer", "minimum": 1, "maximum": 64},
         "runTimeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 86400},
-        "confirmationTimeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 86400}
+        "confirmationTimeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 86400},
+        "maxTokensPerRun": {"type": "integer", "minimum": 1, "maximum": 100000000}
       }
     },
     "Envelope": {

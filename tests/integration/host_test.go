@@ -632,6 +632,61 @@ func TestHostEndToEnd(t *testing.T) {
 		e.model.Script = fakemodel.DefaultScript
 	})
 
+	t.Run("governance", func(t *testing.T) {
+		pol := e.must(200, "GET", "/api/v1/policy", "alice", nil)
+		if pol["default"] != true || pol["maxConcurrentRuns"] != 10.0 {
+			t.Fatalf("%v", pol)
+		}
+		e.must(403, "PUT", "/api/v1/policy", "carol", map[string]any{"maxConcurrentRuns": 1})
+		e.must(422, "PUT", "/api/v1/policy", "alice", map[string]any{"maxConcurrentRuns": -1})
+		// concurrency: one run in flight blocks a second one on another thread
+		e.must(200, "PUT", "/api/v1/policy", "alice", map[string]any{"maxConcurrentRuns": 1})
+		first := e.must(202, "POST", "/v1/agents/assistant/runs", "carol", runBody("gov-1", "hello"), "Idempotency-Key", "g1")
+		st, out := e.call("POST", "/v1/agents/assistant/runs", "carol", runBody("gov-2", "hello"), "Idempotency-Key", "g2")
+		if st != 429 || out["error"].(map[string]any)["code"] != "QUOTA_EXCEEDED" {
+			t.Fatalf("%d %v", st, out)
+		}
+		e.drive()
+		if got := e.must(200, "GET", "/v1/runs/"+first["runId"].(string), "carol", nil); got["status"] != run.StatusCompleted {
+			t.Fatalf("%v", got)
+		}
+		e.must(202, "POST", "/v1/agents/assistant/runs", "carol", runBody("gov-2", "hello"), "Idempotency-Key", "g2")
+		e.drive()
+		usage := e.must(200, "GET", "/api/v1/usage", "alice", nil)
+		if usage["activeRuns"] != 0.0 || usage["tokensLast24h"].(float64) <= 0 || usage["runsLast24h"].(float64) < 2 {
+			t.Fatalf("%v", usage)
+		}
+		// daily budget exhausted: new runs are refused
+		e.must(200, "PUT", "/api/v1/policy", "alice", map[string]any{"maxConcurrentRuns": 0, "tokensPerDay": 1})
+		st, out = e.call("POST", "/v1/agents/assistant/runs", "carol", runBody("gov-3", "hello"), "Idempotency-Key", "g3")
+		if st != 429 || !strings.Contains(fmt.Sprint(out), "budget") {
+			t.Fatalf("%d %v", st, out)
+		}
+		// per-run cap: the run fails after its first step consumed the cap
+		e.must(200, "PUT", "/api/v1/policy", "alice", map[string]any{"maxConcurrentRuns": 0, "tokensPerDay": 0, "maxTokensPerRun": 5})
+		capped := e.must(202, "POST", "/v1/agents/assistant/runs", "carol", runBody("gov-4", "please sum"), "Idempotency-Key", "g4")
+		e.drive()
+		got := e.must(200, "GET", "/v1/runs/"+capped["runId"].(string), "carol", nil)
+		if got["status"] != run.StatusFailed || got["failureCode"] != run.FailBudget || got["stepCount"] != 1.0 {
+			t.Fatalf("%v", got)
+		}
+		// the release's own cap overrides the tenant default
+		e.must(200, "PUT", "/api/v1/policy", "alice", map[string]any{"maxConcurrentRuns": 0, "tokensPerDay": 0, "maxTokensPerRun": 5})
+		def := definition("edge", []string{"sum", "echo"}, nil)
+		def.Limits.MaxTokensPerRun = 100000
+		e.publish("roomy", def)
+		roomy := e.must(202, "POST", "/v1/agents/roomy/runs", "carol", runBody("gov-5", "please sum"), "Idempotency-Key", "g5")
+		e.drive()
+		if got := e.must(200, "GET", "/v1/runs/"+roomy["runId"].(string), "carol", nil); got["status"] != run.StatusCompleted {
+			t.Fatalf("%v", got)
+		}
+		e.must(200, "PUT", "/api/v1/policy", "alice", map[string]any{"maxConcurrentRuns": 0, "tokensPerDay": 0, "maxTokensPerRun": 0})
+		// the policy is per tenant: the other tenant still has the defaults
+		if pol := e.must(200, "GET", "/api/v1/policy", "dave", nil); pol["default"] != true {
+			t.Fatalf("%v", pol)
+		}
+	})
+
 	t.Run("tenant-isolation", func(t *testing.T) {
 		if ags := e.must(200, "GET", "/api/v1/agents", "dave", nil)["agents"].([]any); len(ags) != 0 {
 			t.Fatalf("%v", ags)

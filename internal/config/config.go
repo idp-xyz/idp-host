@@ -76,8 +76,8 @@ func Load(path string) (*File, error) {
 			return nil, fmt.Errorf("providers[%d]: name %q invalid or duplicated", i, p.Name)
 		}
 		seen["p:"+p.Name] = true
-		if p.Kind != "openai" && p.Kind != "anthropic" {
-			return nil, fmt.Errorf("provider %s: kind must be openai or anthropic", p.Name)
+		if p.Kind != "openai" && p.Kind != "anthropic" && p.Kind != "gemini" {
+			return nil, fmt.Errorf("provider %s: kind must be openai, anthropic or gemini", p.Name)
 		}
 		if p.BaseURL == "" {
 			return nil, fmt.Errorf("provider %s: baseUrl is required", p.Name)

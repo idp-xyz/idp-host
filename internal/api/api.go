@@ -59,6 +59,14 @@ type API struct {
 
 	actorMu    chan struct{}
 	actorToken *credential.Token
+	quota      *observability.CounterVec
+}
+
+func quotaKind(message string) string {
+	if strings.Contains(message, "concurrent") {
+		return "concurrency"
+	}
+	return "budget"
 }
 
 type ctxKey int
@@ -123,7 +131,10 @@ func (a *API) writeError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.As(err, &pb):
 	case errors.As(err, &se):
-		status := map[string]int{"NOT_FOUND": 404, "CONFLICT": 409, "FORBIDDEN": 403, "INVALID": 422, "GONE": 410}[se.Code]
+		status := map[string]int{"NOT_FOUND": 404, "CONFLICT": 409, "FORBIDDEN": 403, "INVALID": 422, "GONE": 410, "QUOTA_EXCEEDED": 429}[se.Code]
+		if se.Code == "QUOTA_EXCEEDED" && a.quota != nil {
+			a.quota.Inc(quotaKind(se.Message))
+		}
 		if status == 0 {
 			status = 500
 		}
@@ -157,6 +168,9 @@ func (a *API) Handler() http.Handler {
 	}
 	if a.actorMu == nil {
 		a.actorMu = make(chan struct{}, 1)
+	}
+	if a.Metrics != nil {
+		a.quota = a.Metrics.Counter("idp_host_quota_rejections_total", "Run requests refused by tenant governance, by kind.", "kind")
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok\n")) })
@@ -246,6 +260,22 @@ func (a *API) Handler() http.Handler {
 			return 0, nil, err
 		}
 		out, err := a.Store.RejectRelease(r.Context(), p.Tenant, r.PathValue("id"), p.Subject, in.Reason)
+		return 200, out, err
+	}))
+	mux.Handle("GET /api/v1/policy", a.role(admin, func(r *http.Request, p authorization.Principal) (int, any, error) {
+		out, err := a.Store.GetPolicy(r.Context(), p.Tenant)
+		return 200, out, err
+	}))
+	mux.Handle("PUT /api/v1/policy", a.role(admin, func(r *http.Request, p authorization.Principal) (int, any, error) {
+		var in postgres.Policy
+		if err := decode(r, &in); err != nil {
+			return 0, nil, err
+		}
+		out, err := a.Store.SetPolicy(r.Context(), p.Tenant, in, p.Subject)
+		return 200, out, err
+	}))
+	mux.Handle("GET /api/v1/usage", a.role(admin, func(r *http.Request, p authorization.Principal) (int, any, error) {
+		out, err := a.Store.GetUsage(r.Context(), p.Tenant)
 		return 200, out, err
 	}))
 	mux.Handle("GET /api/v1/audit", a.role(admin, func(r *http.Request, p authorization.Principal) (int, any, error) {

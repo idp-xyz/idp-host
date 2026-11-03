@@ -161,6 +161,29 @@ func (s *Store) CreateRun(ctx context.Context, tenant string, in CreateRunInput)
 			if active > 0 {
 				return fail("CONFLICT", "a run is still in progress on this thread")
 			}
+			// tenant governance (D15): concurrency and the daily token budget
+			policy, err := policyOf(ctx, tx, tenant)
+			if err != nil {
+				return err
+			}
+			if policy.MaxConcurrentRuns > 0 {
+				n, err := activeRuns(ctx, tx)
+				if err != nil {
+					return err
+				}
+				if n >= policy.MaxConcurrentRuns {
+					return fail("QUOTA_EXCEEDED", "the tenant's limit of %d concurrent runs is reached", policy.MaxConcurrentRuns)
+				}
+			}
+			if policy.TokensPerDay > 0 {
+				used, err := s.tokensLastDay(ctx, tx)
+				if err != nil {
+					return err
+				}
+				if used >= policy.TokensPerDay {
+					return fail("QUOTA_EXCEEDED", "the tenant's daily token budget (%d) is exhausted", policy.TokensPerDay)
+				}
+			}
 			// AG-UI callers send the whole conversation each run: messages already on the thread are
 			// skipped by id, and - for clients that re-label what the HOST produced - an assistant
 			// message repeating a known tool call, or a tool message answering an already answered
@@ -577,7 +600,7 @@ func (s *Store) AppendMessages(ctx context.Context, c *run.Claim, msgs []agui.Me
 
 // StartStep increments the step counter and records the step's start, emitting STEP_STARTED. It
 // returns run.ErrStepLimit when the release's limit is reached, and whether a cancel is pending.
-func (s *Store) StartStep(ctx context.Context, c *run.Claim, maxSteps int, provider, model string) (step int, cancelRequested bool, err error) {
+func (s *Store) StartStep(ctx context.Context, c *run.Claim, maxSteps int, maxTokensPerRun int64, provider, model string) (step int, cancelRequested bool, err error) {
 	err = s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
 		r, err := s.owned(ctx, tx, c)
 		if err != nil {
@@ -586,6 +609,33 @@ func (s *Store) StartStep(ctx context.Context, c *run.Claim, maxSteps int, provi
 		cancelRequested = r.CancelRequested
 		if r.StepCount >= maxSteps {
 			return run.ErrStepLimit
+		}
+		// budgets (D15): the tenant's daily tokens and the run's own cap, checked before every model call
+		policy, err := policyOf(ctx, tx, c.TenantID)
+		if err != nil {
+			return err
+		}
+		if policy.TokensPerDay > 0 {
+			used, err := s.tokensLastDay(ctx, tx)
+			if err != nil {
+				return err
+			}
+			if used >= policy.TokensPerDay {
+				return &run.Failure{Code: run.FailBudget, Message: "the tenant's daily token budget is exhausted"}
+			}
+		}
+		cap := policy.MaxTokensPerRun
+		if maxTokensPerRun > 0 {
+			cap = maxTokensPerRun
+		}
+		if cap > 0 {
+			var used int64
+			if err := tx.QueryRow(ctx, `SELECT tokens_used FROM runs WHERE id = $1`, c.RunID).Scan(&used); err != nil {
+				return err
+			}
+			if used >= cap {
+				return &run.Failure{Code: run.FailBudget, Message: "the run's token cap is reached"}
+			}
 		}
 		if err := tx.QueryRow(ctx, `UPDATE runs SET step_count = step_count + 1 WHERE id = $1 RETURNING step_count`, c.RunID).Scan(&step); err != nil {
 			return err
@@ -613,6 +663,9 @@ func (s *Store) FinishStep(ctx context.Context, c *run.Claim, st run.Step, event
 		}
 		if _, err := tx.Exec(ctx, `UPDATE run_steps SET provider = $3, model = $4, prompt_tokens = $5, completion_tokens = $6, latency_ms = $7, stop_reason = $8, error_code = $9, finished_at = now()
 			WHERE run_id = $1 AND step = $2`, c.RunID, st.Step, st.Provider, st.Model, st.PromptTokens, st.CompletionTokens, st.Latency.Milliseconds(), stop, code); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE runs SET tokens_used = tokens_used + $2 WHERE id = $1`, c.RunID, int64(st.PromptTokens+st.CompletionTokens)); err != nil {
 			return err
 		}
 		return appendEvents(ctx, tx, c.TenantID, c.RunID, events)

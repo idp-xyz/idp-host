@@ -114,7 +114,133 @@ func (s *Server) Handler() http.Handler {
 	})
 	mux.HandleFunc("POST /v1/chat/completions", s.openai)
 	mux.HandleFunc("POST /v1/messages", s.anthropic)
+	mux.HandleFunc("POST /v1beta/models/{model}", s.gemini) // {model} is "<id>:streamGenerateContent"
 	return mux
+}
+
+// ---- Gemini wire ----
+
+type geminiRequest struct {
+	SystemInstruction *struct {
+		Parts []map[string]any `json:"parts"`
+	} `json:"systemInstruction"`
+	Contents []struct {
+		Role  string           `json:"role"`
+		Parts []map[string]any `json:"parts"`
+	} `json:"contents"`
+	Tools []struct {
+		FunctionDeclarations []struct {
+			Name string `json:"name"`
+		} `json:"functionDeclarations"`
+	} `json:"tools"`
+}
+
+func (s *Server) gemini(w http.ResponseWriter, r *http.Request) {
+	if !strings.HasSuffix(r.PathValue("model"), ":streamGenerateContent") || r.URL.Query().Get("alt") != "sse" {
+		writeJSON(w, 404, map[string]any{"error": map[string]any{"message": "only :streamGenerateContent?alt=sse"}})
+		return
+	}
+	var req geminiRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<20)).Decode(&req); err != nil {
+		writeJSON(w, 400, map[string]any{"error": map[string]any{"message": "bad json"}})
+		return
+	}
+	var msgs []Message
+	if req.SystemInstruction != nil {
+		var sb strings.Builder
+		for _, p := range req.SystemInstruction.Parts {
+			t, _ := p["text"].(string)
+			sb.WriteString(t)
+		}
+		msgs = append(msgs, Message{Role: "system", Content: sb.String()})
+	}
+	for _, c := range req.Contents {
+		role := c.Role
+		if role == "model" {
+			role = "assistant"
+		}
+		for _, p := range c.Parts {
+			switch {
+			case p["functionCall"] != nil:
+				fc := p["functionCall"].(map[string]any)
+				args, _ := json.Marshal(fc["args"])
+				name, _ := fc["name"].(string)
+				msgs = append(msgs, Message{Role: "assistant", ToolCalls: []Call{{Name: name, Args: string(args)}}})
+			case p["functionResponse"] != nil:
+				fr := p["functionResponse"].(map[string]any)
+				name, _ := fr["name"].(string)
+				resp, _ := json.Marshal(fr["response"])
+				content := string(resp)
+				if m, ok := fr["response"].(map[string]any); ok {
+					if c, ok := m["content"].(string); ok {
+						content = c
+					} else if v, ok := m["result"]; ok && len(m) == 1 { // the adapter wraps non-object results
+						b, _ := json.Marshal(v)
+						content = string(b)
+					}
+				}
+				msgs = append(msgs, Message{Role: "tool", Content: content, ToolCallID: name})
+			default:
+				t, _ := p["text"].(string)
+				msgs = append(msgs, Message{Role: role, Content: t})
+			}
+		}
+	}
+	var tools []string
+	for _, t := range req.Tools {
+		for _, d := range t.FunctionDeclarations {
+			tools = append(tools, d.Name)
+		}
+	}
+	if len(msgs) == 0 {
+		writeJSON(w, 400, map[string]any{"error": map[string]any{"message": "no contents"}})
+		return
+	}
+	turn := s.decide(msgs, tools)
+	if turn.Status != 0 {
+		writeJSON(w, turn.Status, map[string]any{"error": map[string]any{"code": turn.Status, "message": "scripted failure"}})
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(200)
+	f, _ := w.(http.Flusher)
+	send := func(parts []map[string]any, finish string, usage bool) {
+		cand := map[string]any{"content": map[string]any{"parts": parts, "role": "model"}}
+		if finish != "" {
+			cand["finishReason"] = finish
+		}
+		ev := map[string]any{"candidates": []any{cand}}
+		if usage {
+			ev["usageMetadata"] = map[string]any{"promptTokenCount": 10 * len(msgs), "candidatesTokenCount": 7, "totalTokenCount": 10*len(msgs) + 7}
+		}
+		b, _ := json.Marshal(ev)
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
+		if f != nil {
+			f.Flush()
+		}
+	}
+	if turn.Reasoning != "" {
+		send([]map[string]any{{"text": turn.Reasoning, "thought": true}}, "", false)
+	}
+	pieces := split(turn.Text, 5)
+	for i, piece := range pieces {
+		finish := ""
+		if i == len(pieces)-1 && len(turn.ToolCalls) == 0 {
+			finish = "STOP"
+		}
+		send([]map[string]any{{"text": piece}}, finish, i == len(pieces)-1 && len(turn.ToolCalls) == 0)
+	}
+	if len(turn.ToolCalls) > 0 {
+		var parts []map[string]any
+		for _, c := range turn.ToolCalls {
+			var args any
+			_ = json.Unmarshal([]byte(c.Args), &args)
+			parts = append(parts, map[string]any{"functionCall": map[string]any{"name": c.Name, "args": args}})
+		}
+		send(parts, "STOP", true)
+	} else if len(pieces) == 0 {
+		send([]map[string]any{{"text": ""}}, "STOP", true)
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

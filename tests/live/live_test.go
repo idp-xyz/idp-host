@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"idp-host/adapters/providers/anthropic"
+	"idp-host/adapters/providers/gemini"
 	"idp-host/adapters/providers/openai"
 	"idp-host/internal/agui"
 	"idp-host/internal/model"
@@ -42,6 +43,13 @@ func providers(t *testing.T) []model.Provider {
 	}
 	if u := os.Getenv("IDP_LIVE_ANTHROPIC_URL"); u != "" {
 		p, err := anthropic.New(anthropic.Config{Name: "live-anthropic", BaseURL: u, APIKey: os.Getenv("IDP_LIVE_API_KEY"), HTTP: hc})
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, p)
+	}
+	if u := os.Getenv("IDP_LIVE_GEMINI_URL"); u != "" { // e.g. https://generativelanguage.googleapis.com with IDP_LIVE_GEMINI_KEY
+		p, err := gemini.New(gemini.Config{Name: "live-gemini", BaseURL: u, APIKey: os.Getenv("IDP_LIVE_GEMINI_KEY"), HTTP: hc})
 		if err != nil {
 			t.Fatal(err)
 		}
