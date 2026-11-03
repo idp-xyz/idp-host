@@ -401,6 +401,50 @@ func TestFrontendTool(t *testing.T) {
 	}
 }
 
+// TestCallerExecutesTools: in caller mode the model sees only the caller's tools, the gateway is
+// never contacted (no credential either), the run is one model call, and the caller's output cap
+// tightens the release's.
+func TestCallerExecutesTools(t *testing.T) {
+	e := setup(t)
+	e.model.Script = func(msgs []fakemodel.Message, tools []string) fakemodel.Turn {
+		return fakemodel.Turn{ToolCalls: []fakemodel.Call{{Name: "eer_lookup", Args: `{"id":"p-1"}`}}}
+	}
+	d := def()
+	d.Model.MaxOutputTokens = 4000
+	m := newMem(d, user("please sum"), run.Input{ToolExecution: run.ToolExecutionCaller, MaxOutputTokens: 300,
+		Tools: []agui.Tool{{Name: "eer_lookup", Description: "look up", Parameters: []byte(`{"type":"object"}`)}}})
+	m.cred = "" // a caller-mode run needs no gateway credential
+	e.h.Store = m
+	if err := e.h.Run(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	if m.status != run.StatusCompleted || len(m.steps) != 1 || len(e.mcp.Bearers()) != 0 {
+		t.Fatalf("status %s steps %d gateway contacts %d", m.status, len(m.steps), len(e.mcp.Bearers()))
+	}
+	if tools := e.model.LastTools(); len(tools) != 1 || tools[0] != "eer_lookup" {
+		t.Fatalf("gateway tools leaked to the model: %v", tools)
+	}
+	if e.model.LastMaxTokens() != 300 {
+		t.Fatalf("output cap %d", e.model.LastMaxTokens())
+	}
+	for _, c := range m.calls {
+		if c.State != run.CallFrontend || c.Tool != "eer_lookup" || c.Arguments != `{"id":"p-1"}` {
+			t.Fatalf("%+v", c)
+		}
+	}
+	// a proposal for a tool the caller did not offer is denied and the one-step run fails
+	e.model.Script = func(msgs []fakemodel.Message, tools []string) fakemodel.Turn {
+		return fakemodel.Turn{ToolCalls: []fakemodel.Call{{Name: "sum", Args: `{"a":1,"b":2}`}}}
+	}
+	m = newMem(d, user("x"), run.Input{ToolExecution: run.ToolExecutionCaller})
+	e.h.Store = m
+	err := e.h.Run(context.Background(), claim)
+	var f *run.Failure
+	if !errors.As(err, &f) || f.Code != run.FailStepLimit || len(e.mcp.Calls()) != 0 {
+		t.Fatalf("%v calls %v", err, e.mcp.Calls())
+	}
+}
+
 func TestFallbackAndModelFailure(t *testing.T) {
 	e := setup(t)
 	d := def()

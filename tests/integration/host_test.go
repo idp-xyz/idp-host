@@ -748,6 +748,80 @@ func TestHostEndToEnd(t *testing.T) {
 		}
 	})
 
+	t.Run("caller-executes-tools", func(t *testing.T) {
+		// the EER profile (ADR-0001 D19): tools come from the caller, the run is one model call,
+		// the release is pinned, the execution reference is recorded, the gateway is never contacted
+		rels := e.must(200, "GET", "/api/v1/agents/assistant/releases", "alice", nil)["releases"].([]any)
+		digest := rels[len(rels)-1].(map[string]any)["digest"].(string) // the first approved release
+		gatewayCalls := len(e.mcp.Calls())
+		e.model.Script = func(msgs []fakemodel.Message, tools []string) fakemodel.Turn {
+			if msgs[len(msgs)-1].Role == "tool" {
+				return fakemodel.Turn{Text: "Answer: " + msgs[len(msgs)-1].Content}
+			}
+			return fakemodel.Turn{ToolCalls: []fakemodel.Call{{Name: "eer_parcel_lookup", Args: `{"parcel":"p-1"}`}}}
+		}
+		defer func() { e.model.Script = fakemodel.DefaultScript }()
+		tool := map[string]any{"name": "eer_parcel_lookup", "description": "Look up a parcel (executed by EER)", "parameters": map[string]any{"type": "object"}}
+		props := map[string]any{"idp.host/toolExecution": "caller", "idp.host/executionRef": "execution:e2e-1", "idp.host/releaseDigest": digest, "idp.host/maxOutputTokens": 256}
+		go func() {
+			time.Sleep(300 * time.Millisecond)
+			_, _ = e.worker.Once(context.Background())
+		}()
+		in := map[string]any{"threadId": "eer-turn-1", "runId": "eer-run-1", "messages": []map[string]any{{"id": "m1", "role": "user", "content": "where is p-1"}},
+			"tools": []any{tool}, "context": []any{}, "forwardedProps": props}
+		types, events, _ := e.sse("POST", "/ag-ui/agents/assistant", "carol", in)
+		var callID, args string
+		for _, ev := range events {
+			switch ev["type"] {
+			case agui.EventToolCallStart:
+				callID = ev["toolCallId"].(string)
+			case agui.EventToolCallArgs:
+				args += ev["delta"].(string)
+			}
+		}
+		if types[len(types)-1] != agui.EventRunFinished || callID == "" || args != `{"parcel":"p-1"}` || strings.Contains(strings.Join(types, ","), agui.EventToolCallResult) {
+			t.Fatalf("%v %s %s", types, callID, args)
+		}
+		got := e.must(200, "GET", "/v1/runs/eer-run-1", "carol", nil)
+		if got["executionRef"] != "execution:e2e-1" || got["releaseDigest"] != digest || got["stepCount"] != 1.0 || got["status"] != run.StatusCompleted {
+			t.Fatalf("%v", got)
+		}
+		if e.model.LastMaxTokens() != 256 || len(e.mcp.Calls()) != gatewayCalls {
+			t.Fatalf("cap %d, gateway calls %d -> %d", e.model.LastMaxTokens(), gatewayCalls, len(e.mcp.Calls()))
+		}
+		// the caller executed the tool and asks the next turn on a fresh thread with the whole history
+		go func() {
+			time.Sleep(300 * time.Millisecond)
+			_, _ = e.worker.Once(context.Background())
+		}()
+		in = map[string]any{"threadId": "eer-turn-2", "runId": "eer-run-2", "messages": []map[string]any{
+			{"id": "m1", "role": "user", "content": "where is p-1"},
+			{"id": "a1", "role": "assistant", "toolCalls": []map[string]any{{"id": callID, "type": "function", "function": map[string]any{"name": "eer_parcel_lookup", "arguments": args}}}},
+			{"id": "t1", "role": "tool", "toolCallId": callID, "content": `{"status":"completed","result":{"hub":"SZX"}}`}},
+			"tools": []any{tool}, "context": []any{}, "forwardedProps": props}
+		types, _, _ = e.sse("POST", "/ag-ui/agents/assistant", "carol", in)
+		msgs := e.must(200, "GET", "/v1/threads/eer-turn-2/messages", "carol", nil)["messages"].([]any)
+		if types[len(types)-1] != agui.EventRunFinished || !strings.Contains(msgs[len(msgs)-1].(map[string]any)["content"].(string), "SZX") {
+			t.Fatalf("%v %v", types, msgs)
+		}
+		// replaying the same run id returns the same recorded run (an EER activity retry)
+		before := e.model.Calls()
+		types, _, _ = e.sse("POST", "/ag-ui/agents/assistant", "carol", in)
+		if types[len(types)-1] != agui.EventRunFinished || e.model.Calls() != before {
+			t.Fatalf("replay re-invoked the model: %v", types)
+		}
+		// a digest that is no approved release of the agent, and unknown options, are refused
+		bad := map[string]any{"threadId": "eer-turn-3", "runId": "eer-run-3", "messages": []map[string]any{{"id": "m1", "role": "user", "content": "x"}}, "tools": []any{}, "context": []any{},
+			"forwardedProps": map[string]any{"idp.host/releaseDigest": "sha256:" + strings.Repeat("0", 64)}}
+		if st, _ := e.call("POST", "/v1/agents/assistant/runs", "carol", bad, "Idempotency-Key", "bad-1"); st != 409 {
+			t.Fatalf("unknown digest: %d", st)
+		}
+		bad["forwardedProps"] = map[string]any{"idp.host/whatever": true}
+		if st, _ := e.call("POST", "/v1/agents/assistant/runs", "carol", bad, "Idempotency-Key", "bad-2"); st != 422 {
+			t.Fatalf("unknown option: %d", st)
+		}
+	})
+
 	t.Run("tenant-isolation", func(t *testing.T) {
 		if ags := e.must(200, "GET", "/api/v1/agents", "dave", nil)["agents"].([]any); len(ags) != 0 {
 			t.Fatalf("%v", ags)

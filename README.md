@@ -16,7 +16,8 @@ IDP TELOS 的 Agent Hosting & Coordination：`idp-host` 一个二进制，同时
 - **Run 是状态机 + 事件日志**：`QUEUED → RUNNING → (AWAITING_INPUT ⇄ RUNNING)* → COMPLETED | FAILED | CANCELED`；每次迁移一个事务；AG-UI 事件（含流式文本增量）落库，SSE 从事件表读，`Last-Event-ID` 续传，任何副本都能服务任何 Run 的流。
 - **Worker**：`SELECT … FOR UPDATE SKIP LOCKED` 认领、租约心跳、fencing epoch；旧 Worker 的写入被拒；副本任意扩缩。
 - **Harness**：组装上下文 → 流式调模型 → 工具调用逐个过允许列表与确认策略 → 经网关执行 → 下一步；每步、每个调用、每次用量都是事件。前端工具（RunAgentInput.tools）由调用方执行。
-- **HOST 不内建工具、不持有企业任务状态**：工具目录、授权、参数校验、审计在 idp-mcp；Goal / Task / Execution / Checkpoint 归 EER（预留 `executionRef`）。
+- **HOST 不内建工具、不持有企业任务状态**：工具目录、授权、参数校验、审计在 idp-mcp；Goal / Task / Execution / Checkpoint 归 EER，Run 记录 EER 的 `executionRef`。
+- **EER 的 Agent 回合由 HOST 提供（D19–D21）**：EER 的每个回合 = HOST 的一个 Run，用 `forwardedProps` 的 `idp.host/toolExecution: caller`（只给模型 EER 声明的能力、只调一次模型、调用提议交回 EER）、`idp.host/releaseDigest`（钉住发布件）、`idp.host/executionRef`、`idp.host/maxOutputTokens`。授权、审批、派发、补偿、验证仍在 EER。
 - **确认，不是审批**：确认策略要求的工具调用让 Run 等待所有者本人确认（绑定参数摘要、有过期）；企业审批归 EER / Workspace。
 - **身份**：OAuth bearer JWT（JWKS）；HOST 代用户调网关用 RFC 8693 委派令牌，Run 创建时换取、AES-256-GCM 加密保存、Worker 执行时使用；开发拓扑用静态 API Key。
 

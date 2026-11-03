@@ -114,6 +114,16 @@ func (h *Harness) Run(ctx context.Context, c *run.Claim) error {
 		return h.fail(ctx, c, run.FailReleaseGone, "the run's release cannot be loaded: "+err.Error())
 	}
 	t := &turn{h: h, ctx: ctx, claim: c, rc: rc, def: rc.Release.Effective(), messages: rc.Messages, frontend: map[string]bool{}, visible: map[string]bool{}}
+	if rc.Run.Input.ToolExecution == run.ToolExecutionCaller {
+		// ADR-0001 D19: the caller executes every tool. No gateway tools are offered (the release's
+		// and its skills' alike), and the run is one model call: a final answer, or proposals the
+		// caller executes and answers in its next run.
+		t.def.Tools = agent.ToolPolicy{Allow: []string{}}
+		t.def.Limits.MaxSteps = 1
+	}
+	if m := rc.Run.Input.MaxOutputTokens; m > 0 && (t.def.Model.MaxOutputTokens == 0 || m < t.def.Model.MaxOutputTokens) {
+		t.def.Model.MaxOutputTokens = m
+	}
 	for _, ft := range rc.Run.Input.Tools {
 		t.frontend[ft.Name] = true
 	}

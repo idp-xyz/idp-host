@@ -247,7 +247,17 @@ components:
       description: AG-UI RunAgentInput; tools are frontend tools the HOST never executes, state is ignored
       type: object
       required: [messages]
-      properties: {threadId: {type: string}, runId: {type: string}, parentRunId: {type: string}, state: {}, messages: {type: array, items: {$ref: '#/components/schemas/Message'}}, tools: {type: array, items: {type: object}}, context: {type: array, items: {type: object}}, forwardedProps: {}}
+      properties: {threadId: {type: string}, runId: {type: string}, parentRunId: {type: string}, state: {}, messages: {type: array, items: {$ref: '#/components/schemas/Message'}}, tools: {type: array, items: {type: object}}, context: {type: array, items: {type: object}}, forwardedProps: {$ref: '#/components/schemas/ForwardedProps'}}
+    ForwardedProps:
+      description: >-
+        Caller options (ADR-0001 D19). Keys outside the idp.host/ namespace are kept with the run and
+        ignored; an unknown idp.host/ key is rejected (422).
+      type: object
+      properties:
+        idp.host/toolExecution: {type: string, enum: [server, caller], description: 'caller = the HOST offers the model only the frontend tools, never its gateway tools, and makes one model call; proposed calls are handed back'}
+        idp.host/releaseDigest: {type: string, pattern: '^sha256:[0-9a-f]{64}$', description: run this approved (or superseded) release of the agent instead of the current one; 409 when the agent has no such release}
+        idp.host/executionRef: {type: string, pattern: '^[\x21-\x7e]{1,256}$', description: 'the caller''s execution reference (EER), recorded on the run'}
+        idp.host/maxOutputTokens: {type: integer, minimum: 1, maximum: 1048576, description: caps the release's model output limit for this run}
     Run:
       description: contract idp.telos.host AgentRun
       type: object

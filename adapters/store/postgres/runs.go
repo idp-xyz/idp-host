@@ -27,6 +27,8 @@ type CreateRunInput struct {
 	Input          run.Input
 	Credential     *credential.Token // delegated gateway token, sealed before storage
 	TraceID        string
+	ReleaseID      string // the approved release to run; "" = the agent's current release
+	ExecutionRef   string // the caller's execution reference (EER), recorded on the run
 }
 
 const runCols = `tenant_id::text, id, thread_id, agent_id::text, release_id::text, release_digest, owner, status, idempotency_key, input, step_count, event_seq,
@@ -97,8 +99,22 @@ func (s *Store) CreateRun(ctx context.Context, tenant string, in CreateRunInput)
 			if err != nil {
 				return err
 			}
-			releaseID, env, doc, err := currentRelease(ctx, tx, a)
-			if err != nil {
+			var releaseID string
+			var env *agent.Envelope
+			var doc *agent.Document
+			if in.ReleaseID != "" { // a pinned release: it must be an approved release of this agent
+				releaseID = in.ReleaseID
+				var owner string
+				if err := tx.QueryRow(ctx, `SELECT agent_id::text FROM agent_releases WHERE id = $1`, releaseID).Scan(&owner); err != nil || owner != a.ID {
+					return fail("CONFLICT", "release %s is not a release of agent %s", releaseID, a.Name)
+				}
+				if env, err = envelopeOf(ctx, tx, releaseID); err != nil {
+					return err
+				}
+				if doc, err = agent.Open(env); err != nil {
+					return fail("GONE", "release %s is corrupt: %s", releaseID, err)
+				}
+			} else if releaseID, env, doc, err = currentRelease(ctx, tx, a); err != nil {
 				return err
 			}
 			threadID := in.ThreadID
@@ -130,7 +146,7 @@ func (s *Store) CreateRun(ctx context.Context, tenant string, in CreateRunInput)
 					return err
 				}
 			}
-			hashSrc := map[string]any{"agent": a.ID, "messages": in.Messages, "input": in.Input}
+			hashSrc := map[string]any{"agent": a.ID, "messages": in.Messages, "input": in.Input, "release": in.ReleaseID, "executionRef": in.ExecutionRef}
 			hash, err := canonical.Digest(hashSrc)
 			if err != nil {
 				return err
@@ -231,13 +247,16 @@ func (s *Store) CreateRun(ctx context.Context, tenant string, in CreateRunInput)
 			}
 			inputRaw, _ := json.Marshal(in.Input)
 			deadline := s.now().Add(time.Duration(doc.Definition.Limits.RunTimeoutSeconds) * time.Second)
-			var trace any
+			var trace, execRef any
 			if in.TraceID != "" {
 				trace = in.TraceID
 			}
+			if in.ExecutionRef != "" {
+				execRef = in.ExecutionRef
+			}
 			if _, err := tx.Exec(ctx, `INSERT INTO runs (tenant_id, id, thread_id, agent_id, release_id, release_digest, owner, status, idempotency_key, request_sha256, input,
-			credential, credential_expires_at, trace_id, deadline_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 'QUEUED', $8, $9, $10, $11, $12, $13, $14)`,
-				tenant, runID, threadID, a.ID, releaseID, env.Digest, in.Owner, in.IdempotencyKey, hash, inputRaw, cred, credExp, trace, deadline); err != nil {
+			credential, credential_expires_at, trace_id, deadline_at, execution_ref) VALUES ($1, $2, $3, $4, $5, $6, $7, 'QUEUED', $8, $9, $10, $11, $12, $13, $14, $15)`,
+				tenant, runID, threadID, a.ID, releaseID, env.Digest, in.Owner, in.IdempotencyKey, hash, inputRaw, cred, credExp, trace, deadline, execRef); err != nil {
 				if isUniqueViolation(err) {
 					if strings.Contains(constraintOf(err), "idempotency") {
 						return errRetry // the same request raced; the retry replays it

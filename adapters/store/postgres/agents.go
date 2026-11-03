@@ -390,6 +390,20 @@ func envelopeOf(ctx context.Context, tx pgx.Tx, releaseID string) (*agent.Envelo
 	return &e, nil
 }
 
+// ReleaseIDByDigest finds the approved release of an agent with the given digest (caller pinning,
+// ADR-0001 D19). Any approved release qualifies, not only the current one.
+func (s *Store) ReleaseIDByDigest(ctx context.Context, tenant, agentID, digest string) (string, error) {
+	var id string
+	err := s.InTenant(ctx, tenant, func(tx pgx.Tx) error {
+		err := tx.QueryRow(ctx, `SELECT id::text FROM agent_releases WHERE agent_id = $1 AND digest = $2 AND status IN ('APPROVED', 'SUPERSEDED')`, agentID, digest).Scan(&id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fail("CONFLICT", "no approved release of this agent has digest %s", digest)
+		}
+		return err
+	})
+	return id, err
+}
+
 // currentRelease resolves an agent's current release and opens its document (digest verified).
 func currentRelease(ctx context.Context, tx pgx.Tx, a *Agent) (string, *agent.Envelope, *agent.Document, error) {
 	if a.CurrentReleaseID == nil {

@@ -41,11 +41,27 @@ type Script func(messages []Message, tools []string) Turn
 
 // Server is the fake.
 type Server struct {
-	Script Script
-	calls  atomic.Int64
-	mu     sync.Mutex
-	last   []Message
-	models []string
+	Script    Script
+	calls     atomic.Int64
+	mu        sync.Mutex
+	last      []Message
+	lastTools []string
+	lastMax   int
+	models    []string
+}
+
+// LastTools returns the tool names offered in the last request.
+func (s *Server) LastTools() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.lastTools...)
+}
+
+// LastMaxTokens returns the output limit of the last OpenAI-wire request (0 = none).
+func (s *Server) LastMaxTokens() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastMax
 }
 
 // New returns a server with the default script.
@@ -253,16 +269,24 @@ func (s *Server) decide(msgs []Message, tools []string) Turn {
 	s.calls.Add(1)
 	s.mu.Lock()
 	s.last = msgs
+	s.lastTools = tools
 	s.mu.Unlock()
 	return s.Script(msgs, tools)
+}
+
+func (s *Server) recordMax(n int) {
+	s.mu.Lock()
+	s.lastMax = n
+	s.mu.Unlock()
 }
 
 // ---- OpenAI wire ----
 
 type oaiRequest struct {
-	Model    string `json:"model"`
-	Stream   bool   `json:"stream"`
-	Messages []struct {
+	Model     string `json:"model"`
+	Stream    bool   `json:"stream"`
+	MaxTokens int    `json:"max_tokens"`
+	Messages  []struct {
 		Role       string          `json:"role"`
 		Content    json.RawMessage `json:"content"`
 		ToolCallID string          `json:"tool_call_id"`
@@ -290,6 +314,7 @@ func (s *Server) openai(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"error": map[string]any{"message": "bad json"}})
 		return
 	}
+	s.recordMax(req.MaxTokens)
 	var msgs []Message
 	for _, m := range req.Messages {
 		var content string

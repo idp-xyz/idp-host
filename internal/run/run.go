@@ -80,7 +80,15 @@ type Input struct {
 	Tools          []agui.Tool     `json:"tools"`
 	Context        []agui.Context  `json:"context"`
 	ForwardedProps json.RawMessage `json:"forwardedProps,omitempty"`
+	// Caller options (ADR-0001 D19), taken from forwardedProps["idp.host/..."].
+	ToolExecution   string `json:"toolExecution,omitempty"`   // "" = server, or ToolExecutionCaller
+	MaxOutputTokens int    `json:"maxOutputTokens,omitempty"` // caps the release's model output limit
 }
+
+// ToolExecutionCaller: the caller executes every tool. The run offers the model only the caller's
+// tools, never contacts the MCP gateway, and ends after one model call with either a final answer
+// or the proposed calls (an EER agent turn).
+const ToolExecutionCaller = "caller"
 
 // Run is one execution of an agent on a thread.
 type Run struct {

@@ -505,14 +505,25 @@ func (a *API) createRun(r *http.Request, p authorization.Principal, ref, key str
 	if len(in.Messages) == 0 {
 		return nil, false, transport.Fail(http.StatusUnprocessableEntity, "INVALID", "messages are required")
 	}
+	opts, err := run.ParseOptions(in.ForwardedProps)
+	if err != nil {
+		return nil, false, transport.Fail(http.StatusUnprocessableEntity, "INVALID", err.Error())
+	}
 	ag, err := a.Store.GetAgent(r.Context(), p.Tenant, ref)
 	if err != nil {
 		return nil, false, err
 	}
-	if ag.CurrentReleaseID == nil {
+	releaseID := ""
+	if opts.ReleaseDigest != "" {
+		if releaseID, err = a.Store.ReleaseIDByDigest(r.Context(), p.Tenant, ag.ID, opts.ReleaseDigest); err != nil {
+			return nil, false, err
+		}
+	} else if ag.CurrentReleaseID != nil {
+		releaseID = *ag.CurrentReleaseID
+	} else {
 		return nil, false, transport.Fail(http.StatusConflict, "CONFLICT", "agent has no published release")
 	}
-	env, err := a.Store.GetEnvelope(r.Context(), p.Tenant, *ag.CurrentReleaseID)
+	env, err := a.Store.GetEnvelope(r.Context(), p.Tenant, releaseID)
 	if err != nil {
 		return nil, false, err
 	}
@@ -521,7 +532,8 @@ func (a *API) createRun(r *http.Request, p authorization.Principal, ref, key str
 		return nil, false, transport.Fail(http.StatusGone, "GONE", "release is corrupt")
 	}
 	var cred *credential.Token
-	if gw := doc.Definition.Tools.Gateway; len(doc.Definition.Tools.Allow) > 0 && gw != "" {
+	// With caller-executed tools the run never reaches the gateway, so it needs no credential.
+	if gw := doc.Effective().Tools.Gateway; opts.ToolExecution == "" && len(doc.Effective().Tools.Allow) > 0 && gw != "" {
 		auth, ok := a.Gateways[gw]
 		if !ok {
 			return nil, false, transport.Fail(http.StatusConflict, "CONFLICT", "gateway "+gw+" is not configured on this host")
@@ -534,7 +546,7 @@ func (a *API) createRun(r *http.Request, p authorization.Principal, ref, key str
 			}
 		}
 	}
-	input := run.Input{Tools: in.Tools, Context: in.Context, ForwardedProps: in.ForwardedProps}
+	input := run.Input{Tools: in.Tools, Context: in.Context, ForwardedProps: in.ForwardedProps, ToolExecution: opts.ToolExecution, MaxOutputTokens: opts.MaxOutputTokens}
 	if input.Tools == nil {
 		input.Tools = []agui.Tool{}
 	}
@@ -542,7 +554,8 @@ func (a *API) createRun(r *http.Request, p authorization.Principal, ref, key str
 		input.Context = []agui.Context{}
 	}
 	out, replayed, err := a.Store.CreateRun(r.Context(), p.Tenant, postgres.CreateRunInput{ThreadID: in.ThreadID, RunID: in.RunID, AgentRef: ag.ID, Owner: p.Subject,
-		IdempotencyKey: key, Messages: in.Messages, Input: input, Credential: cred, TraceID: observability.TraceID(r.Context())})
+		IdempotencyKey: key, Messages: in.Messages, Input: input, Credential: cred, TraceID: observability.TraceID(r.Context()),
+		ReleaseID: releaseID, ExecutionRef: opts.ExecutionRef})
 	return out, replayed, err
 }
 
