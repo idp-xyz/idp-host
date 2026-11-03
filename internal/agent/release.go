@@ -32,6 +32,7 @@ var (
 	toolNameRE = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)
 	gatewayRE  = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$`)
 	providerRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$`)
+	digestRE   = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 )
 
 // ValidName reports whether s may name an agent.
@@ -44,6 +45,7 @@ type Definition struct {
 	Tools        ToolPolicy         `json:"tools"`
 	Confirmation ConfirmationPolicy `json:"confirmation"`
 	Limits       Limits             `json:"limits"`
+	Skills       []SkillRef         `json:"skills,omitempty"` // resolved and embedded when a release is compiled (D17)
 }
 
 // ModelProfile selects the model and its parameters; Fallbacks are tried in order when the
@@ -163,6 +165,13 @@ func (d *Definition) Validate() error {
 			bad("confirmation.tools[%q] is invalid", tool)
 		}
 	}
+	names := map[string]bool{}
+	for i, s := range d.Skills {
+		if !ValidName(s.Name) || s.Version < 0 || names[s.Name] {
+			bad("skills[%d]: invalid or duplicated", i)
+		}
+		names[s.Name] = true
+	}
 	l := d.Limits
 	if l.MaxSteps < 1 || l.MaxSteps > 200 || l.MaxToolCallsPerStep < 1 || l.MaxToolCallsPerStep > 64 ||
 		l.RunTimeoutSeconds < 1 || l.RunTimeoutSeconds > 86400 || l.ConfirmationTimeoutSeconds < 1 || l.ConfirmationTimeoutSeconds > 86400 ||
@@ -198,9 +207,13 @@ type Document struct {
 	CreatedBy     string     `json:"createdBy"`
 	ApprovedBy    string     `json:"approvedBy,omitempty"` // part of the digest once approved
 	Definition    Definition `json:"definition"`
+	// Skills are the skill releases the definition referenced, resolved when the release was
+	// compiled (one per reference, same order).
+	Skills []EmbeddedSkill `json:"skills,omitempty"`
 }
 
-// Validate checks the document.
+// Validate checks the document, including that the embedded skills match the references and
+// that the effective tool set has a gateway.
 func (d *Document) Validate() error {
 	if d.SchemaVersion != SchemaVersion {
 		return fmt.Errorf("schemaVersion must be %s", SchemaVersion)
@@ -214,7 +227,25 @@ func (d *Document) Validate() error {
 	if d.Version < 1 {
 		return errors.New("version must be >= 1")
 	}
-	return d.Definition.Validate()
+	if err := d.Definition.Validate(); err != nil {
+		return err
+	}
+	if len(d.Skills) != len(d.Definition.Skills) {
+		return errors.New("skills: every reference must be embedded exactly once")
+	}
+	for i, s := range d.Skills {
+		ref := d.Definition.Skills[i]
+		if s.Name != ref.Name || s.Version < 1 || (ref.Version != 0 && s.Version != ref.Version) || !digestRE.MatchString(s.Digest) {
+			return fmt.Errorf("skills[%d]: does not match reference %s", i, ref.Name)
+		}
+		if err := s.Definition.Validate(); err != nil {
+			return fmt.Errorf("skills[%d]: %w", i, err)
+		}
+	}
+	if eff := d.Effective(); len(eff.Tools.Allow) > 0 && !gatewayRE.MatchString(eff.Tools.Gateway) {
+		return errors.New("tools.gateway is required when the agent or its skills use tools")
+	}
+	return nil
 }
 
 // Envelope is what is stored and distributed: the document plus its digest.

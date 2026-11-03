@@ -687,6 +687,67 @@ func TestHostEndToEnd(t *testing.T) {
 		}
 	})
 
+	t.Run("skills", func(t *testing.T) {
+		// a skill that brings the echo tool and demands confirmation for it
+		e.must(201, "POST", "/api/v1/skills", "alice", map[string]any{"name": "echoing", "displayName": "Echoing", "definition": map[string]any{
+			"instructions": "When asked to echo, use the echo tool.", "tools": []string{"echo"}, "confirmation": map[string]string{"echo": "confirm"}}})
+		e.must(422, "POST", "/api/v1/skills", "alice", map[string]any{"name": "bad", "displayName": "x", "definition": map[string]any{"instructions": "", "tools": []string{}}})
+		// an agent referencing an unpublished skill cannot be compiled
+		agentDef := definition("edge", []string{"sum"}, nil)
+		agentDef.Skills = []agent.SkillRef{{Name: "echoing"}}
+		e.must(201, "POST", "/api/v1/agents", "alice", map[string]any{"name": "skilled", "displayName": "Skilled", "definition": agentDef})
+		e.must(409, "POST", "/api/v1/agents/skilled/releases", "alice", nil)
+		rel := e.must(201, "POST", "/api/v1/skills/echoing/releases", "alice", nil)
+		e.must(403, "POST", "/api/v1/skill-releases/"+rel["releaseId"].(string)+"/approve", "alice", nil)
+		sk := e.must(200, "POST", "/api/v1/skill-releases/"+rel["releaseId"].(string)+"/approve", "bob", nil)
+		// the agent release embeds the skill with its digest
+		ar := e.must(201, "POST", "/api/v1/agents/skilled/releases", "alice", nil)
+		e.must(200, "POST", "/api/v1/releases/"+ar["releaseId"].(string)+"/approve", "bob", nil)
+		env := e.must(200, "GET", "/api/v1/releases/"+ar["releaseId"].(string)+"/envelope", "alice", nil)
+		doc := env["document"].(map[string]any)
+		embedded := doc["skills"].([]any)
+		if len(embedded) != 1 || embedded[0].(map[string]any)["digest"] != sk["digest"] || embedded[0].(map[string]any)["version"] != 1.0 {
+			t.Fatalf("%v", doc["skills"])
+		}
+		// the run sees the skill's tool and its confirmation rule
+		r := e.must(202, "POST", "/v1/agents/skilled/runs", "carol", runBody("skill-1", "echo this"), "Idempotency-Key", "s1")
+		e.drive()
+		if got := e.must(200, "GET", "/v1/runs/"+r["runId"].(string), "carol", nil); got["status"] != run.StatusAwaitingInput {
+			t.Fatalf("%v", got)
+		}
+		calls := e.must(200, "GET", "/v1/runs/"+r["runId"].(string)+"/tool-calls", "carol", nil)["toolCalls"].([]any)
+		e.must(200, "POST", "/v1/runs/"+r["runId"].(string)+"/tool-calls/"+calls[0].(map[string]any)["toolCallId"].(string)+"/decide", "carol", map[string]any{"decision": "confirm"})
+		e.drive()
+		msgs := e.must(200, "GET", "/v1/threads/skill-1/messages", "carol", nil)["messages"].([]any)
+		if msgs[len(msgs)-1].(map[string]any)["content"] != "Result: hi" {
+			t.Fatalf("%v", msgs)
+		}
+		if last := e.model.Last(); !strings.Contains(last[0].Content, "## Skill: echoing") {
+			t.Fatalf("skill instructions not merged: %q", last[0].Content)
+		}
+		// a new skill version does not change the compiled release; a pinned reference stays on its version
+		e.must(200, "PATCH", "/api/v1/skills/echoing", "alice", map[string]any{"definition": map[string]any{"instructions": "v2", "tools": []string{"echo"}}})
+		rel2 := e.must(201, "POST", "/api/v1/skills/echoing/releases", "alice", nil)
+		e.must(200, "POST", "/api/v1/skill-releases/"+rel2["releaseId"].(string)+"/approve", "bob", nil)
+		pinned := definition("edge", []string{"sum"}, nil)
+		pinned.Skills = []agent.SkillRef{{Name: "echoing", Version: 1}}
+		e.must(201, "POST", "/api/v1/agents", "alice", map[string]any{"name": "pinned", "displayName": "Pinned", "definition": pinned})
+		pr := e.must(201, "POST", "/api/v1/agents/pinned/releases", "alice", nil)
+		if v := pr["document"].(map[string]any)["skills"].([]any)[0].(map[string]any)["version"]; v != 1.0 {
+			t.Fatalf("pinned version %v", v)
+		}
+		cur := e.must(201, "POST", "/api/v1/agents/skilled/releases", "alice", nil)
+		if v := cur["document"].(map[string]any)["skills"].([]any)[0].(map[string]any)["version"]; v != 2.0 {
+			t.Fatalf("current version %v", v)
+		}
+		if n := len(e.must(200, "GET", "/api/v1/skills", "alice", nil)["skills"].([]any)); n != 1 {
+			t.Fatalf("skills %d", n)
+		}
+		if n := len(e.must(200, "GET", "/api/v1/skills", "dave", nil)["skills"].([]any)); n != 0 {
+			t.Fatalf("skills visible across tenants: %d", n)
+		}
+	})
+
 	t.Run("tenant-isolation", func(t *testing.T) {
 		if ags := e.must(200, "GET", "/api/v1/agents", "dave", nil)["agents"].([]any); len(ags) != 0 {
 			t.Fatalf("%v", ags)

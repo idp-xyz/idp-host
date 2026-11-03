@@ -21,6 +21,7 @@
           "limits": {
             "confirmationTimeoutSeconds": 1800,
             "maxSteps": 12,
+            "maxTokensPerRun": 200000,
             "maxToolCallsPerStep": 4,
             "runTimeoutSeconds": 600
           },
@@ -36,6 +37,12 @@
             "provider": "local",
             "temperature": 0.2
           },
+          "skills": [
+            {
+              "name": "customs-declaration",
+              "version": 2
+            }
+          ],
           "tools": {
             "allow": [
               "parcel__create_shipment",
@@ -46,6 +53,23 @@
         },
         "releaseId": "7f3c1a2e-5b6d-4c8e-9f01-23456789abcd",
         "schemaVersion": "idp.host.agent/v1",
+        "skills": [
+          {
+            "definition": {
+              "confirmation": {
+                "parcel__file_declaration": "confirm"
+              },
+              "instructions": "When a shipment crosses a border, prepare the customs declaration with the declaration tool and ask before filing.",
+              "tools": [
+                "parcel__file_declaration",
+                "parcel__get_tariff"
+              ]
+            },
+            "digest": "sha256:e23bd8ae343ad0c2e60c32bc0c0357997f085b4bbac2f304c2bde75135bd65c3",
+            "name": "customs-declaration",
+            "version": 2
+          }
+        ],
         "tenantId": "1a2b3c4d-0000-4000-8000-000000000001",
         "version": 3
       }
@@ -83,9 +107,33 @@
       }
     },
     {
+      "definition": "SkillRelease",
+      "value": {
+        "approvedBy": "bob",
+        "createdAt": "2026-11-03T11:00:00Z",
+        "createdBy": "alice",
+        "definition": {
+          "confirmation": {
+            "parcel__file_declaration": "confirm"
+          },
+          "instructions": "When a shipment crosses a border, prepare the customs declaration with the declaration tool and ask before filing.",
+          "tools": [
+            "parcel__file_declaration",
+            "parcel__get_tariff"
+          ]
+        },
+        "releaseId": "c4d5e6f7-5b6d-4c8e-9f01-23456789abcf",
+        "schemaVersion": "idp.host.skill/v1",
+        "skillId": "a1b2c3d4-0000-4000-8000-000000000004",
+        "skillName": "customs-declaration",
+        "tenantId": "1a2b3c4d-0000-4000-8000-000000000001",
+        "version": 2
+      }
+    },
+    {
       "definition": "Envelope",
       "value": {
-        "digest": "sha256:583f24bdda30076cc81434508d7c51f8dc9c0874293f70a331207f966e274cac",
+        "digest": "sha256:99c909fc3287bae693b7ca356444e14cd6a840ad5e4963c091b93c24d498f2ef",
         "document": {
           "agentId": "9e8d7c6b-0000-4000-8000-000000000002",
           "agentName": "parcel-assistant",
@@ -103,6 +151,7 @@
             "limits": {
               "confirmationTimeoutSeconds": 1800,
               "maxSteps": 12,
+              "maxTokensPerRun": 200000,
               "maxToolCallsPerStep": 4,
               "runTimeoutSeconds": 600
             },
@@ -118,6 +167,12 @@
               "provider": "local",
               "temperature": 0.2
             },
+            "skills": [
+              {
+                "name": "customs-declaration",
+                "version": 2
+              }
+            ],
             "tools": {
               "allow": [
                 "parcel__create_shipment",
@@ -128,8 +183,52 @@
           },
           "releaseId": "7f3c1a2e-5b6d-4c8e-9f01-23456789abcd",
           "schemaVersion": "idp.host.agent/v1",
+          "skills": [
+            {
+              "definition": {
+                "confirmation": {
+                  "parcel__file_declaration": "confirm"
+                },
+                "instructions": "When a shipment crosses a border, prepare the customs declaration with the declaration tool and ask before filing.",
+                "tools": [
+                  "parcel__file_declaration",
+                  "parcel__get_tariff"
+                ]
+              },
+              "digest": "sha256:e23bd8ae343ad0c2e60c32bc0c0357997f085b4bbac2f304c2bde75135bd65c3",
+              "name": "customs-declaration",
+              "version": 2
+            }
+          ],
           "tenantId": "1a2b3c4d-0000-4000-8000-000000000001",
           "version": 3
+        }
+      }
+    },
+    {
+      "definition": "Envelope",
+      "value": {
+        "digest": "sha256:e23bd8ae343ad0c2e60c32bc0c0357997f085b4bbac2f304c2bde75135bd65c3",
+        "document": {
+          "approvedBy": "bob",
+          "createdAt": "2026-11-03T11:00:00Z",
+          "createdBy": "alice",
+          "definition": {
+            "confirmation": {
+              "parcel__file_declaration": "confirm"
+            },
+            "instructions": "When a shipment crosses a border, prepare the customs declaration with the declaration tool and ask before filing.",
+            "tools": [
+              "parcel__file_declaration",
+              "parcel__get_tariff"
+            ]
+          },
+          "releaseId": "c4d5e6f7-5b6d-4c8e-9f01-23456789abcf",
+          "schemaVersion": "idp.host.skill/v1",
+          "skillId": "a1b2c3d4-0000-4000-8000-000000000004",
+          "skillName": "customs-declaration",
+          "tenantId": "1a2b3c4d-0000-4000-8000-000000000001",
+          "version": 2
         }
       }
     },
@@ -142,7 +241,7 @@
         "deadlineAt": "2026-11-03T13:10:00Z",
         "finishedAt": "2026-11-03T13:00:09Z",
         "owner": "carol",
-        "releaseDigest": "sha256:583f24bdda30076cc81434508d7c51f8dc9c0874293f70a331207f966e274cac",
+        "releaseDigest": "sha256:99c909fc3287bae693b7ca356444e14cd6a840ad5e4963c091b93c24d498f2ef",
         "releaseId": "7f3c1a2e-5b6d-4c8e-9f01-23456789abcd",
         "runId": "run_01JD7Q3Z8M8T0G3C6N4V9S2A1B",
         "startedAt": "2026-11-03T13:00:01Z",
@@ -160,7 +259,7 @@
         "createdAt": "2026-11-03T13:10:00Z",
         "deadlineAt": "2026-11-03T13:20:00Z",
         "owner": "carol",
-        "releaseDigest": "sha256:583f24bdda30076cc81434508d7c51f8dc9c0874293f70a331207f966e274cac",
+        "releaseDigest": "sha256:99c909fc3287bae693b7ca356444e14cd6a840ad5e4963c091b93c24d498f2ef",
         "releaseId": "7f3c1a2e-5b6d-4c8e-9f01-23456789abcd",
         "runId": "run_01JD7Q3Z8M8T0G3C6N4V9S2A1C",
         "startedAt": "2026-11-03T13:10:01Z",
@@ -181,7 +280,7 @@
         "failureMessage": "the run reached its limit of 12 steps",
         "finishedAt": "2026-11-03T13:25:00Z",
         "owner": "carol",
-        "releaseDigest": "sha256:583f24bdda30076cc81434508d7c51f8dc9c0874293f70a331207f966e274cac",
+        "releaseDigest": "sha256:99c909fc3287bae693b7ca356444e14cd6a840ad5e4963c091b93c24d498f2ef",
         "releaseId": "7f3c1a2e-5b6d-4c8e-9f01-23456789abcd",
         "runId": "run_01JD7Q3Z8M8T0G3C6N4V9S2A1D",
         "startedAt": "2026-11-03T13:20:01Z",

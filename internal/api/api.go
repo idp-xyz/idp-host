@@ -262,6 +262,73 @@ func (a *API) Handler() http.Handler {
 		out, err := a.Store.RejectRelease(r.Context(), p.Tenant, r.PathValue("id"), p.Subject, in.Reason)
 		return 200, out, err
 	}))
+	mux.Handle("POST /api/v1/skills", a.role(admin, func(r *http.Request, p authorization.Principal) (int, any, error) {
+		var in struct {
+			Name        string                `json:"name"`
+			DisplayName string                `json:"displayName"`
+			Definition  agent.SkillDefinition `json:"definition"`
+		}
+		if err := decode(r, &in); err != nil {
+			return 0, nil, err
+		}
+		out, err := a.Store.CreateSkill(r.Context(), p.Tenant, in.Name, in.DisplayName, in.Definition, p.Subject)
+		return http.StatusCreated, out, err
+	}))
+	mux.Handle("GET /api/v1/skills", a.role(admin, func(r *http.Request, p authorization.Principal) (int, any, error) {
+		out, err := a.Store.ListSkills(r.Context(), p.Tenant)
+		return 200, map[string]any{"skills": out}, err
+	}))
+	mux.Handle("GET /api/v1/skills/{ref}", a.role(admin, func(r *http.Request, p authorization.Principal) (int, any, error) {
+		out, err := a.Store.GetSkill(r.Context(), p.Tenant, r.PathValue("ref"))
+		return 200, out, err
+	}))
+	mux.Handle("PATCH /api/v1/skills/{ref}", a.role(admin, func(r *http.Request, p authorization.Principal) (int, any, error) {
+		var in struct {
+			DisplayName *string                `json:"displayName"`
+			Definition  *agent.SkillDefinition `json:"definition"`
+		}
+		if err := decode(r, &in); err != nil {
+			return 0, nil, err
+		}
+		out, err := a.Store.UpdateSkill(r.Context(), p.Tenant, r.PathValue("ref"), in.DisplayName, in.Definition, p.Subject)
+		return 200, out, err
+	}))
+	mux.Handle("POST /api/v1/skills/{ref}/releases", a.role(admin, func(r *http.Request, p authorization.Principal) (int, any, error) {
+		out, err := a.Store.CreateSkillRelease(r.Context(), p.Tenant, r.PathValue("ref"), p.Subject)
+		return http.StatusCreated, out, err
+	}))
+	mux.Handle("GET /api/v1/skills/{ref}/releases", a.role(admin, func(r *http.Request, p authorization.Principal) (int, any, error) {
+		out, err := a.Store.ListSkillReleases(r.Context(), p.Tenant, r.PathValue("ref"))
+		return 200, map[string]any{"releases": out}, err
+	}))
+	mux.Handle("POST /api/v1/skills/{ref}/set-current", a.role(admin, func(r *http.Request, p authorization.Principal) (int, any, error) {
+		var in struct {
+			ReleaseID string `json:"releaseId"`
+		}
+		if err := decode(r, &in); err != nil {
+			return 0, nil, err
+		}
+		out, err := a.Store.SetCurrentSkillRelease(r.Context(), p.Tenant, r.PathValue("ref"), in.ReleaseID, p.Subject)
+		return 200, out, err
+	}))
+	mux.Handle("GET /api/v1/skill-releases/{id}", a.role(admin, func(r *http.Request, p authorization.Principal) (int, any, error) {
+		out, err := a.Store.GetSkillRelease(r.Context(), p.Tenant, r.PathValue("id"))
+		return 200, out, err
+	}))
+	mux.Handle("POST /api/v1/skill-releases/{id}/approve", a.role(authorization.RoleApprover, func(r *http.Request, p authorization.Principal) (int, any, error) {
+		out, err := a.Store.ApproveSkillRelease(r.Context(), p.Tenant, r.PathValue("id"), p.Subject)
+		return 200, out, err
+	}))
+	mux.Handle("POST /api/v1/skill-releases/{id}/reject", a.role(authorization.RoleApprover, func(r *http.Request, p authorization.Principal) (int, any, error) {
+		var in struct {
+			Reason string `json:"reason"`
+		}
+		if err := decode(r, &in); err != nil {
+			return 0, nil, err
+		}
+		out, err := a.Store.RejectSkillRelease(r.Context(), p.Tenant, r.PathValue("id"), p.Subject, in.Reason)
+		return 200, out, err
+	}))
 	mux.Handle("GET /api/v1/policy", a.role(admin, func(r *http.Request, p authorization.Principal) (int, any, error) {
 		out, err := a.Store.GetPolicy(r.Context(), p.Tenant)
 		return 200, out, err

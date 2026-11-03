@@ -30,7 +30,7 @@ var update = flag.Bool("update", false, "regenerate api/contracts/examples.json 
 
 const (
 	contractDir = "../../api/contracts"
-	contractID  = "urn:idp:telos:host:1.0.0"
+	contractID  = "urn:idp:telos:host:1.1.0"
 )
 
 type noLoader struct{}
@@ -84,7 +84,7 @@ func (k *contract) schema(def string) *jsonschema.Schema {
 	return s
 }
 
-var roots = map[string]bool{"AgentRelease": true, "Envelope": true, "AgentRun": true}
+var roots = map[string]bool{"AgentRelease": true, "SkillRelease": true, "Envelope": true, "AgentRun": true}
 
 func (k *contract) validate(def string, raw []byte) error {
 	inst, err := jsonschema.UnmarshalJSON(bytes.NewReader(raw))
@@ -102,15 +102,27 @@ func (k *contract) validate(def string, raw []byte) error {
 	return nil
 }
 
+func exampleSkill() *agent.SkillDocument {
+	return &agent.SkillDocument{SchemaVersion: agent.SkillSchemaVersion, ReleaseID: "c4d5e6f7-5b6d-4c8e-9f01-23456789abcf", TenantID: "1a2b3c4d-0000-4000-8000-000000000001",
+		SkillID: "a1b2c3d4-0000-4000-8000-000000000004", SkillName: "customs-declaration", Version: 2, CreatedAt: "2026-11-03T11:00:00Z", CreatedBy: "alice", ApprovedBy: "bob",
+		Definition: agent.SkillDefinition{Instructions: "When a shipment crosses a border, prepare the customs declaration with the declaration tool and ask before filing.",
+			Tools: []string{"parcel__file_declaration", "parcel__get_tariff"}, Confirmation: map[string]string{"parcel__file_declaration": agent.ConfirmConfirm}}}
+}
+
 func exampleDocuments() (full, minimal *agent.Document) {
 	temp := 0.2
+	skillEnv, _ := agent.SealSkill(exampleSkill())
+	skill := exampleSkill()
+	skill.Definition.Normalize()
 	full = &agent.Document{SchemaVersion: agent.SchemaVersion, ReleaseID: "7f3c1a2e-5b6d-4c8e-9f01-23456789abcd", TenantID: "1a2b3c4d-0000-4000-8000-000000000001",
 		AgentID: "9e8d7c6b-0000-4000-8000-000000000002", AgentName: "parcel-assistant", Version: 3, CreatedAt: "2026-11-03T12:00:00Z", CreatedBy: "alice", ApprovedBy: "bob",
 		Definition: agent.Definition{Instructions: "You help operators with parcels. Use tools for facts; never invent shipment data.",
 			Model:        agent.ModelProfile{Provider: "local", Model: "qwen3.8-flash", Temperature: &temp, MaxOutputTokens: 2048, Fallbacks: []agent.ModelRef{{Provider: "cloud", Model: "claude-sonnet-5-5"}}},
 			Tools:        agent.ToolPolicy{Gateway: "edge", Allow: []string{"parcel__get_shipment", "parcel__create_shipment"}},
 			Confirmation: agent.ConfirmationPolicy{Default: agent.ConfirmAuto, Tools: map[string]string{"parcel__create_shipment": agent.ConfirmConfirm}},
-			Limits:       agent.Limits{MaxSteps: 12, MaxToolCallsPerStep: 4, RunTimeoutSeconds: 600, ConfirmationTimeoutSeconds: 1800}}}
+			Limits:       agent.Limits{MaxSteps: 12, MaxToolCallsPerStep: 4, RunTimeoutSeconds: 600, ConfirmationTimeoutSeconds: 1800, MaxTokensPerRun: 200000},
+			Skills:       []agent.SkillRef{{Name: "customs-declaration", Version: 2}}},
+		Skills: []agent.EmbeddedSkill{{Name: "customs-declaration", Version: 2, Digest: skillEnv.Digest, Definition: skill.Definition}}}
 	minimal = &agent.Document{SchemaVersion: agent.SchemaVersion, ReleaseID: "0b1c2d3e-5b6d-4c8e-9f01-23456789abce", TenantID: "1a2b3c4d-0000-4000-8000-000000000001",
 		AgentID: "4f5e6d7c-0000-4000-8000-000000000003", AgentName: "faq", Version: 1, CreatedAt: "2026-11-03T12:30:00Z", CreatedBy: "alice",
 		Definition: agent.Definition{Instructions: "Answer questions about the handbook.", Model: agent.ModelProfile{Provider: "local", Model: "qwen3.8-flash"}}}
@@ -162,7 +174,13 @@ func buildExamples(t *testing.T) []byte {
 	}
 	add("AgentRelease", json.RawMessage(fullEnv.Document))
 	add("AgentRelease", json.RawMessage(minEnv.Document))
+	skillEnv, err := agent.SealSkill(exampleSkill())
+	if err != nil {
+		t.Fatal(err)
+	}
+	add("SkillRelease", json.RawMessage(skillEnv.Document))
 	add("Envelope", fullEnv)
+	add("Envelope", skillEnv)
 	for _, r := range exampleRuns(full.ReleaseID, fullEnv.Digest) {
 		add("AgentRun", r)
 	}
@@ -209,13 +227,20 @@ func TestContractExamplesAreGeneratedAndValid(t *testing.T) {
 			if _, err := agent.Open(&agent.Envelope{Digest: digest, Document: x.Value}); err != nil {
 				t.Errorf("example %d: the implementation rejects the published AgentRelease: %v", i, err)
 			}
+		case "SkillRelease":
+			digest, _ := canonical.Digest(x.Value)
+			if _, err := agent.OpenSkill(&agent.Envelope{Digest: digest, Document: x.Value}); err != nil {
+				t.Errorf("example %d: the implementation rejects the published SkillRelease: %v", i, err)
+			}
 		case "Envelope":
 			var env agent.Envelope
 			if err := json.Unmarshal(x.Value, &env); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := agent.Open(&env); err != nil {
-				t.Errorf("example %d: the implementation rejects the published Envelope: %v", i, err)
+				if _, err2 := agent.OpenSkill(&env); err2 != nil {
+					t.Errorf("example %d: the implementation rejects the published Envelope: %v / %v", i, err, err2)
+				}
 			}
 		case "AgentRun":
 			var r run.Run
@@ -260,7 +285,8 @@ func TestContractFieldsMatchGo(t *testing.T) {
 		return out
 	}
 	closed := map[string]any{"AgentRelease": agent.Document{}, "Definition": agent.Definition{}, "ModelProfile": agent.ModelProfile{}, "ModelRef": agent.ModelRef{},
-		"ToolPolicy": agent.ToolPolicy{}, "ConfirmationPolicy": agent.ConfirmationPolicy{}, "Limits": agent.Limits{}, "Envelope": agent.Envelope{}, "AgentRun": run.Run{}}
+		"ToolPolicy": agent.ToolPolicy{}, "ConfirmationPolicy": agent.ConfirmationPolicy{}, "Limits": agent.Limits{}, "Envelope": agent.Envelope{}, "AgentRun": run.Run{},
+		"SkillRef": agent.SkillRef{}, "SkillDefinition": agent.SkillDefinition{}, "EmbeddedSkill": agent.EmbeddedSkill{}, "SkillRelease": agent.SkillDocument{}}
 	for def, zero := range closed {
 		d, ok := defs[def].(map[string]any)
 		if !ok {
@@ -352,6 +378,30 @@ func TestContractRejectsWhatOpenRejects(t *testing.T) {
 		"steps out of range":        {"definition.limits.maxSteps", 1000},
 		"unknown top-level field":   {"extra", true},
 		"unknown definition field":  {"definition.extra", true},
+		"skill digest malformed":    {"skills.0.digest", "sha256:zz"},
+		"skill bad tool":            {"skills.0.definition.tools.0", "bad name"},
+		"skill ref bad name":        {"definition.skills.0.name", "Customs"},
+	}
+	// cross-reference rules only the implementation can check (a schema cannot relate two arrays)
+	implOnly := map[string]struct {
+		path  string
+		value any
+	}{
+		"skill name mismatch":    {"skills.0.name", "other-skill"},
+		"embedded skill missing": {"skills", []any{}},
+		"skill version mismatch": {"skills.0.version", 3},
+	}
+	for name, c := range implOnly {
+		var m map[string]any
+		dec := json.NewDecoder(bytes.NewReader(env.Document))
+		dec.UseNumber()
+		_ = dec.Decode(&m)
+		set(m, c.path, c.value)
+		raw, _ := canonical.Canonical(m)
+		digest, _ := canonical.Digest(json.RawMessage(raw))
+		if _, err := agent.Open(&agent.Envelope{Digest: digest, Document: raw}); err == nil {
+			t.Errorf("%s: the implementation accepts it", name)
+		}
 	}
 	for name, c := range cases {
 		var m map[string]any

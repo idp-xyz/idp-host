@@ -113,7 +113,7 @@ func (h *Harness) Run(ctx context.Context, c *run.Claim) error {
 		}
 		return h.fail(ctx, c, run.FailReleaseGone, "the run's release cannot be loaded: "+err.Error())
 	}
-	t := &turn{h: h, ctx: ctx, claim: c, rc: rc, def: rc.Release.Definition, messages: rc.Messages, frontend: map[string]bool{}, visible: map[string]bool{}}
+	t := &turn{h: h, ctx: ctx, claim: c, rc: rc, def: rc.Release.Effective(), messages: rc.Messages, frontend: map[string]bool{}, visible: map[string]bool{}}
 	for _, ft := range rc.Run.Input.Tools {
 		t.frontend[ft.Name] = true
 	}

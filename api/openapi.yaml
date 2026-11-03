@@ -76,6 +76,43 @@ paths:
       summary: Reject a candidate
       requestBody: {required: true, content: {application/json: {schema: {type: object, properties: {reason: {type: string}}}}}}
       responses: {'200': {description: rejected, content: {application/json: {schema: {$ref: '#/components/schemas/Release'}}}}, '409': {$ref: '#/components/responses/Problem'}}
+  /api/v1/skills:
+    post:
+      summary: Create a skill with its draft definition (instructions, tools, confirmation overrides)
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [name, displayName, definition], properties: {name: {type: string}, displayName: {type: string}, definition: {$ref: '#/components/schemas/SkillDefinition'}}}}}}
+      responses: {'201': {description: created, content: {application/json: {schema: {$ref: '#/components/schemas/Skill'}}}}, '409': {$ref: '#/components/responses/Problem'}, '422': {$ref: '#/components/responses/Problem'}}
+    get:
+      summary: List the tenant's skills
+      responses: {'200': {description: skills}}
+  /api/v1/skills/{ref}:
+    parameters: [{$ref: '#/components/parameters/ref'}]
+    get: {summary: Get a skill, responses: {'200': {description: skill, content: {application/json: {schema: {$ref: '#/components/schemas/Skill'}}}}, '404': {$ref: '#/components/responses/Problem'}}}
+    patch:
+      summary: Update the display name and/or the draft definition
+      requestBody: {required: true, content: {application/json: {schema: {type: object, properties: {displayName: {type: string}, definition: {$ref: '#/components/schemas/SkillDefinition'}}}}}}
+      responses: {'200': {description: skill}, '404': {$ref: '#/components/responses/Problem'}, '422': {$ref: '#/components/responses/Problem'}}
+  /api/v1/skills/{ref}/releases:
+    parameters: [{$ref: '#/components/parameters/ref'}]
+    post: {summary: Compile the draft into a candidate skill release, responses: {'201': {description: candidate}, '422': {$ref: '#/components/responses/Problem'}}}
+    get: {summary: List skill releases, newest first, responses: {'200': {description: releases}}}
+  /api/v1/skills/{ref}/set-current:
+    parameters: [{$ref: '#/components/parameters/ref'}]
+    post:
+      summary: Point the skill at an approved release
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [releaseId], properties: {releaseId: {type: string}}}}}}
+      responses: {'200': {description: skill}, '409': {$ref: '#/components/responses/Problem'}}
+  /api/v1/skill-releases/{id}:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    get: {summary: Get a skill release, responses: {'200': {description: release}, '404': {$ref: '#/components/responses/Problem'}}}
+  /api/v1/skill-releases/{id}/approve:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    post: {summary: Approve a candidate skill release (four eyes) and make it current, responses: {'200': {description: approved}, '403': {$ref: '#/components/responses/Problem'}, '409': {$ref: '#/components/responses/Problem'}}}
+  /api/v1/skill-releases/{id}/reject:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    post:
+      summary: Reject a candidate skill release
+      requestBody: {required: true, content: {application/json: {schema: {type: object, properties: {reason: {type: string}}}}}}
+      responses: {'200': {description: rejected}, '409': {$ref: '#/components/responses/Problem'}}
   /api/v1/policy:
     get:
       summary: The tenant's governance policy (defaults when none is stored)
@@ -172,10 +209,19 @@ components:
         tools: {type: object, required: [allow], properties: {gateway: {type: string}, allow: {type: array, items: {type: string}}}}
         confirmation: {type: object, required: [default], properties: {default: {type: string, enum: [auto, confirm]}, tools: {type: object, additionalProperties: {type: string, enum: [auto, confirm]}}}}
         limits: {type: object, properties: {maxSteps: {type: integer}, maxToolCallsPerStep: {type: integer}, runTimeoutSeconds: {type: integer}, confirmationTimeoutSeconds: {type: integer}, maxTokensPerRun: {type: integer, description: 0 = the tenant policy's default}}}
+        skills: {type: array, description: skills by name, optionally pinned to a version (0 = current); embedded when a release is compiled, items: {type: object, required: [name], properties: {name: {type: string}, version: {type: integer}}}}
     Policy:
       description: Tenant governance (zero = unlimited); runs beyond the limits are refused with 429 QUOTA_EXCEEDED, runs that exhaust a budget mid-way fail with BUDGET_EXCEEDED
       type: object
       properties: {maxConcurrentRuns: {type: integer}, tokensPerDay: {type: integer}, maxTokensPerRun: {type: integer}, updatedBy: {type: string}, updatedAt: {type: string, format: date-time}, default: {type: boolean}}
+    SkillDefinition:
+      description: The editable content of a skill (contract idp.telos.host SkillDefinition)
+      type: object
+      required: [instructions, tools]
+      properties: {instructions: {type: string}, tools: {type: array, items: {type: string}}, confirmation: {type: object, additionalProperties: {type: string, enum: [auto, confirm]}}}
+    Skill:
+      type: object
+      properties: {skillId: {type: string}, name: {type: string}, displayName: {type: string}, definition: {$ref: '#/components/schemas/SkillDefinition'}, currentReleaseId: {type: [string, 'null']}, createdBy: {type: string}, createdAt: {type: string, format: date-time}, updatedAt: {type: string, format: date-time}}
     NewAgent:
       type: object
       required: [name, displayName, definition]

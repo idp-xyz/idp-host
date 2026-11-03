@@ -211,6 +211,9 @@ func (s *Store) CreateRelease(ctx context.Context, tenant, ref, by string) (*Rel
 		doc := &agent.Document{SchemaVersion: agent.SchemaVersion, ReleaseID: id, TenantID: tenant, AgentID: a.ID, AgentName: a.Name, Version: version,
 			CreatedAt: s.now().UTC().Format(time.RFC3339), CreatedBy: by, Definition: a.Definition}
 		doc.Definition.Normalize()
+		if doc.Skills, err = resolveSkills(ctx, tx, doc.Definition.Skills); err != nil {
+			return err
+		}
 		if err := doc.Validate(); err != nil {
 			return fail("INVALID", "%s", err)
 		}
