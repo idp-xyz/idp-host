@@ -33,7 +33,7 @@ type CreateRunInput struct {
 
 const runCols = `tenant_id::text, id, thread_id, agent_id::text, release_id::text, release_digest, owner, status, idempotency_key, input, step_count, event_seq,
 	fencing_epoch, coalesce(lease_owner, ''), lease_until, cancel_requested, coalesce(failure_code, ''), coalesce(failure_message, ''), coalesce(execution_ref, ''),
-	credential_expires_at, coalesce(trace_id, ''), deadline_at, created_at, started_at, finished_at, coalesce(parent_run_id, ''), depth`
+	credential_expires_at, coalesce(trace_id, ''), deadline_at, created_at, started_at, finished_at, coalesce(parent_run_id, ''), depth, coalesce(purpose, ''), coalesce(evaluation_id::text, '')`
 
 // activeStatuses are the statuses of a run that holds its thread and a place in the tenant's concurrency.
 const activeStatuses = `('QUEUED', 'RUNNING', 'AWAITING_INPUT', 'AWAITING_SUBAGENT')`
@@ -44,7 +44,7 @@ func scanRun(row pgx.Row) (*run.Run, error) {
 	var leaseUntil, credExp, startedAt, finishedAt *time.Time
 	if err := row.Scan(&r.TenantID, &r.ID, &r.ThreadID, &r.AgentID, &r.ReleaseID, &r.ReleaseDigest, &r.Owner, &r.Status, &r.IdempotencyKey, &input, &r.StepCount, &r.EventSeq,
 		&r.FencingEpoch, &r.LeaseOwner, &leaseUntil, &r.CancelRequested, &r.FailureCode, &r.FailureMessage, &r.ExecutionRef,
-		&credExp, &r.TraceID, &r.DeadlineAt, &r.CreatedAt, &startedAt, &finishedAt, &r.ParentRunID, &r.Depth); err != nil {
+		&credExp, &r.TraceID, &r.DeadlineAt, &r.CreatedAt, &startedAt, &finishedAt, &r.ParentRunID, &r.Depth, &r.Purpose, &r.EvaluationID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, fail("NOT_FOUND", "run not found")
 		}
@@ -519,6 +519,11 @@ func (s *Store) cancelResting(ctx context.Context, tx pgx.Tx, tenant string, r *
 	if err := appendEvents(ctx, tx, tenant, r.ID, []agui.Event{agui.RunError(reason, "CANCELED")}); err != nil {
 		return err
 	}
+	if r.Purpose == run.PurposeEvaluation {
+		if err := evaluationRunEnded(ctx, tx, r, run.StatusCanceled, "CANCELED"); err != nil {
+			return err
+		}
+	}
 	rows, err := tx.Query(ctx, `SELECT `+runCols+` FROM runs WHERE parent_run_id = $1 AND status IN `+activeStatuses+` ORDER BY created_at FOR UPDATE`, r.ID)
 	if err != nil {
 		return err
@@ -642,12 +647,18 @@ func (s *Store) Context(ctx context.Context, c *run.Claim) (*run.Context, error)
 			return err
 		}
 		out.Run = *r
-		env, err := envelopeOf(ctx, tx, r.ReleaseID)
-		if err != nil {
-			return err
-		}
-		if out.Release, err = agent.Open(env); err != nil {
-			return fail("GONE", "release is corrupt: %s", err)
+		var env *agent.Envelope
+		if r.Purpose == run.PurposeEvaluation {
+			if env, out.Release, err = candidateEnvelope(ctx, tx, r.ReleaseID); err != nil {
+				return err
+			}
+		} else {
+			if env, err = envelopeOf(ctx, tx, r.ReleaseID); err != nil {
+				return err
+			}
+			if out.Release, err = agent.Open(env); err != nil {
+				return fail("GONE", "release is corrupt: %s", err)
+			}
 		}
 		if out.Release.ReleaseID != r.ReleaseID || env.Digest != r.ReleaseDigest {
 			return fail("GONE", "release digest changed")
@@ -655,6 +666,11 @@ func (s *Store) Context(ctx context.Context, c *run.Claim) (*run.Context, error)
 		if out.Messages, err = threadMessages(ctx, tx, r.ThreadID); err != nil {
 			return err
 		}
+		policy, err := policyOf(ctx, tx, c.TenantID)
+		if err != nil {
+			return err
+		}
+		out.BlockedPatterns = policy.BlockedPatterns
 		out.ToolCalls, err = runCalls(ctx, tx, c.RunID, []string{run.CallPendingConfirmation, run.CallConfirmed, run.CallRejected, run.CallExpired, run.CallExecuting, run.CallDelegated}, true)
 		return err
 	})
@@ -854,8 +870,18 @@ func (s *Store) Finish(ctx context.Context, c *run.Claim, status, failureCode, f
 				return appendEvents(ctx, tx, c.TenantID, r.ParentRunID, []agui.Event{agui.Custom(agui.CustomSubagentAwaitingInput, map[string]any{"runId": r.ID})})
 			}
 		}
+		if r.Purpose == run.PurposeEvaluation && finished {
+			r.StepCount, _ = stepCount(ctx, tx, r.ID)
+			return evaluationRunEnded(ctx, tx, r, status, failureCode)
+		}
 		return nil
 	})
+}
+
+func stepCount(ctx context.Context, tx pgx.Tx, runID string) (int, error) {
+	var n int
+	err := tx.QueryRow(ctx, `SELECT step_count FROM runs WHERE id = $1`, runID).Scan(&n)
+	return n, err
 }
 
 // CreateChildRun creates the sub-agent run a DELEGATED tool call of the claimed run points at (D22):

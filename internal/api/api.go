@@ -131,7 +131,7 @@ func (a *API) writeError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.As(err, &pb):
 	case errors.As(err, &se):
-		status := map[string]int{"NOT_FOUND": 404, "CONFLICT": 409, "FORBIDDEN": 403, "INVALID": 422, "GONE": 410, "QUOTA_EXCEEDED": 429}[se.Code]
+		status := map[string]int{"NOT_FOUND": 404, "CONFLICT": 409, "FORBIDDEN": 403, "INVALID": 422, "GONE": 410, "QUOTA_EXCEEDED": 429, "EVALUATION_REQUIRED": 409}[se.Code]
 		if se.Code == "QUOTA_EXCEEDED" && a.quota != nil {
 			a.quota.Inc(quotaKind(se.Message))
 		}
@@ -250,6 +250,41 @@ func (a *API) Handler() http.Handler {
 	}))
 	mux.Handle("POST /api/v1/releases/{id}/approve", a.role(authorization.RoleApprover, func(r *http.Request, p authorization.Principal) (int, any, error) {
 		out, err := a.Store.ApproveRelease(r.Context(), p.Tenant, r.PathValue("id"), p.Subject)
+		return 200, out, err
+	}))
+	mux.Handle("POST /api/v1/releases/{id}/evaluate", a.role(admin, func(r *http.Request, p authorization.Principal) (int, any, error) {
+		// ADR-0001 D26: the evaluation runs are ordinary runs of the candidate release, owned by the
+		// evaluator; they need the same gateway credential a run of theirs would
+		rel, err := a.Store.GetRelease(r.Context(), p.Tenant, r.PathValue("id"))
+		if err != nil {
+			return 0, nil, err
+		}
+		var doc agent.Document
+		if err := json.Unmarshal(rel.Document, &doc); err != nil {
+			return 0, nil, transport.Fail(http.StatusGone, "GONE", "release document is corrupt")
+		}
+		var cred *credential.Token
+		if gw := doc.Effective().Tools.Gateway; len(doc.Effective().Tools.Allow) > 0 && gw != "" {
+			auth, ok := a.Gateways[gw]
+			if !ok {
+				return 0, nil, transport.Fail(http.StatusConflict, "CONFLICT", "gateway "+gw+" is not configured on this host")
+			}
+			if auth.Exchanger != nil {
+				tok, _ := identity.Bearer(r)
+				if cred, err = a.delegate(r.Context(), auth, tok); err != nil {
+					return 0, nil, transport.Fail(http.StatusForbidden, "DELEGATION_REFUSED", "the authorization server refused to delegate the caller to this host")
+				}
+			}
+		}
+		out, err := a.Store.CreateEvaluation(r.Context(), p.Tenant, rel.ID, p.Subject, cred)
+		return http.StatusAccepted, out, err
+	}))
+	mux.Handle("GET /api/v1/releases/{id}/evaluations", a.role(admin, func(r *http.Request, p authorization.Principal) (int, any, error) {
+		out, err := a.Store.ListEvaluations(r.Context(), p.Tenant, r.PathValue("id"))
+		return 200, map[string]any{"evaluations": out}, err
+	}))
+	mux.Handle("GET /api/v1/evaluations/{id}", a.role(admin, func(r *http.Request, p authorization.Principal) (int, any, error) {
+		out, err := a.Store.GetEvaluation(r.Context(), p.Tenant, r.PathValue("id"))
 		return 200, out, err
 	}))
 	mux.Handle("POST /api/v1/releases/{id}/reject", a.role(authorization.RoleApprover, func(r *http.Request, p authorization.Principal) (int, any, error) {

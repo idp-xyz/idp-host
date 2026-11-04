@@ -291,6 +291,9 @@ func (s *Store) ApproveRelease(ctx context.Context, tenant, releaseID, by string
 		if err := dec.Decode(&doc); err != nil {
 			return err
 		}
+		if err := evaluationGate(ctx, tx, r.ID, &doc); err != nil {
+			return err
+		}
 		doc.ApprovedBy = by
 		env, err := agent.Seal(&doc)
 		if err != nil {

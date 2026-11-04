@@ -18,6 +18,7 @@ import (
 	"idp-host/internal/agent"
 	"idp-host/internal/agui"
 	"idp-host/internal/canonical"
+	"idp-host/internal/guard"
 	"idp-host/internal/mcpclient"
 	"idp-host/internal/model"
 	"idp-host/internal/run"
@@ -53,6 +54,7 @@ type Metrics interface {
 	StepFinished(provider, model, outcome string, latency time.Duration, usage model.Usage)
 	ToolCall(gateway, outcome string, latency time.Duration)
 	RunFinished(status string)
+	Guard(kind, outcome string) // kind: input | output; outcome: flagged | blocked | redacted | classifier_error
 }
 
 // Harness runs claims.
@@ -63,6 +65,8 @@ type Harness struct {
 	Metrics   Metrics
 	Log       *slog.Logger
 	Now       func() time.Time
+	// Classifiers are the external output classifiers of the HOST configuration, by name (D28).
+	Classifiers map[string]guard.Classifier
 
 	DeltaFlush      time.Duration // how often streamed text is persisted (default 50 ms)
 	ToolTimeout     time.Duration // per tool call (default 60 s)
@@ -106,6 +110,22 @@ type turn struct {
 	subagents map[string]agent.EmbeddedSubagent    // by tool name (D22)
 	resources map[string]map[string]agent.Resource // on-demand skill resources by skill and name (D23)
 	waiting   bool                                 // a delegated call's child run has not ended yet
+	output    *guard.Output                        // the tenant's and the release's output filter (D28)
+	flagged   map[string]bool                      // untrusted content already reported in this turn (D27)
+}
+
+// guardBlock ends a model call whose output the guard refused.
+type guardBlock struct {
+	rule   string
+	detail string
+}
+
+func (g *guardBlock) Error() string { return "output guard: " + g.rule }
+
+func (t *turn) guardMetric(kind, outcome string) {
+	if t.h.Metrics != nil {
+		t.h.Metrics.Guard(kind, outcome)
+	}
 }
 
 // Run executes one claim to its next resting state. It returns run.ErrFenced when the claim was
@@ -136,6 +156,12 @@ func (h *Harness) Run(ctx context.Context, c *run.Claim) error {
 	if m := rc.Run.Input.MaxOutputTokens; m > 0 && (t.def.Model.MaxOutputTokens == 0 || m < t.def.Model.MaxOutputTokens) {
 		t.def.Model.MaxOutputTokens = m
 	}
+	t.flagged = map[string]bool{}
+	out, err := guard.NewOutput(rc.BlockedPatterns, t.def.Guards.Output.Patterns, t.def.Guards.Output.Redact)
+	if err != nil {
+		return h.fail(ctx, c, run.FailInternal, "output guard: "+err.Error())
+	}
+	t.output = out
 	for _, ft := range rc.Run.Input.Tools {
 		t.frontend[ft.Name] = true
 	}
@@ -411,6 +437,10 @@ type streamer struct {
 	msgID   string
 	started bool
 	buf     strings.Builder
+	full    strings.Builder // everything streamed so far (output guard, D28)
+	out     *guard.Output
+	strict  bool   // release nothing before the final checks
+	blocked string // the blocked pattern that ended the stream
 	last    time.Time
 	err     error
 	cancel  context.CancelFunc
@@ -422,7 +452,17 @@ func (s *streamer) delta(d model.Delta) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.err != nil {
+	if s.err != nil || s.blocked != "" {
+		return
+	}
+	s.full.WriteString(d.Text)
+	if rule := s.out.Check(s.full.String()); rule != "" {
+		s.blocked = rule
+		s.buf.Reset()
+		s.cancel()
+		return
+	}
+	if s.strict {
 		return
 	}
 	s.buf.WriteString(d.Text)
@@ -440,7 +480,11 @@ func (s *streamer) flushLocked() {
 		events = append(events, agui.TextMessageStart(s.msgID, agui.RoleAssistant))
 		s.started = true
 	}
-	events = append(events, agui.TextMessageContent(s.msgID, s.buf.String()))
+	chunk, n := s.out.Redact(s.buf.String())
+	if n > 0 {
+		s.t.guardMetric("output", "redacted")
+	}
+	events = append(events, agui.TextMessageContent(s.msgID, chunk))
 	s.buf.Reset()
 	s.last = s.t.h.Now()
 	if err := s.t.h.Store.AppendEvents(s.t.ctx, s.t.claim, events); err != nil {
@@ -482,6 +526,15 @@ func (t *turn) loop() error {
 		if err != nil {
 			if errors.Is(err, run.ErrFenced) || t.ctx.Err() != nil {
 				return run.ErrFenced
+			}
+			var gb *guardBlock
+			if errors.As(err, &gb) {
+				_ = h.Store.FinishStep(t.ctx, t.claim, st, []agui.Event{agui.Custom(agui.CustomGuardBlocked, map[string]any{"step": step, "rule": gb.rule, "detail": gb.detail})})
+				if h.Metrics != nil {
+					h.Metrics.StepFinished(st.Provider, st.Model, "guard_blocked", st.Latency, model.Usage{})
+				}
+				t.guardMetric("output", "blocked")
+				return h.fail(t.ctx, t.claim, run.FailGuard, "the output guard refused the answer: "+gb.rule)
 			}
 			_ = h.Store.FinishStep(t.ctx, t.claim, st, nil)
 			if h.Metrics != nil {
@@ -541,13 +594,10 @@ func (t *turn) callModel(step int) (*model.Response, run.Step, error) {
 	h := t.h
 	refs := append([]agent.ModelRef{{Provider: t.def.Model.Provider, Model: t.def.Model.Model}}, t.def.Model.Fallbacks...)
 	st := run.Step{Step: step, Provider: refs[0].Provider, Model: refs[0].Model}
-	var ctxMsgs []agui.Message
-	for _, c := range t.rc.Run.Input.Context {
-		if c.Value != "" {
-			ctxMsgs = append(ctxMsgs, agui.Message{ID: "ctx", Role: agui.RoleDeveloper, Content: c.Description + "\n" + c.Value})
-		}
+	msgs, err := t.guardedMessages()
+	if err != nil {
+		return nil, st, err
 	}
-	msgs := append(ctxMsgs, t.messages...)
 	var lastErr error
 	for i, ref := range refs {
 		p, ok := h.Providers.Get(ref.Provider)
@@ -558,7 +608,7 @@ func (t *turn) callModel(step int) (*model.Response, run.Step, error) {
 		st.Provider, st.Model = ref.Provider, ref.Model
 		msgID := h.NewMessageID()
 		mctx, cancel := context.WithCancel(t.ctx)
-		s := &streamer{t: t, msgID: msgID, last: h.Now(), cancel: cancel}
+		s := &streamer{t: t, msgID: msgID, last: h.Now(), cancel: cancel, out: t.output, strict: t.def.Guards.Output.Strict}
 		start := h.Now()
 		resp, err := p.Complete(mctx, model.Request{Model: ref.Model, Instructions: t.def.Instructions, Messages: msgs, Tools: t.tools,
 			Temperature: t.def.Model.Temperature, MaxOutputTokens: t.def.Model.MaxOutputTokens}, s.delta)
@@ -567,14 +617,22 @@ func (t *turn) callModel(step int) (*model.Response, run.Step, error) {
 		if ferr := s.finish(); ferr != nil {
 			return nil, st, ferr // fenced while streaming
 		}
+		if s.blocked != "" {
+			st.ErrorCode = "guard_blocked"
+			return nil, st, &guardBlock{rule: s.blocked, detail: "the output matched a blocked pattern while streaming"}
+		}
 		if err == nil {
 			resp.Message.ID = msgID
-			if resp.Message.Content != "" && !s.started { // non-streaming provider: emit the text now
+			st.PromptTokens, st.CompletionTokens, st.StopReason = resp.Usage.PromptTokens, resp.Usage.CompletionTokens, resp.StopReason
+			if gerr := t.guardOutput(resp); gerr != nil {
+				st.ErrorCode = "guard_blocked"
+				return nil, st, gerr
+			}
+			if resp.Message.Content != "" && !s.started { // non-streaming provider or strict mode: emit the text now
 				if err := h.Store.AppendEvents(t.ctx, t.claim, []agui.Event{agui.TextMessageStart(msgID, agui.RoleAssistant), agui.TextMessageContent(msgID, resp.Message.Content)}); err != nil {
 					return nil, st, err
 				}
 			}
-			st.PromptTokens, st.CompletionTokens, st.StopReason = resp.Usage.PromptTokens, resp.Usage.CompletionTokens, resp.StopReason
 			return resp, st, nil
 		}
 		lastErr = err
@@ -688,4 +746,92 @@ func (t *turn) hostTool(name string) bool {
 		return true
 	}
 	return name == agent.ResourceReadTool && len(t.resources) > 0
+}
+
+// guardedMessages assembles what the model reads this step: the input-guard preamble when wrapping is
+// on, the caller's context and the thread, with tool results and context passed through the
+// release's input guard (D27). Findings are reported once per turn, on the run's stream.
+func (t *turn) guardedMessages() ([]agui.Message, error) {
+	in := t.def.Guards.Input
+	var msgs []agui.Message
+	if in.ToolResults != guard.ModeOff || in.Context != guard.ModeOff {
+		msgs = append(msgs, agui.Message{ID: "guard", Role: agui.RoleDeveloper, Content: guard.Preamble})
+	}
+	var events []agui.Event
+	report := func(key, source, id string, findings []guard.Finding, blocked bool) {
+		if len(findings) == 0 || t.flagged[key] {
+			return
+		}
+		t.flagged[key] = true
+		outcome := "flagged"
+		if blocked {
+			outcome = "blocked"
+		}
+		t.guardMetric("input", outcome)
+		events = append(events, agui.Custom(agui.CustomGuardFlagged, map[string]any{"source": source, "id": id, "outcome": outcome, "findings": findings}))
+	}
+	for i, c := range t.rc.Run.Input.Context {
+		if c.Value == "" {
+			continue
+		}
+		value, findings := guard.Apply(in.Context, "context", c.Value)
+		report(fmt.Sprintf("ctx:%d", i), "context", c.Description, findings, in.Context == guard.ModeBlock)
+		msgs = append(msgs, agui.Message{ID: "ctx", Role: agui.RoleDeveloper, Content: c.Description + "\n" + value})
+	}
+	for _, m := range t.messages {
+		if m.Role == agui.RoleTool && m.Content != "" && in.ToolResults != guard.ModeOff { // an error-only result is the HOST's own text
+			content, findings := guard.Apply(in.ToolResults, "tool_result", m.Content)
+			report("tool:"+m.ID, "tool_result", m.ToolCallID, findings, in.ToolResults == guard.ModeBlock)
+			m.Content = content
+		}
+		msgs = append(msgs, m)
+	}
+	if len(events) > 0 {
+		if err := t.h.Store.AppendEvents(t.ctx, t.claim, events); err != nil {
+			return nil, err
+		}
+	}
+	return msgs, nil
+}
+
+// guardOutput applies the output guard to a completed answer (D28): blocked patterns over the whole
+// text, redaction, then the external classifier. It rewrites the message's content in place.
+func (t *turn) guardOutput(resp *model.Response) error {
+	content := resp.Message.Content
+	if content == "" {
+		return nil
+	}
+	if rule := t.output.Check(content); rule != "" {
+		return &guardBlock{rule: rule, detail: "the answer matched a blocked pattern"}
+	}
+	if redacted, n := t.output.Redact(content); n > 0 {
+		resp.Message.Content = redacted
+		t.guardMetric("output", "redacted")
+	}
+	og := t.def.Guards.Output
+	if og.Classifier == "" {
+		return nil
+	}
+	c := t.h.Classifiers[og.Classifier]
+	var verdict guard.Verdict
+	var err error
+	if c == nil {
+		err = fmt.Errorf("%w: classifier %s is not configured on this host", guard.ErrClassifier, og.Classifier)
+	} else {
+		cctx, cancel := context.WithTimeout(t.ctx, t.h.ToolTimeout)
+		verdict, err = c.Classify(cctx, resp.Message.Content)
+		cancel()
+	}
+	if err != nil {
+		t.guardMetric("output", "classifier_error")
+		if og.OnError == guard.OnErrorBlock {
+			return &guardBlock{rule: "classifier:" + og.Classifier, detail: err.Error()}
+		}
+		t.h.Log.Warn("output classifier failed, answer released (onError=allow)", "classifier", og.Classifier, "error", err)
+		return t.h.Store.AppendEvents(t.ctx, t.claim, []agui.Event{agui.Custom(agui.CustomGuardFlagged, map[string]any{"source": "classifier", "id": og.Classifier, "outcome": "error", "detail": err.Error()})})
+	}
+	if !verdict.Allow {
+		return &guardBlock{rule: "classifier:" + og.Classifier, detail: strings.Join(verdict.Categories, ",")}
+	}
+	return nil
 }

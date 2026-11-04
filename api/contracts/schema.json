@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:idp:telos:host:1.3.0",
-  "title": "idp.telos.host 1.3.0",
-  "description": "idp-host（Agent Hosting & Coordination）对外发布的契约：AgentRelease（agent 行为的不可变发布件，ADR-0001 D2；1.1.0 起可嵌入 Skill，D17）、SkillRelease（skill 的不可变发布件）、Envelope（发布件加内容摘要）、AgentRun（一次运行的记录，API 返回的形态；1.3.0 起可为子 agent 运行，D22）和 RunOptions（1.2.0 起：创建运行时的调用方选项，D19）。1.3.0 新增：Definition 的 subagents 与 skillMerge（D22、D24）、Limits 的 maxSubagentDepth、SkillDefinition 的 resources（D23）、AgentRelease 的 subagents、AgentRun 的 parentRunId / depth 与状态 AWAITING_SUBAGENT。生产者是 idp-host，权威副本在 idp-host/api/contracts/，由 go test ./internal/run -run TestContract 保证与实现一致；idp-contracts 中的副本只能与之逐字节相同。JSON Schema 只描述形状与可本地判定的规则；摘要是否匹配由 agent.Open / agent.OpenSkill 判定，运行时不变量由 HOST 的状态机判定。",
+  "$id": "urn:idp:telos:host:1.4.0",
+  "title": "idp.telos.host 1.4.0",
+  "description": "idp-host（Agent Hosting & Coordination）对外发布的契约：AgentRelease（agent 行为的不可变发布件，ADR-0001 D2；1.1.0 起可嵌入 Skill，D17）、SkillRelease（skill 的不可变发布件）、Envelope（发布件加内容摘要）、AgentRun（一次运行的记录，API 返回的形态；1.3.0 起可为子 agent 运行，D22）和 RunOptions（1.2.0 起：创建运行时的调用方选项，D19）。1.3.0 新增：Definition 的 subagents 与 skillMerge（D22、D24）、Limits 的 maxSubagentDepth、SkillDefinition 的 resources（D23）、AgentRelease 的 subagents、AgentRun 的 parentRunId / depth 与状态 AWAITING_SUBAGENT。1.4.0 新增：Definition 的 guards（输入护栏与输出过滤，D27、D28）与 evaluation（评估集，D26），AgentRun 的 purpose。生产者是 idp-host，权威副本在 idp-host/api/contracts/，由 go test ./internal/run -run TestContract 保证与实现一致；idp-contracts 中的副本只能与之逐字节相同。JSON Schema 只描述形状与可本地判定的规则；摘要是否匹配由 agent.Open / agent.OpenSkill 判定，运行时不变量由 HOST 的状态机判定。",
   "oneOf": [
     {"$ref": "#/$defs/AgentRelease"},
     {"$ref": "#/$defs/SkillRelease"},
@@ -35,7 +35,7 @@
     },
     "Definition": {
       "title": "Definition",
-      "description": "agent 行为的全部输入：系统指令、模型配置、工具策略、确认策略、限制，按名字（可钉版本）引用的 skill，可委派的子 agent（D22）与 skill 合并规则（D24；缺省 append / union / strictest）。",
+      "description": "agent 行为的全部输入：系统指令、模型配置、工具策略、确认策略、限制，按名字（可钉版本）引用的 skill，可委派的子 agent（D22），skill 合并规则（D24；缺省 append / union / strictest），内容护栏（D27、D28；缺省输入 wrap、输出不过滤）与评估集（D26）。",
       "x-idp-telos-owner": "idp.telos.host",
       "type": "object",
       "additionalProperties": false,
@@ -48,7 +48,89 @@
         "limits": {"$ref": "#/$defs/Limits"},
         "skills": {"type": "array", "items": {"$ref": "#/$defs/SkillRef"}},
         "subagents": {"type": "array", "items": {"$ref": "#/$defs/SubagentRef"}},
-        "skillMerge": {"$ref": "#/$defs/SkillMerge"}
+        "skillMerge": {"$ref": "#/$defs/SkillMerge"},
+        "guards": {"$ref": "#/$defs/Guards"},
+        "evaluation": {"$ref": "#/$defs/Evaluation"}
+      }
+    },
+    "Guards": {
+      "title": "Guards",
+      "description": "发布件的内容护栏（D27、D28）：input 决定工具结果与调用方 context 进入模型前的处理，output 决定模型输出的过滤。",
+      "x-idp-telos-owner": "idp.telos.host",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["input"],
+      "properties": {
+        "input": {"$ref": "#/$defs/InputGuard"},
+        "output": {"$ref": "#/$defs/OutputGuard"}
+      }
+    },
+    "InputGuard": {
+      "title": "InputGuard",
+      "description": "输入护栏（D27）：off 不处理；wrap（缺省）把内容标为不可信（<untrusted> 定界，指令里附说明）并在发现注入模式时发 idp.host/guard.flagged；block 另把命中的内容替换为说明文字。检测是确定性规则：指令覆盖句式、角色标记伪装、人格切换、嵌入的工具调用 JSON、泄露提示词的请求、不可见字符、超长重复。",
+      "x-idp-telos-owner": "idp.telos.host",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["toolResults", "context"],
+      "properties": {
+        "toolResults": {"enum": ["off", "wrap", "block"]},
+        "context": {"enum": ["off", "wrap", "block"]}
+      }
+    },
+    "OutputGuard": {
+      "title": "OutputGuard",
+      "description": "输出过滤（D28）：patterns 是本发布件禁止出现在输出里的 RE2 模式（与租户策略的 blockedPatterns 并用），命中则运行以 GUARD_BLOCKED 失败并发 idp.host/guard.blocked；redact 是内置脱敏（email、phone、带 Luhn 校验的 card）；classifier 是 HOST 配置里登记的外部分类端点，onError 决定它失败时放行（allow，缺省）还是拦截（block）；strict 为 true 时先缓冲再放行，不再流式输出。",
+      "x-idp-telos-owner": "idp.telos.host",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [],
+      "properties": {
+        "patterns": {"type": "array", "maxItems": 64, "items": {"type": "string", "minLength": 1, "maxLength": 512}},
+        "redact": {"type": "array", "items": {"enum": ["email", "phone", "card"]}},
+        "classifier": {"type": "string", "pattern": "^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$"},
+        "onError": {"enum": ["allow", "block"]},
+        "strict": {"type": "boolean"}
+      }
+    },
+    "Evaluation": {
+      "title": "Evaluation",
+      "description": "发布件的固定评估集（D26）：每条用例是一条用户消息与对结果的期望；required 为 true 的发布件在最近一次评估全部通过前不能被批准（409 EVALUATION_REQUIRED）。评估以候选发布件的普通运行执行（AgentRun.purpose = evaluation），不计入租户并发。",
+      "x-idp-telos-owner": "idp.telos.host",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cases"],
+      "properties": {
+        "required": {"type": "boolean"},
+        "cases": {"type": "array", "maxItems": 32, "items": {"$ref": "#/$defs/EvalCase"}}
+      }
+    },
+    "EvalCase": {
+      "title": "EvalCase",
+      "description": "一条评估用例：名字（评估集内唯一）、用户输入、期望。",
+      "x-idp-telos-owner": "idp.telos.host",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "input", "expect"],
+      "properties": {
+        "name": {"type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$"},
+        "input": {"type": "string", "minLength": 1, "maxLength": 65536},
+        "expect": {"$ref": "#/$defs/Expectation"}
+      }
+    },
+    "Expectation": {
+      "title": "Expectation",
+      "description": "对一条用例运行结果的判定（至少一条规则）：contains / notContains 对最终助手消息做不区分大小写的子串判断，matches 是 RE2，toolCalled 要求运行调用过该工具，noToolCall 要求没有工具调用，maxSteps 限制步数。运行未以 COMPLETED 结束即不通过。",
+      "x-idp-telos-owner": "idp.telos.host",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [],
+      "properties": {
+        "contains": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 1024}},
+        "notContains": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 1024}},
+        "matches": {"type": "string", "minLength": 1, "maxLength": 512},
+        "toolCalled": {"type": "string", "pattern": "^[A-Za-z0-9_.-]{1,128}$"},
+        "noToolCall": {"type": "boolean"},
+        "maxSteps": {"type": "integer", "minimum": 1, "maximum": 200}
       }
     },
     "SubagentRef": {
@@ -266,6 +348,7 @@
         "executionRef": {"type": "string", "minLength": 1, "description": "调用方（EER）的 Execution 引用，由 RunOptions 的 idp.host/executionRef 设置（ADR-0001 D10、D19）；子 agent 运行继承父运行的值"},
         "parentRunId": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$", "description": "委派出本运行的父运行（子 agent 运行，D22）；调用方自己的运行没有"},
         "depth": {"type": "integer", "minimum": 0, "description": "委派深度：调用方的运行为 0（缺省），子运行为父运行 + 1"},
+        "purpose": {"enum": ["evaluation"], "description": "HOST 为评估集创建的运行（D26）；调用方自己的运行没有"},
         "traceId": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
         "deadlineAt": {"type": "string", "format": "date-time"},
         "createdAt": {"type": "string", "format": "date-time"},

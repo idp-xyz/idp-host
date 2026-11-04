@@ -55,6 +55,7 @@ import (
 	"idp-host/internal/api"
 	"idp-host/internal/config"
 	"idp-host/internal/credential"
+	"idp-host/internal/guard"
 	"idp-host/internal/harness"
 	"idp-host/internal/mcpclient"
 	"idp-host/internal/model"
@@ -238,6 +239,21 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 		}
 	}
 	registry := model.NewRegistry(providers...)
+	classifiers := map[string]guard.Classifier{}
+	for _, c := range cfg.Classifiers {
+		if c.Insecure && !dev {
+			return fmt.Errorf("classifier %s: insecure is allowed in development mode only", c.Name)
+		}
+		endpoint, err := model.CheckEndpoint(c.Endpoint, c.Insecure)
+		if err != nil {
+			return fmt.Errorf("classifier %s: %w", c.Name, err)
+		}
+		hc, err := model.NewHTTPClient(10*time.Second, c.CAFile)
+		if err != nil {
+			return fmt.Errorf("classifier %s: %w", c.Name, err)
+		}
+		classifiers[c.Name] = &guard.HTTPClassifier{Name: c.Name, Endpoint: endpoint, APIKey: c.APIKey, HTTP: hc, Timeout: time.Duration(c.TimeoutSeconds) * time.Second}
+	}
 	gateways := map[string]*harness.Gateway{}
 	gatewayAuth := map[string]api.GatewayAuth{}
 	for _, g := range cfg.Gateways {
@@ -287,7 +303,7 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 	wctx, cancelWorkers := context.WithCancel(ctx)
 	defer cancelWorkers()
 	if workers > 0 {
-		h := &harness.Harness{Store: store, Providers: registry, Gateways: gateways, Metrics: worker.NewMetrics(metrics), Log: log}
+		h := &harness.Harness{Store: store, Providers: registry, Gateways: gateways, Classifiers: classifiers, Metrics: worker.NewMetrics(metrics), Log: log}
 		w := &worker.Worker{ID: env("IDP_HOST_INSTANCE", hostname), Store: store, Harness: h, Concurrency: workers, Lease: lease, Log: log}
 		wg.Add(1)
 		go func() {
@@ -318,7 +334,7 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 			errc <- srv.ListenAndServe()
 		}
 	}()
-	log.Info("idp-host listening", "addr", srv.Addr, "devMode", dev, "tls", srv.TLSConfig != nil, "workers", workers, "providers", registry.Names(), "gateways", len(gateways))
+	log.Info("idp-host listening", "addr", srv.Addr, "devMode", dev, "tls", srv.TLSConfig != nil, "workers", workers, "providers", registry.Names(), "gateways", len(gateways), "classifiers", len(classifiers))
 	select {
 	case err := <-errc:
 		cancelWorkers()

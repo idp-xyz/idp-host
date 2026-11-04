@@ -16,6 +16,7 @@ type Metrics struct {
 	tools    *observability.CounterVec
 	toolSec  *observability.HistogramVec
 	runs     *observability.CounterVec
+	guards   *observability.CounterVec
 	Claims   *observability.CounterVec
 }
 
@@ -28,6 +29,7 @@ func NewMetrics(m *observability.Metrics) *Metrics {
 		tools:    m.Counter("idp_host_tool_calls_total", "Tool calls by gateway and outcome.", "gateway", "outcome"),
 		toolSec:  m.Histogram("idp_host_tool_seconds", "Tool call latency by gateway.", observability.DurationBuckets, "gateway"),
 		runs:     m.Counter("idp_host_runs_finished_total", "Run turns by resulting status.", "status"),
+		guards:   m.Counter("idp_host_guard_events_total", "Content guard decisions by kind (input, output) and outcome.", "kind", "outcome"),
 		Claims:   m.Counter("idp_host_claims_total", "Claims by result (served, fenced).", "result"),
 	}
 }
@@ -52,3 +54,6 @@ func (m *Metrics) ToolCall(gateway, outcome string, latency time.Duration) {
 
 // RunFinished implements harness.Metrics.
 func (m *Metrics) RunFinished(status string) { m.runs.Inc(status) }
+
+// Guard implements harness.Metrics.
+func (m *Metrics) Guard(kind, outcome string) { m.guards.Inc(kind, outcome) }

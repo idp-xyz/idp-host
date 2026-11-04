@@ -26,6 +26,10 @@ const (
 	StatusCanceled         = "CANCELED"
 )
 
+// PurposeEvaluation marks a run the HOST created to judge an evaluation case of a release (D26). Such
+// runs do not count against the tenant's concurrency.
+const PurposeEvaluation = "evaluation"
+
 // Terminal reports whether status is final.
 func Terminal(status string) bool {
 	return status == StatusCompleted || status == StatusFailed || status == StatusCanceled
@@ -55,6 +59,7 @@ const (
 	FailBudget      = "BUDGET_EXCEEDED"
 	FailInternal    = "INTERNAL"
 	FailReleaseGone = "RELEASE_UNAVAILABLE"
+	FailGuard       = "GUARD_BLOCKED" // the output guard refused the model's answer (D28)
 )
 
 // Refusal is a store decision against a worker's request (quota, missing release) as opposed to an
@@ -85,10 +90,11 @@ func (f *Failure) Error() string { return f.Code + ": " + f.Message }
 
 // Context is everything a worker needs to continue a run.
 type Context struct {
-	Run       Run
-	Release   *agent.Document
-	Messages  []agui.Message
-	ToolCalls []ToolCall // unresolved: pending, confirmed, rejected, expired or delegated but not yet answered
+	Run             Run
+	Release         *agent.Document
+	Messages        []agui.Message
+	ToolCalls       []ToolCall // unresolved: pending, confirmed, rejected, expired or delegated but not yet answered
+	BlockedPatterns []string   // the tenant policy's blocked output patterns (D28)
 }
 
 // ChildRunInput creates a sub-agent run under the parent's claim (D22).
@@ -153,6 +159,8 @@ type Run struct {
 	ExecutionRef        string    `json:"executionRef,omitempty"`
 	ParentRunID         string    `json:"parentRunId,omitempty"` // the run that delegated to this one (D22)
 	Depth               int       `json:"depth,omitempty"`       // 0 for a caller's run, parent depth + 1 for a sub-agent run
+	Purpose             string    `json:"purpose,omitempty"`     // "" (a caller's run) or PurposeEvaluation (D26)
+	EvaluationID        string    `json:"-"`
 	CredentialExpiresAt time.Time `json:"-"`
 	TraceID             string    `json:"traceId,omitempty"`
 	DeadlineAt          time.Time `json:"deadlineAt"`

@@ -277,12 +277,26 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// unwrapRE matches the HOST's untrusted-content wrapper (ADR-0001 D27) around a tool result.
+var unwrapRE = regexp.MustCompile(`(?s)^<untrusted source="[a-z_]+">\n(.*)\n</untrusted>$`)
+
 func (s *Server) decide(msgs []Message, tools []string) Turn {
 	s.calls.Add(1)
 	s.mu.Lock()
 	s.last = msgs
 	s.lastTools = tools
 	s.mu.Unlock()
+	// scripts reason about the tool's own output: strip the wrapper a guarded HOST adds
+	plain := make([]Message, len(msgs))
+	for i, m := range msgs {
+		if m.Role == "tool" {
+			if sub := unwrapRE.FindStringSubmatch(m.Content); sub != nil {
+				m.Content = sub[1]
+			}
+		}
+		plain[i] = m
+	}
+	msgs = plain
 	return s.Script(msgs, tools)
 }
 

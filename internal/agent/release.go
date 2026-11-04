@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"idp-host/internal/canonical"
+	"idp-host/internal/guard"
 )
 
 // SchemaVersion identifies the release document format.
@@ -79,6 +80,33 @@ type Definition struct {
 	Skills       []SkillRef         `json:"skills,omitempty"`    // resolved and embedded when a release is compiled (D17)
 	Subagents    []SubagentRef      `json:"subagents,omitempty"` // other agents this one may delegate to (D22)
 	SkillMerge   SkillMerge         `json:"skillMerge,omitzero"` // how skills are merged into the effective definition (D24)
+	Guards       Guards             `json:"guards,omitzero"`     // input and output content guards (D27, D28)
+	Evaluation   Evaluation         `json:"evaluation,omitzero"` // the fixed evaluation set and whether approval needs it (D26)
+}
+
+// Guards are the release's content guards.
+type Guards struct {
+	Input  InputGuard  `json:"input"`
+	Output OutputGuard `json:"output,omitzero"`
+}
+
+// InputGuard decides what happens to tool results and caller context before the model sees them
+// (D27): off, wrap (mark as untrusted, report findings) or block (wrap and withhold flagged content).
+type InputGuard struct {
+	ToolResults string `json:"toolResults"`
+	Context     string `json:"context"`
+}
+
+// OutputGuard filters the model's output (D28): blocked patterns (RE2) in addition to the tenant's,
+// built-in redactions (email, phone, card), an external classifier registered in the HOST
+// configuration with its failure policy, and strict mode (the answer is released only after the
+// checks, so nothing is streamed before them).
+type OutputGuard struct {
+	Patterns   []string `json:"patterns,omitempty"`
+	Redact     []string `json:"redact,omitempty"`
+	Classifier string   `json:"classifier,omitempty"`
+	OnError    string   `json:"onError,omitempty"` // allow (default) | block
+	Strict     bool     `json:"strict,omitempty"`
 }
 
 // SubagentRef names another agent of the tenant this agent may delegate to; Version 0 means the
@@ -187,6 +215,12 @@ func (d *Definition) Normalize() {
 	if d.SkillMerge.Confirmation == "" {
 		d.SkillMerge.Confirmation = MergeStrictest
 	}
+	if d.Guards.Input.ToolResults == "" {
+		d.Guards.Input.ToolResults = guard.ModeWrap
+	}
+	if d.Guards.Input.Context == "" {
+		d.Guards.Input.Context = guard.ModeWrap
+	}
 	if d.Confirmation.Default == "" {
 		d.Confirmation.Default = ConfirmAuto
 	}
@@ -265,6 +299,26 @@ func (d *Definition) Validate() error {
 	}
 	if d.SkillMerge.Instructions == MergePlaceholder && strings.Count(d.Instructions, SkillsPlaceholder) != 1 {
 		bad("skillMerge.instructions placeholder needs exactly one %s in the instructions", SkillsPlaceholder)
+	}
+	for name, mode := range map[string]string{"toolResults": d.Guards.Input.ToolResults, "context": d.Guards.Input.Context} {
+		if mode != guard.ModeOff && mode != guard.ModeWrap && mode != guard.ModeBlock {
+			bad("guards.input.%s must be off, wrap or block", name)
+		}
+	}
+	if _, err := guard.NewOutput(nil, d.Guards.Output.Patterns, d.Guards.Output.Redact); err != nil {
+		bad("guards.output: %v", err)
+	}
+	if c := d.Guards.Output.Classifier; c != "" && !providerRE.MatchString(c) {
+		bad("guards.output.classifier is invalid")
+	}
+	if e := d.Guards.Output.OnError; e != "" && e != guard.OnErrorAllow && e != guard.OnErrorBlock {
+		bad("guards.output.onError must be allow or block")
+	}
+	if d.Guards.Output.OnError != "" && d.Guards.Output.Classifier == "" {
+		bad("guards.output.onError needs a classifier")
+	}
+	if err := d.Evaluation.Validate(); err != nil {
+		bad("evaluation: %v", err)
 	}
 	l := d.Limits
 	if l.MaxSteps < 1 || l.MaxSteps > 200 || l.MaxToolCallsPerStep < 1 || l.MaxToolCallsPerStep > 64 ||
@@ -409,4 +463,131 @@ func Open(e *Envelope) (*Document, error) {
 		return nil, err
 	}
 	return &d, nil
+}
+
+// Evaluation is the release's fixed evaluation set (ADR-0001 D26): cases the HOST runs as ordinary
+// runs of the candidate release, each judged against its expectation. Required releases cannot be
+// approved before their latest evaluation passed in full.
+type Evaluation struct {
+	Required bool       `json:"required,omitempty"`
+	Cases    []EvalCase `json:"cases"`
+}
+
+// EvalCase is one evaluation case: a user message and what the agent's answer must satisfy.
+type EvalCase struct {
+	Name   string      `json:"name"`
+	Input  string      `json:"input"`
+	Expect Expectation `json:"expect"`
+}
+
+// Expectation is judged on the run's final assistant message, the tools it called and its step count.
+type Expectation struct {
+	Contains    []string `json:"contains,omitempty"`    // every substring must appear (case-insensitive)
+	NotContains []string `json:"notContains,omitempty"` // no substring may appear (case-insensitive)
+	Matches     string   `json:"matches,omitempty"`     // RE2 the answer must match
+	ToolCalled  string   `json:"toolCalled,omitempty"`  // a tool the run must have called
+	NoToolCall  bool     `json:"noToolCall,omitempty"`  // the run must not have called any tool
+	MaxSteps    int      `json:"maxSteps,omitempty"`    // the run must finish within this many steps
+}
+
+// MaxEvalCases bounds an evaluation set.
+const MaxEvalCases = 32
+
+var caseNameRE = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
+
+// Validate checks the evaluation set.
+func (e *Evaluation) Validate() error {
+	if len(e.Cases) > MaxEvalCases {
+		return fmt.Errorf("at most %d cases", MaxEvalCases)
+	}
+	if e.Required && len(e.Cases) == 0 {
+		return errors.New("a required evaluation needs at least one case")
+	}
+	names := map[string]bool{}
+	for i, c := range e.Cases {
+		if !caseNameRE.MatchString(c.Name) || names[c.Name] {
+			return fmt.Errorf("cases[%d]: name is invalid or duplicated", i)
+		}
+		names[c.Name] = true
+		if strings.TrimSpace(c.Input) == "" || len(c.Input) > 64<<10 {
+			return fmt.Errorf("cases[%d]: input is required (at most 64 KiB)", i)
+		}
+		x := c.Expect
+		if len(x.Contains) == 0 && len(x.NotContains) == 0 && x.Matches == "" && x.ToolCalled == "" && !x.NoToolCall && x.MaxSteps == 0 {
+			return fmt.Errorf("cases[%d]: expect needs at least one rule", i)
+		}
+		for _, s := range append(append([]string{}, x.Contains...), x.NotContains...) {
+			if s == "" || len(s) > 1024 {
+				return fmt.Errorf("cases[%d]: contains/notContains entries must be 1-1024 characters", i)
+			}
+		}
+		if x.Matches != "" {
+			if len(x.Matches) > 512 {
+				return fmt.Errorf("cases[%d]: matches is too long", i)
+			}
+			if _, err := regexp.Compile(x.Matches); err != nil {
+				return fmt.Errorf("cases[%d]: matches: %v", i, err)
+			}
+		}
+		if x.ToolCalled != "" && !toolNameRE.MatchString(x.ToolCalled) {
+			return fmt.Errorf("cases[%d]: toolCalled is not a tool name", i)
+		}
+		if x.ToolCalled != "" && x.NoToolCall {
+			return fmt.Errorf("cases[%d]: toolCalled and noToolCall contradict", i)
+		}
+		if x.MaxSteps < 0 || x.MaxSteps > 200 {
+			return fmt.Errorf("cases[%d]: maxSteps out of range", i)
+		}
+	}
+	return nil
+}
+
+// Outcome is what an evaluation case is judged on.
+type Outcome struct {
+	Status      string   // the run's terminal status
+	FailureCode string   // when it failed
+	Answer      string   // the run's last assistant message
+	Tools       []string // the tools the run called (HOST-executed, delegated or frontend)
+	Steps       int
+}
+
+// Judge decides whether an outcome satisfies the expectation and says why not.
+func (x Expectation) Judge(o Outcome) (bool, string) {
+	if o.Status != "COMPLETED" {
+		return false, fmt.Sprintf("the run ended %s %s", o.Status, o.FailureCode)
+	}
+	lower := strings.ToLower(o.Answer)
+	for _, s := range x.Contains {
+		if !strings.Contains(lower, strings.ToLower(s)) {
+			return false, fmt.Sprintf("answer does not contain %q", s)
+		}
+	}
+	for _, s := range x.NotContains {
+		if strings.Contains(lower, strings.ToLower(s)) {
+			return false, fmt.Sprintf("answer contains %q", s)
+		}
+	}
+	if x.Matches != "" {
+		if re, err := regexp.Compile(x.Matches); err != nil || !re.MatchString(o.Answer) {
+			return false, fmt.Sprintf("answer does not match %q", x.Matches)
+		}
+	}
+	if x.ToolCalled != "" {
+		called := false
+		for _, t := range o.Tools {
+			if t == x.ToolCalled {
+				called = true
+			}
+		}
+		if !called {
+			return false, fmt.Sprintf("tool %s was not called (called: %s)", x.ToolCalled, strings.Join(o.Tools, ", "))
+		}
+	}
+	if x.NoToolCall && len(o.Tools) > 0 {
+		return false, "tools were called: " + strings.Join(o.Tools, ", ")
+	}
+	if x.MaxSteps > 0 && o.Steps > x.MaxSteps {
+		return false, fmt.Sprintf("%d steps, at most %d allowed", o.Steps, x.MaxSteps)
+	}
+	return true, ""
 }

@@ -15,8 +15,21 @@ import (
 
 // File is the document.
 type File struct {
-	Providers []Provider `yaml:"providers"`
-	Gateways  []Gateway  `yaml:"gateways"`
+	Providers   []Provider   `yaml:"providers"`
+	Gateways    []Gateway    `yaml:"gateways"`
+	Classifiers []Classifier `yaml:"classifiers"` // external output classifiers (ADR-0001 D28)
+}
+
+// Classifier is an external content classifier a release's guards.output.classifier may name:
+// POST {"text": ...} answered with {"allow": bool, "categories": [...]}.
+type Classifier struct {
+	Name           string `yaml:"name"`
+	Endpoint       string `yaml:"endpoint"`
+	APIKey         string `yaml:"apiKey"`     // development only
+	APIKeyFile     string `yaml:"apiKeyFile"` // production
+	CAFile         string `yaml:"caFile"`
+	TimeoutSeconds int    `yaml:"timeoutSeconds"`
+	Insecure       bool   `yaml:"insecure"` // plain http to a non-loopback host; development mode only
 }
 
 // Provider is one model endpoint.
@@ -84,6 +97,22 @@ func Load(path string) (*File, error) {
 		}
 		if p.APIKey, err = secret(p.APIKey, p.APIKeyFile); err != nil {
 			return nil, fmt.Errorf("provider %s: %w", p.Name, err)
+		}
+	}
+	for i := range f.Classifiers {
+		c := &f.Classifiers[i]
+		if !nameRE.MatchString(c.Name) || seen["c:"+c.Name] {
+			return nil, fmt.Errorf("classifiers[%d]: name %q invalid or duplicated", i, c.Name)
+		}
+		seen["c:"+c.Name] = true
+		if c.Endpoint == "" {
+			return nil, fmt.Errorf("classifier %s: endpoint is required", c.Name)
+		}
+		if c.TimeoutSeconds < 0 || c.TimeoutSeconds > 60 {
+			return nil, fmt.Errorf("classifier %s: timeoutSeconds must be within [0, 60]", c.Name)
+		}
+		if c.APIKey, err = secret(c.APIKey, c.APIKeyFile); err != nil {
+			return nil, fmt.Errorf("classifier %s: %w", c.Name, err)
 		}
 	}
 	for i := range f.Gateways {

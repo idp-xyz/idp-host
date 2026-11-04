@@ -31,7 +31,7 @@ var update = flag.Bool("update", false, "regenerate api/contracts/examples.json 
 
 const (
 	contractDir = "../../api/contracts"
-	contractID  = "urn:idp:telos:host:1.3.0"
+	contractID  = "urn:idp:telos:host:1.4.0"
 )
 
 type noLoader struct{}
@@ -126,7 +126,12 @@ func exampleDocuments() (full, minimal *agent.Document) {
 			Limits:       agent.Limits{MaxSteps: 12, MaxToolCallsPerStep: 4, RunTimeoutSeconds: 600, ConfirmationTimeoutSeconds: 1800, MaxTokensPerRun: 200000, MaxSubagentDepth: 2},
 			Skills:       []agent.SkillRef{{Name: "customs-declaration", Version: 2}},
 			Subagents:    []agent.SubagentRef{{Name: "tariff-expert", Version: 4, Description: "Delegate tariff classification questions (HS codes, duty rates) to the tariff expert."}},
-			SkillMerge:   agent.SkillMerge{Instructions: agent.MergeAppend, Tools: agent.MergeCeiling, Confirmation: agent.MergeStrictest}},
+			SkillMerge:   agent.SkillMerge{Instructions: agent.MergeAppend, Tools: agent.MergeCeiling, Confirmation: agent.MergeStrictest},
+			Guards: agent.Guards{Input: agent.InputGuard{ToolResults: "block", Context: "wrap"},
+				Output: agent.OutputGuard{Patterns: []string{`(?i)internal use only`}, Redact: []string{"email", "card"}, Classifier: "moderation", OnError: "block", Strict: true}},
+			Evaluation: agent.Evaluation{Required: true, Cases: []agent.EvalCase{
+				{Name: "greets", Input: "hello", Expect: agent.Expectation{Contains: []string{"parcel"}, NoToolCall: true, MaxSteps: 1}},
+				{Name: "looks-up-shipment", Input: "where is shipment 42?", Expect: agent.Expectation{ToolCalled: "parcel__get_shipment", NotContains: []string{"I cannot"}, Matches: `(?i)shipment 42`}}}}},
 		Skills:    []agent.EmbeddedSkill{{Name: "customs-declaration", Version: 2, Digest: skillEnv.Digest, Definition: skill.Definition}},
 		Subagents: []agent.EmbeddedSubagent{{Name: "tariff-expert", AgentID: "5a6b7c8d-0000-4000-8000-000000000005", Version: 4, Digest: "sha256:" + strings.Repeat("7e", 32)}}}
 	minimal = &agent.Document{SchemaVersion: agent.SchemaVersion, ReleaseID: "0b1c2d3e-5b6d-4c8e-9f01-23456789abce", TenantID: "1a2b3c4d-0000-4000-8000-000000000001",
@@ -147,6 +152,8 @@ func exampleRuns(releaseID, digest string) []run.Run {
 		{ID: run.ChildRunID("run_01JD7Q3Z8M8T0G3C6N4V9S2A1E", "call_tariff_1"), ThreadID: run.ChildRunID("run_01JD7Q3Z8M8T0G3C6N4V9S2A1E", "call_tariff_1"), AgentID: "5a6b7c8d-0000-4000-8000-000000000005",
 			ReleaseID: "e1f2a3b4-5b6d-4c8e-9f01-23456789abd0", ReleaseDigest: "sha256:" + strings.Repeat("7e", 32), Owner: "carol", Status: run.StatusRunning, StepCount: 1,
 			ParentRunID: "run_01JD7Q3Z8M8T0G3C6N4V9S2A1E", Depth: 1, DeadlineAt: at.Add(30 * time.Minute), CreatedAt: at.Add(20*time.Minute + 2*time.Second), StartedAt: at.Add(20*time.Minute + 3*time.Second)},
+		{ID: "eval_7f3c1a2e5b6d4c8e9f0123456789abcd_0", ThreadID: "eval_7f3c1a2e5b6d4c8e9f0123456789abcd_0", AgentID: "9e8d7c6b-0000-4000-8000-000000000002", ReleaseID: releaseID, ReleaseDigest: digest, Owner: "alice",
+			Status: run.StatusCompleted, StepCount: 1, Purpose: run.PurposeEvaluation, DeadlineAt: at.Add(40 * time.Minute), CreatedAt: at.Add(30 * time.Minute), StartedAt: at.Add(30*time.Minute + time.Second), FinishedAt: at.Add(30*time.Minute + 4*time.Second)},
 		{ID: "run_01JD7Q3Z8M8T0G3C6N4V9S2A1D", ThreadID: "thr-ops-43", AgentID: "9e8d7c6b-0000-4000-8000-000000000002", ReleaseID: releaseID, ReleaseDigest: digest, Owner: "carol",
 			Status: run.StatusFailed, StepCount: 12, CancelRequested: false, FailureCode: run.FailStepLimit, FailureMessage: "the run reached its limit of 12 steps",
 			ExecutionRef: "eer:execution:0192f3a1", DeadlineAt: at.Add(30 * time.Minute), CreatedAt: at.Add(20 * time.Minute), StartedAt: at.Add(20*time.Minute + time.Second), FinishedAt: at.Add(25 * time.Minute)},
@@ -207,7 +214,7 @@ func buildExamples(t *testing.T) []byte {
 		add("RunOptions", o)
 	}
 	b, err := json.MarshalIndent(examplesFile{
-		Description: "idp.telos.host 1.3.0 的示例：每一个都是 idp-host 实际产出或原样接受的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录，RunOptions 经 run.ParseOptions 解析后原样往返）。",
+		Description: "idp.telos.host 1.4.0 的示例：每一个都是 idp-host 实际产出或原样接受的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录，RunOptions 经 run.ParseOptions 解析后原样往返）。",
 		GeneratedBy: "go test ./internal/run -run TestContract -update",
 		Examples:    out,
 	}, "", "  ")
@@ -319,7 +326,8 @@ func TestContractFieldsMatchGo(t *testing.T) {
 	closed := map[string]any{"AgentRelease": agent.Document{}, "Definition": agent.Definition{}, "ModelProfile": agent.ModelProfile{}, "ModelRef": agent.ModelRef{},
 		"ToolPolicy": agent.ToolPolicy{}, "ConfirmationPolicy": agent.ConfirmationPolicy{}, "Limits": agent.Limits{}, "Envelope": agent.Envelope{}, "AgentRun": run.Run{},
 		"SkillRef": agent.SkillRef{}, "SkillDefinition": agent.SkillDefinition{}, "EmbeddedSkill": agent.EmbeddedSkill{}, "SkillRelease": agent.SkillDocument{},
-		"RunOptions": run.Options{}, "SubagentRef": agent.SubagentRef{}, "EmbeddedSubagent": agent.EmbeddedSubagent{}, "SkillMerge": agent.SkillMerge{}, "Resource": agent.Resource{}}
+		"RunOptions": run.Options{}, "SubagentRef": agent.SubagentRef{}, "EmbeddedSubagent": agent.EmbeddedSubagent{}, "SkillMerge": agent.SkillMerge{}, "Resource": agent.Resource{},
+		"Guards": agent.Guards{}, "InputGuard": agent.InputGuard{}, "OutputGuard": agent.OutputGuard{}, "Evaluation": agent.Evaluation{}, "EvalCase": agent.EvalCase{}, "Expectation": agent.Expectation{}}
 	for def, zero := range closed {
 		d, ok := defs[def].(map[string]any)
 		if !ok {
@@ -424,19 +432,34 @@ func TestContractRejectsWhatOpenRejects(t *testing.T) {
 		"resource bad name":         {"skills.0.definition.resources.0.name", "has space"},
 		"reserved allow entry":      {"definition.tools.allow.0", "agent__tariff-expert"},
 		"reserved skill tool":       {"skills.0.definition.tools.0", "resource__read"},
+		"guard input mode unknown":  {"definition.guards.input.toolResults", "sanitize"},
+		"guard redact unknown":      {"definition.guards.output.redact.0", "ssn"},
+		"guard onError unknown":     {"definition.guards.output.onError", "retry"},
+		"guard pattern empty":       {"definition.guards.output.patterns.0", ""},
+		"eval case bad name":        {"definition.evaluation.cases.0.name", "has space"},
+		"eval case empty input":     {"definition.evaluation.cases.0.input", ""},
+		"eval max steps too high":   {"definition.evaluation.cases.0.expect.maxSteps", 1000},
+		"eval tool not a name":      {"definition.evaluation.cases.1.expect.toolCalled", "bad name"},
+		"unknown evaluation field":  {"definition.evaluation.extra", true},
 	}
 	// cross-reference rules only the implementation can check (a schema cannot relate two arrays)
 	implOnly := map[string]struct {
 		path  string
 		value any
 	}{
-		"skill name mismatch":     {"skills.0.name", "other-skill"},
-		"embedded skill missing":  {"skills", []any{}},
-		"skill version mismatch":  {"skills.0.version", 3},
-		"subagent name mismatch":  {"subagents.0.name", "other-agent"},
-		"subagent missing":        {"subagents", []any{}},
-		"subagent is itself":      {"subagents.0.agentId", "9e8d7c6b-0000-4000-8000-000000000002"},
-		"skill tool over ceiling": {"skills.0.definition.tools.0", "parcel__pay_duty"},
+		"skill name mismatch":         {"skills.0.name", "other-skill"},
+		"embedded skill missing":      {"skills", []any{}},
+		"skill version mismatch":      {"skills.0.version", 3},
+		"subagent name mismatch":      {"subagents.0.name", "other-agent"},
+		"subagent missing":            {"subagents", []any{}},
+		"subagent is itself":          {"subagents.0.agentId", "9e8d7c6b-0000-4000-8000-000000000002"},
+		"skill tool over ceiling":     {"skills.0.definition.tools.0", "parcel__pay_duty"},
+		"guard bad regex":             {"definition.guards.output.patterns.0", "("},
+		"guard onError no classifier": {"definition.guards.output", map[string]any{"onError": "block"}},
+		"eval duplicate case":         {"definition.evaluation.cases.1.name", "greets"},
+		"eval empty expectation":      {"definition.evaluation.cases.0.expect", map[string]any{}},
+		"eval contradiction":          {"definition.evaluation.cases.1.expect", map[string]any{"toolCalled": "x", "noToolCall": true}},
+		"eval required no cases":      {"definition.evaluation", map[string]any{"required": true, "cases": []any{}}},
 	}
 	for name, c := range implOnly {
 		var m map[string]any
@@ -479,6 +502,7 @@ func TestContractRejectsWhatOpenRejects(t *testing.T) {
 		"bad deadline":      {"deadlineAt", "tomorrow"},
 		"negative depth":    {"depth", -1},
 		"bad parent id":     {"parentRunId", "run 1"},
+		"unknown purpose":   {"purpose", "test"},
 	}
 	r := exampleRuns(full.ReleaseID, env.Digest)[0]
 	for name, c := range runCases {

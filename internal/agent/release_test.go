@@ -218,3 +218,62 @@ func TestSubagentReferencesAndReservedTools(t *testing.T) {
 		t.Fatal("oversized resource accepted")
 	}
 }
+
+func TestEvaluationValidationAndJudge(t *testing.T) {
+	ok := Evaluation{Required: true, Cases: []EvalCase{{Name: "greets", Input: "hi", Expect: Expectation{Contains: []string{"Hello"}, NoToolCall: true, MaxSteps: 1}}}}
+	if err := ok.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	bad := []Evaluation{
+		{Required: true},
+		{Cases: []EvalCase{{Name: "a b", Input: "x", Expect: Expectation{Contains: []string{"y"}}}}},
+		{Cases: []EvalCase{{Name: "a", Input: "", Expect: Expectation{Contains: []string{"y"}}}}},
+		{Cases: []EvalCase{{Name: "a", Input: "x", Expect: Expectation{}}}},
+		{Cases: []EvalCase{{Name: "a", Input: "x", Expect: Expectation{Matches: "("}}}},
+		{Cases: []EvalCase{{Name: "a", Input: "x", Expect: Expectation{ToolCalled: "sum", NoToolCall: true}}}},
+		{Cases: []EvalCase{{Name: "a", Input: "x", Expect: Expectation{Contains: []string{"y"}}}, {Name: "a", Input: "x", Expect: Expectation{Contains: []string{"y"}}}}},
+	}
+	for i, b := range bad {
+		if err := b.Validate(); err == nil {
+			t.Fatalf("bad[%d] accepted", i)
+		}
+	}
+	x := Expectation{Contains: []string{"hello"}, NotContains: []string{"sorry"}, Matches: `\d+`, ToolCalled: "sum", MaxSteps: 2}
+	good := Outcome{Status: "COMPLETED", Answer: "Hello, the sum is 3", Tools: []string{"sum"}, Steps: 2}
+	if pass, why := x.Judge(good); !pass {
+		t.Fatal(why)
+	}
+	for name, o := range map[string]Outcome{
+		"failed run":  {Status: "FAILED", FailureCode: "STEP_LIMIT", Answer: "Hello 3", Tools: []string{"sum"}, Steps: 1},
+		"missing":     {Status: "COMPLETED", Answer: "the sum is 3", Tools: []string{"sum"}, Steps: 1},
+		"forbidden":   {Status: "COMPLETED", Answer: "Hello, sorry, 3", Tools: []string{"sum"}, Steps: 1},
+		"no match":    {Status: "COMPLETED", Answer: "Hello, three", Tools: []string{"sum"}, Steps: 1},
+		"tool unused": {Status: "COMPLETED", Answer: "Hello 3", Tools: nil, Steps: 1},
+		"too long":    {Status: "COMPLETED", Answer: "Hello 3", Tools: []string{"sum"}, Steps: 3},
+	} {
+		if pass, why := x.Judge(o); pass || why == "" {
+			t.Fatalf("%s judged pass", name)
+		}
+	}
+	if pass, why := (Expectation{NoToolCall: true}).Judge(Outcome{Status: "COMPLETED", Answer: "x", Tools: []string{"echo"}}); pass || !strings.Contains(why, "echo") {
+		t.Fatalf("%v %s", pass, why)
+	}
+	// guards validation
+	d := Definition{Instructions: "x", Model: ModelProfile{Provider: "p", Model: "m"}}
+	d.Normalize()
+	if d.Guards.Input != (InputGuard{ToolResults: "wrap", Context: "wrap"}) {
+		t.Fatalf("%+v", d.Guards.Input)
+	}
+	for _, g := range []Guards{
+		{Input: InputGuard{ToolResults: "sanitize", Context: "wrap"}},
+		{Input: InputGuard{ToolResults: "wrap", Context: "wrap"}, Output: OutputGuard{Patterns: []string{"("}}},
+		{Input: InputGuard{ToolResults: "wrap", Context: "wrap"}, Output: OutputGuard{Redact: []string{"ssn"}}},
+		{Input: InputGuard{ToolResults: "wrap", Context: "wrap"}, Output: OutputGuard{OnError: "block"}},
+		{Input: InputGuard{ToolResults: "wrap", Context: "wrap"}, Output: OutputGuard{Classifier: "Bad Name"}},
+	} {
+		d.Guards = g
+		if err := d.Validate(); err == nil {
+			t.Fatalf("guards %+v accepted", g)
+		}
+	}
+}

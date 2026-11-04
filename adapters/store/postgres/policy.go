@@ -2,10 +2,13 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"idp-host/internal/guard"
 )
 
 // Policy is a tenant's governance policy (ADR-0001 D15). Zero means unlimited.
@@ -13,13 +16,14 @@ type Policy struct {
 	MaxConcurrentRuns int       `json:"maxConcurrentRuns"`
 	TokensPerDay      int64     `json:"tokensPerDay"`
 	MaxTokensPerRun   int64     `json:"maxTokensPerRun"`
+	BlockedPatterns   []string  `json:"blockedPatterns"` // RE2 patterns no agent of the tenant may emit (D28)
 	UpdatedBy         string    `json:"updatedBy,omitempty"`
 	UpdatedAt         time.Time `json:"updatedAt,omitzero"`
 	Default           bool      `json:"default"` // true when the tenant has no stored policy
 }
 
 // DefaultPolicy applies to tenants without a stored policy.
-var DefaultPolicy = Policy{MaxConcurrentRuns: 10, Default: true}
+var DefaultPolicy = Policy{MaxConcurrentRuns: 10, BlockedPatterns: []string{}, Default: true}
 
 // Usage is a tenant's consumption over the rolling day plus what is in flight now.
 type Usage struct {
@@ -35,19 +39,29 @@ func (p Policy) Validate() error {
 	if p.MaxConcurrentRuns < 0 || p.MaxConcurrentRuns > 100000 || p.TokensPerDay < 0 || p.MaxTokensPerRun < 0 {
 		return fail("INVALID", "policy values must be >= 0 (0 = unlimited)")
 	}
+	if _, err := guard.CompilePatterns(p.BlockedPatterns); err != nil {
+		return fail("INVALID", "blockedPatterns: %v", err)
+	}
 	return nil
 }
 
 func policyOf(ctx context.Context, tx pgx.Tx, tenant string) (Policy, error) {
 	var p Policy
 	var by *string
-	err := tx.QueryRow(ctx, `SELECT max_concurrent_runs, tokens_per_day, max_tokens_per_run, updated_by, updated_at FROM tenant_policies WHERE tenant_id = $1`, tenant).
-		Scan(&p.MaxConcurrentRuns, &p.TokensPerDay, &p.MaxTokensPerRun, &by, &p.UpdatedAt)
+	var patterns []byte
+	err := tx.QueryRow(ctx, `SELECT max_concurrent_runs, tokens_per_day, max_tokens_per_run, updated_by, updated_at, blocked_patterns FROM tenant_policies WHERE tenant_id = $1`, tenant).
+		Scan(&p.MaxConcurrentRuns, &p.TokensPerDay, &p.MaxTokensPerRun, &by, &p.UpdatedAt, &patterns)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return DefaultPolicy, nil
 	}
 	if err != nil {
 		return p, err
+	}
+	if err := json.Unmarshal(patterns, &p.BlockedPatterns); err != nil {
+		return p, err
+	}
+	if p.BlockedPatterns == nil {
+		p.BlockedPatterns = []string{}
 	}
 	if by != nil {
 		p.UpdatedBy = *by
@@ -72,11 +86,15 @@ func (s *Store) SetPolicy(ctx context.Context, tenant string, p Policy, by strin
 	}
 	var out Policy
 	err := s.InTenant(ctx, tenant, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `INSERT INTO tenant_policies (tenant_id, max_concurrent_runs, tokens_per_day, max_tokens_per_run, updated_by)
-			VALUES ($1, $2, $3, $4, $5)
+		patterns, _ := json.Marshal(p.BlockedPatterns)
+		if p.BlockedPatterns == nil {
+			patterns = []byte(`[]`)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO tenant_policies (tenant_id, max_concurrent_runs, tokens_per_day, max_tokens_per_run, updated_by, blocked_patterns)
+			VALUES ($1, $2, $3, $4, $5, $6)
 			ON CONFLICT (tenant_id) DO UPDATE SET max_concurrent_runs = EXCLUDED.max_concurrent_runs, tokens_per_day = EXCLUDED.tokens_per_day,
-			  max_tokens_per_run = EXCLUDED.max_tokens_per_run, updated_by = EXCLUDED.updated_by, updated_at = now()`,
-			tenant, p.MaxConcurrentRuns, p.TokensPerDay, p.MaxTokensPerRun, by); err != nil {
+			  max_tokens_per_run = EXCLUDED.max_tokens_per_run, updated_by = EXCLUDED.updated_by, updated_at = now(), blocked_patterns = EXCLUDED.blocked_patterns`,
+			tenant, p.MaxConcurrentRuns, p.TokensPerDay, p.MaxTokensPerRun, by, patterns); err != nil {
 			return err
 		}
 		if err := Audit(ctx, tx, tenant, by, "policy.set", "", p); err != nil {
@@ -98,7 +116,7 @@ func (s *Store) tokensLastDay(ctx context.Context, tx pgx.Tx) (int64, error) {
 
 func activeRuns(ctx context.Context, tx pgx.Tx) (int, error) {
 	var n int
-	err := tx.QueryRow(ctx, `SELECT count(*) FROM runs WHERE status IN ('QUEUED', 'RUNNING', 'AWAITING_INPUT', 'AWAITING_SUBAGENT')`).Scan(&n)
+	err := tx.QueryRow(ctx, `SELECT count(*) FROM runs WHERE status IN ('QUEUED', 'RUNNING', 'AWAITING_INPUT', 'AWAITING_SUBAGENT') AND coalesce(purpose, '') <> 'evaluation'`).Scan(&n)
 	return n, err
 }
 

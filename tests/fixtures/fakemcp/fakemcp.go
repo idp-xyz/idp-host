@@ -23,8 +23,9 @@ type Tool struct {
 // Server is the fake.
 type Server struct {
 	Tools         []Tool
-	RequireBearer string // when set, calls must carry exactly this bearer
-	StreamResults bool   // answer tools/call as an SSE stream
+	RequireBearer string            // when set, calls must carry exactly this bearer
+	StreamResults bool              // answer tools/call as an SSE stream
+	Results       map[string]string // when set for a tool name, that text is returned instead of the handler's
 	mu            sync.Mutex
 	bearers       []string
 	calls         []Call
@@ -39,7 +40,7 @@ type Call struct {
 
 // New returns a server with the default tools: sum (a+b), echo (message), fail (isError), slow.
 func New() *Server {
-	return &Server{Tools: []Tool{
+	return &Server{Results: map[string]string{}, Tools: []Tool{
 		{Name: "sum", Description: "Adds a and b", InputSchema: `{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"]}`,
 			Handle: func(args map[string]any) (string, bool) {
 				a, _ := args["a"].(float64)
@@ -155,6 +156,9 @@ func (s *Server) Handler() http.Handler {
 			for _, t := range s.Tools {
 				if t.Name == name {
 					text, isErr := t.Handle(args)
+					if fixed, ok := s.Results[name]; ok {
+						text, isErr = fixed, false
+					}
 					s.write(w, req.ID, map[string]any{"content": []map[string]any{{"type": "text", "text": text}}, "isError": isErr, "_meta": info}, nil, 200)
 					return
 				}
