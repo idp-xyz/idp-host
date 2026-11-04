@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:idp:telos:host:1.5.0",
+  "$id": "urn:idp:telos:host:1.6.0",
   "title": "idp.telos.host 1.5.0",
   "description": "idp-host（Agent Hosting & Coordination）对外发布的契约：AgentRelease（agent 行为的不可变发布件，ADR-0001 D2；1.1.0 起可嵌入 Skill，D17）、SkillRelease（skill 的不可变发布件）、Envelope（发布件加内容摘要）、AgentRun（一次运行的记录，API 返回的形态；1.3.0 起可为子 agent 运行，D22）和 RunOptions（1.2.0 起：创建运行时的调用方选项，D19）。1.3.0 新增：Definition 的 subagents 与 skillMerge（D22、D24）、Limits 的 maxSubagentDepth、SkillDefinition 的 resources（D23）、AgentRelease 的 subagents、AgentRun 的 parentRunId / depth 与状态 AWAITING_SUBAGENT。1.4.0 新增：Definition 的 guards（输入护栏与输出过滤，D27、D28）与 evaluation（评估集，D26），AgentRun 的 purpose。1.5.0 新增：ModelProfile 的 routing（模型路由，D29）、SubagentRef / EmbeddedSubagent 的 a2a（远端 A2A agent，D30）。生产者是 idp-host，权威副本在 idp-host/api/contracts/，由 go test ./internal/run -run TestContract 保证与实现一致；idp-contracts 中的副本只能与之逐字节相同。JSON Schema 只描述形状与可本地判定的规则；摘要是否匹配由 agent.Open / agent.OpenSkill 判定，运行时不变量由 HOST 的状态机判定。",
   "oneOf": [
@@ -50,7 +50,8 @@
         "subagents": {"type": "array", "items": {"$ref": "#/$defs/SubagentRef"}},
         "skillMerge": {"$ref": "#/$defs/SkillMerge"},
         "guards": {"$ref": "#/$defs/Guards"},
-        "evaluation": {"$ref": "#/$defs/Evaluation"}
+        "evaluation": {"$ref": "#/$defs/Evaluation"},
+        "context": {"$ref": "#/$defs/ContextPolicy"}
       }
     },
     "Guards": {
@@ -276,6 +277,23 @@
         "routing": {"$ref": "#/$defs/Routing"}
       }
     },
+    "ContextPolicy": {
+      "title": "ContextPolicy",
+      "description": "运行创建时从 CMI（idp.telos.cmi）取上下文（D32）：cmi = true 时 HOST 以调用方身份向 CMI 解析一个密封的 ContextPackage——查询是最后一条用户消息，范围是线程，预算与种类、来源由此处限定——并把包内条目追加到运行的 context（调用方自己的 context 在前），包 id 记在 AgentRun.contextPackageId，事件 idp.host/context.resolved 记录包 id、摘要、条目数与 token 数。CMI 不可用时按 onError：skip（缺省，记 idp.host/context.skipped 后照常运行）或 fail（拒绝创建运行，502 CONTEXT_UNAVAILABLE）。其余字段只在 cmi = true 时有意义。",
+      "x-idp-telos-owner": "idp.telos.host",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [],
+      "properties": {
+        "cmi": {"type": "boolean"},
+        "purpose": {"type": "string", "maxLength": 200, "description": "传给 CMI 的用途（CMI 据此选取与审计）"},
+        "maxTokens": {"type": "integer", "minimum": 0, "maximum": 32000, "description": "包的 token 预算；0 = CMI 缺省"},
+        "maxItems": {"type": "integer", "minimum": 0, "maximum": 100, "description": "包的条目上限；0 = CMI 缺省"},
+        "kinds": {"type": "array", "items": {"enum": ["memory", "knowledge"]}, "description": "只取这些种类；空 = 两种都取"},
+        "sources": {"type": "array", "items": {"type": "string", "pattern": "^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$"}, "description": "只取这些知识来源；空 = 调用方可见的全部来源"},
+        "onError": {"enum": ["skip", "fail"]}
+      }
+    },
     "Routing": {
       "title": "Routing",
       "description": "模型路由（D29）：candidates 是带元数据的候选（与主模型、回退一起构成候选池，去重），strategy 决定每一步的尝试顺序：ordered（主、回退、候选按声明顺序）、cost（按声明单价与本次调用规模估算）、latency（按本进程观察到的时延 EWMA，错误率高者视为慢）、capability（声明能力最多者优先）。提供工具时只保留声明了 tools 能力（或未声明能力）的候选；估算输入超过 maxContextTokens 的候选被跳过。决定记录为 idp.host/model.routed 事件。路由器不学习、不调用外部服务。",
@@ -391,6 +409,7 @@
         "parentRunId": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$", "description": "委派出本运行的父运行（子 agent 运行，D22）；调用方自己的运行没有"},
         "depth": {"type": "integer", "minimum": 0, "description": "委派深度：调用方的运行为 0（缺省），子运行为父运行 + 1"},
         "purpose": {"enum": ["evaluation"], "description": "HOST 为评估集创建的运行（D26）；调用方自己的运行没有"},
+        "contextPackageId": {"type": "string", "minLength": 1, "description": "运行的 context 来自哪个 CMI ContextPackage（D32）；发布件未要求 CMI 上下文或解析被跳过时没有"},
         "traceId": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
         "deadlineAt": {"type": "string", "format": "date-time"},
         "createdAt": {"type": "string", "format": "date-time"},

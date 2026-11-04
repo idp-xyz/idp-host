@@ -31,7 +31,7 @@ var update = flag.Bool("update", false, "regenerate api/contracts/examples.json 
 
 const (
 	contractDir = "../../api/contracts"
-	contractID  = "urn:idp:telos:host:1.5.0"
+	contractID  = "urn:idp:telos:host:1.6.0"
 )
 
 type noLoader struct{}
@@ -133,6 +133,7 @@ func exampleDocuments() (full, minimal *agent.Document) {
 			SkillMerge: agent.SkillMerge{Instructions: agent.MergeAppend, Tools: agent.MergeCeiling, Confirmation: agent.MergeStrictest},
 			Guards: agent.Guards{Input: agent.InputGuard{ToolResults: "block", Context: "wrap"},
 				Output: agent.OutputGuard{Patterns: []string{`(?i)internal use only`}, Redact: []string{"email", "card"}, Classifier: "moderation", OnError: "block", Strict: true}},
+			Context: agent.ContextPolicy{CMI: true, Purpose: "parcel operations assistant", MaxTokens: 3000, MaxItems: 12, Kinds: []string{"memory", "knowledge"}, Sources: []string{"ops-handbook"}, OnError: "skip"},
 			Evaluation: agent.Evaluation{Required: true, Cases: []agent.EvalCase{
 				{Name: "greets", Input: "hello", Expect: agent.Expectation{Contains: []string{"parcel"}, NoToolCall: true, MaxSteps: 1}},
 				{Name: "looks-up-shipment", Input: "where is shipment 42?", Expect: agent.Expectation{ToolCalled: "parcel__get_shipment", NotContains: []string{"I cannot"}, Matches: `(?i)shipment 42`}}}}},
@@ -149,7 +150,8 @@ func exampleRuns(releaseID, digest string) []run.Run {
 	at := time.Date(2026, 11, 3, 13, 0, 0, 0, time.UTC)
 	return []run.Run{
 		{ID: "run_01JD7Q3Z8M8T0G3C6N4V9S2A1B", ThreadID: "thr-ops-42", AgentID: "9e8d7c6b-0000-4000-8000-000000000002", ReleaseID: releaseID, ReleaseDigest: digest, Owner: "carol",
-			Status: run.StatusCompleted, StepCount: 2, TraceID: "4bf92f3577b34da6a3ce929d0e0e4736", DeadlineAt: at.Add(10 * time.Minute), CreatedAt: at, StartedAt: at.Add(time.Second), FinishedAt: at.Add(9 * time.Second)},
+			Status: run.StatusCompleted, StepCount: 2, TraceID: "4bf92f3577b34da6a3ce929d0e0e4736", ContextPackageID: "pkg_01JD7Q3Z8M8T0G3C6N4V9S2B00",
+			DeadlineAt: at.Add(10 * time.Minute), CreatedAt: at, StartedAt: at.Add(time.Second), FinishedAt: at.Add(9 * time.Second)},
 		{ID: "run_01JD7Q3Z8M8T0G3C6N4V9S2A1C", ThreadID: "thr-ops-42", AgentID: "9e8d7c6b-0000-4000-8000-000000000002", ReleaseID: releaseID, ReleaseDigest: digest, Owner: "carol",
 			Status: run.StatusAwaitingInput, StepCount: 1, DeadlineAt: at.Add(20 * time.Minute), CreatedAt: at.Add(10 * time.Minute), StartedAt: at.Add(10*time.Minute + time.Second)},
 		{ID: "run_01JD7Q3Z8M8T0G3C6N4V9S2A1E", ThreadID: "thr-ops-44", AgentID: "9e8d7c6b-0000-4000-8000-000000000002", ReleaseID: releaseID, ReleaseDigest: digest, Owner: "carol",
@@ -219,7 +221,7 @@ func buildExamples(t *testing.T) []byte {
 		add("RunOptions", o)
 	}
 	b, err := json.MarshalIndent(examplesFile{
-		Description: "idp.telos.host 1.5.0 的示例：每一个都是 idp-host 实际产出或原样接受的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录，RunOptions 经 run.ParseOptions 解析后原样往返）。",
+		Description: "idp.telos.host 1.6.0 的示例：每一个都是 idp-host 实际产出或原样接受的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录，RunOptions 经 run.ParseOptions 解析后原样往返）。",
 		GeneratedBy: "go test ./internal/run -run TestContract -update",
 		Examples:    out,
 	}, "", "  ")
@@ -333,7 +335,7 @@ func TestContractFieldsMatchGo(t *testing.T) {
 		"SkillRef": agent.SkillRef{}, "SkillDefinition": agent.SkillDefinition{}, "EmbeddedSkill": agent.EmbeddedSkill{}, "SkillRelease": agent.SkillDocument{},
 		"RunOptions": run.Options{}, "SubagentRef": agent.SubagentRef{}, "EmbeddedSubagent": agent.EmbeddedSubagent{}, "SkillMerge": agent.SkillMerge{}, "Resource": agent.Resource{},
 		"Guards": agent.Guards{}, "InputGuard": agent.InputGuard{}, "OutputGuard": agent.OutputGuard{}, "Evaluation": agent.Evaluation{}, "EvalCase": agent.EvalCase{}, "Expectation": agent.Expectation{},
-		"Routing": agent.Routing{}, "Candidate": agent.Candidate{}, "A2ARef": agent.A2ARef{}}
+		"Routing": agent.Routing{}, "Candidate": agent.Candidate{}, "A2ARef": agent.A2ARef{}, "ContextPolicy": agent.ContextPolicy{}}
 	for def, zero := range closed {
 		d, ok := defs[def].(map[string]any)
 		if !ok {
@@ -452,6 +454,11 @@ func TestContractRejectsWhatOpenRejects(t *testing.T) {
 		"candidate bad capability":  {"definition.model.routing.candidates.0.capabilities.0", "telepathy"},
 		"candidate negative price":  {"definition.model.routing.candidates.1.costPer1kInput", -1},
 		"a2a card not a url":        {"definition.subagents.1.a2a.cardUrl", "carrier-desk"},
+		"context onError unknown":   {"definition.context.onError", "retry"},
+		"context kind unknown":      {"definition.context.kinds.0", "secrets"},
+		"context budget too high":   {"definition.context.maxTokens", 64000},
+		"context source not a name": {"definition.context.sources.0", "Ops Handbook"},
+		"unknown context field":     {"definition.context.ttl", 30},
 		"a2a embedded not a url":    {"subagents.1.a2a.cardUrl", "nope"},
 	}
 	// cross-reference rules only the implementation can check (a schema cannot relate two arrays)

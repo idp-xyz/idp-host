@@ -55,6 +55,7 @@ import (
 	"idp-host/adapters/store/postgres"
 	"idp-host/internal/a2a"
 	"idp-host/internal/api"
+	"idp-host/internal/cmiclient"
 	"idp-host/internal/config"
 	"idp-host/internal/credential"
 	"idp-host/internal/guard"
@@ -349,6 +350,28 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 		return nil
 	}
 	srvAPI := &api.API{Store: store, Auth: verifier, Gateways: gatewayAuth, Providers: registry.Names(), Log: log, Metrics: metrics, Version: version}
+	if c := cfg.CMI; c != nil { // ADR-0001 D32
+		endpoint, err := mcpclient.CheckEndpoint(c.Endpoint)
+		if err != nil {
+			return fmt.Errorf("cmi: %w", err)
+		}
+		hc, err := model.NewHTTPClient(10*time.Second, c.CAFile)
+		if err != nil {
+			return fmt.Errorf("cmi: %w", err)
+		}
+		srvAPI.CMI = &cmiclient.Client{Endpoint: endpoint, HTTP: hc}
+		switch c.Auth.Mode {
+		case "static":
+			srvAPI.CMIKey = c.Auth.APIKey
+		case "delegation":
+			tokenTLS, err := transport.ClientTLS(c.Auth.CAFile, "", "")
+			if err != nil {
+				return fmt.Errorf("cmi: %w", err)
+			}
+			srvAPI.CMIAuth = api.GatewayAuth{ActorToken: c.Auth.ActorToken, Exchanger: &credential.Exchanger{TokenEndpoint: c.Auth.TokenEndpoint, ClientID: c.Auth.ClientID, ClientSecret: c.Auth.ClientSecret, Audience: c.Auth.Audience,
+				HTTP: &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil, TLSClientConfig: tokenTLS}}}}
+		}
+	}
 	srv := &http.Server{Addr: env("IDP_HOST_LISTEN", "127.0.0.1:8450"), Handler: observability.HTTPMiddleware(tp, "idp-host/api", srvAPI.Handler()),
 		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 0, IdleTimeout: 120 * time.Second}
 	if cert := env("IDP_HOST_TLS_CERT_FILE", ""); cert != "" {

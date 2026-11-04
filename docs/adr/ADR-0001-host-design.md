@@ -154,7 +154,7 @@
 
 ## 11. M3–M5：后续阶段（2026-11-04 决策）
 
-决策人 2026-11-04 选择把第 3 节列为"后续阶段"的全部条目做完，分三个里程碑：M3（子 agent 与 Skill 补全、补齐 M2 的局限）、M4（评估门禁与安全过滤）、M5（模型路由、A2A、SDK 形态的 harness）。与 CMI、Workspace 的联调仍因对方不存在而不做。
+决策人 2026-11-04 选择把第 3 节列为"后续阶段"的全部条目做完，分三个里程碑：M3（子 agent 与 Skill 补全、补齐 M2 的局限）、M4（评估门禁与安全过滤）、M5（模型路由、A2A、SDK 形态的 harness）。与 CMI、Workspace 的联调仍因对方不存在而不做（CMI 后来在 idp-cmi 中建成，联调见第 14 节 D32）。
 
 | # | 决策 | 理由 |
 |---|---|---|
@@ -206,3 +206,22 @@
 - 远端委派期间父 Run 的 Worker goroutine 阻塞在 HTTP 上（本地子 Run 不占 Worker）；远端任务进入 input-required 视为失败。
 - A2A 只实现文本 part；没有 push 通知；agent card 需要承载方的 bearer（不是公开端点）。
 - 路由器的 latency 统计只在本进程内，副本之间不共享。
+
+## 14. D32：CMI 上下文联调（2026-11-04 决策与实施，WSL 实测）
+
+idp-cmi（Context, Memory & Knowledge Infrastructure）M1 完成并发布契约 `idp.telos.cmi` 1.0.0 后，第 3 节与第 11 节留下的"与 CMI 的 Context API 联调"空位在 HOST 侧补上。
+
+| # | 决策 | 理由 |
+|---|---|---|
+| D32 | **运行创建时从 CMI 取上下文**。AgentDefinition 增加 `context`（ContextPolicy）：`cmi = true` 时 HOST 在创建运行的请求里、入队之前，以调用方身份向配置文件 `cmi` 一节登记的 CMI 调 `POST /v1/context/resolve`——查询是最后一条用户消息（截至 4096 字符）、scope 是线程、`purpose` / `maxTokens` / `maxItems` / `kinds` / `sources` 来自策略；CMI 返回的密封 ContextPackage 的每个条目变成一条调用方 context（描述 = 种类、来源与其信任等级、观测时间、引用、标题；值 = 摘录），追加在调用方自己的 context 之后，由 harness 作为 developer 消息交给模型（并经 D27 的输入护栏）。包 id 记在 Run 的 `contextPackageId`，事件 `idp.host/context.resolved` 记包 id、摘要、条目数与 token 数。凭据与网关同款：`static`（一个 cmi-reader 凭据，开发用）或 `delegation`（RFC 8693 以调用方令牌换 CMI 受众的令牌）。CMI 不可用、拒绝或没有用户消息时按 `onError`：`skip`（缺省）照常运行并记 `idp.host/context.skipped`；`fail` 拒绝创建（502 `CONTEXT_UNAVAILABLE`）。幂等重放比较去掉 CMI 条目后的请求（CMI 条目每次都新取，不能让同一请求因此变成"另一个请求"）。 | 上下文由谁给、什么时候给是信任边界：由 HOST 在创建时以调用方身份取，CMI 的可见性（租户、ACL、敏感度上限）就是调用方自己的；模型看到的是不可变、可引用的包，审计能回答"模型当时看到了什么"（CMI ADR D5、D10）。放在创建时而不是每一步，是因为一次运行回答一个问题，中途再取会让同一运行的不同步看到不同事实。不用新的消息角色，而用现有的 context，是为了让护栏、EER 的 `ToolExecution = caller`、子 agent 继承（D22 继承调用方 context）全部不变。 |
+
+**契约**：`idp.telos.host` 1.6.0——Definition 增 `context`（ContextPolicy：cmi、purpose、maxTokens、maxItems、kinds、sources、onError），AgentRun 增 `contextPackageId`；只做新增。
+
+**实施**：`internal/cmiclient`（Resolve、ContextOf）、`internal/api` 的 `resolveContext`、配置 `cmi: {endpoint, caFile, auth}`、迁移 0007（`runs.context_package_id`）、`CreateRunInput.ContextPackageID / Extra`（RUN_STARTED 之后追加 resolved / skipped 事件）。
+
+**验证**：单元与契约（1.6.0：示例发布件带 context 策略、示例运行带 contextPackageId，5 种新拒绝用例）、集成（新增 cmi-context 场景：假 CMI 收到 bearer、查询、线程 scope 与预算；模型看到两条 CMI developer 消息；运行记录 packageId 与 resolved 事件；同一请求重放同一运行；CMI 503 时 skip 并记 skipped 事件；onError = fail 时 502 CONTEXT_UNAVAILABLE；未配置 CMI 时 skip）全部通过。
+
+**局限（不标 PASS）**
+- 与真实 idp-cmi 进程的 compose 联调未做（集成测试用的是按 idp.telos.cmi 1.0.0 形状的假 CMI）；委派模式对真实 Keycloak 未验证（static 模式已测）。
+- 只在创建时取一次；后续用户在同一线程追问要再创建运行才会取新上下文。
+- CMI 条目按 ContextPackage 的 excerpt 原样交给模型，HOST 不再按 sensitivity 过滤——这由 CMI 的 sensitivityCeiling 与策略负责。

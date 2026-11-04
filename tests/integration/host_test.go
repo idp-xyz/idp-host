@@ -32,6 +32,7 @@ import (
 	"idp-host/internal/agui"
 	"idp-host/internal/api"
 	"idp-host/internal/authorization"
+	"idp-host/internal/cmiclient"
 	"idp-host/internal/credential"
 	"idp-host/internal/harness"
 	"idp-host/internal/mcpclient"
@@ -84,6 +85,7 @@ func scratchDB(t *testing.T) (ownerURL, serviceURL string) {
 type env struct {
 	t        *testing.T
 	store    *postgres.Store
+	host     *api.API
 	api      *httptest.Server
 	worker   *worker.Worker
 	model    *fakemodel.Server
@@ -188,7 +190,7 @@ func newEnv(t *testing.T) *env {
 	deleg.Name = "delegated"
 	h := &harness.Harness{Store: store, Providers: model.NewRegistry(prov), Gateways: map[string]*harness.Gateway{"edge": edge, "delegated": deleg}, Log: log, DeltaFlush: time.Millisecond}
 	w := &worker.Worker{ID: "it-worker", Store: store, Harness: h, Lease: 30 * time.Second, Log: log}
-	return &env{t: t, store: store, api: srv, worker: w, model: fm, mcp: fx, mcpDeleg: fx2, tokens: tokens, tenantA: tenantA, tenantB: tenantB}
+	return &env{t: t, store: store, host: a, api: srv, worker: w, model: fm, mcp: fx, mcpDeleg: fx2, tokens: tokens, tenantA: tenantA, tenantB: tenantB}
 }
 
 // drive lets the worker serve every claimable run.
@@ -1339,6 +1341,111 @@ func TestHostEndToEnd(t *testing.T) {
 		remote := e.must(200, "GET", "/v1/threads/"+run.ChildRunID(r["runId"].(string), calls[0].(map[string]any)["toolCallId"].(string))+"/runs", "carol", nil)["runs"].([]any)
 		if len(remote) != 1 || remote[0].(map[string]any)["status"] != run.StatusCompleted {
 			t.Fatalf("%v", remote)
+		}
+	})
+
+	t.Run("cmi-context", func(t *testing.T) {
+		// ADR-0001 D32: a release that asks for CMI context gets a package resolved for the caller at
+		// run creation; its items reach the model as developer context, the package id is on the run
+		var seen struct {
+			auth string
+			body map[string]any
+		}
+		status := 200
+		cmi := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/v1/context/resolve" || r.Method != "POST" {
+				http.Error(w, "nope", 404)
+				return
+			}
+			seen.auth = r.Header.Get("Authorization")
+			seen.body = map[string]any{}
+			_ = json.NewDecoder(r.Body).Decode(&seen.body)
+			if status != 200 {
+				http.Error(w, `{"code":"UNAVAILABLE"}`, status)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"packageId":"pkg_it_1","digest":"sha256:`+strings.Repeat("ab", 32)+`","package":{"items":[
+			{"kind":"knowledge","id":"k1","source":"ops-handbook","trust":"authoritative","ref":"handbook#returns","title":"Returns policy","excerpt":"Returns are accepted within 30 days.","observedAt":"2026-11-01T00:00:00Z","tokens":9},
+			{"kind":"memory","id":"m1","source":"host","trust":"informational","ref":"thread:ctx-1","excerpt":"The user prefers metric units.","observedAt":"2026-11-02T00:00:00Z","tokens":7}],
+			"budget":{"usedTokens":16}}}`)
+		}))
+		defer cmi.Close()
+		e.host.CMI = &cmiclient.Client{Endpoint: cmi.URL, HTTP: cmi.Client()}
+		e.host.CMIKey = "cmi-reader-key"
+		defer func() { e.host.CMI = nil; e.host.CMIKey = "" }()
+
+		def := definition("edge", []string{"sum"}, nil)
+		def.Context = agent.ContextPolicy{CMI: true, Purpose: "assistant", MaxItems: 5, Kinds: []string{"knowledge", "memory"}}
+		e.publish("informed", def)
+		r := e.must(202, "POST", "/v1/agents/informed/runs", "carol", runBody("ctx-1", "what is the returns policy?"), "Idempotency-Key", "cx1")
+		if seen.auth != "Bearer cmi-reader-key" || seen.body["query"] != "what is the returns policy?" || seen.body["purpose"] != "assistant" {
+			t.Fatalf("CMI saw %q %v", seen.auth, seen.body)
+		}
+		if sc, _ := seen.body["scope"].(map[string]any); sc["kind"] != "thread" || sc["id"] != "ctx-1" {
+			t.Fatalf("scope %v", seen.body["scope"])
+		}
+		if bd, _ := seen.body["budget"].(map[string]any); bd["maxItems"] != float64(5) {
+			t.Fatalf("budget %v", seen.body["budget"])
+		}
+		e.drive()
+		got := e.must(200, "GET", "/v1/runs/"+r["runId"].(string), "carol", nil)
+		if got["status"] != run.StatusCompleted || got["contextPackageId"] != "pkg_it_1" {
+			t.Fatalf("%v", got)
+		}
+		var resolved map[string]any
+		for _, ev := range e.must(200, "GET", "/v1/runs/"+r["runId"].(string)+"/events", "carol", nil)["events"].([]any) {
+			p := ev.(map[string]any)["event"].(map[string]any)
+			if p["name"] == agui.CustomContextResolved {
+				resolved = p["value"].(map[string]any)
+			}
+		}
+		if resolved == nil || resolved["packageId"] != "pkg_it_1" || resolved["items"] != float64(2) || resolved["tokens"] != float64(16) {
+			t.Fatalf("%v", resolved)
+		}
+		var ctxSeen []string
+		for _, m := range e.model.Last() {
+			if (m.Role == "developer" || m.Role == "system") && strings.HasPrefix(m.Content, "CMI ") {
+				ctxSeen = append(ctxSeen, m.Content)
+			}
+		}
+		if len(ctxSeen) != 2 || !strings.Contains(ctxSeen[0], "knowledge from ops-handbook (authoritative") || !strings.Contains(ctxSeen[0], "Returns are accepted within 30 days.") || !strings.Contains(ctxSeen[1], "metric units") {
+			t.Fatalf("model saw %q", ctxSeen)
+		}
+		// the same request replays the same run although the CMI items are resolved afresh
+		again := e.must(200, "POST", "/v1/agents/informed/runs", "carol", runBody("ctx-1", "what is the returns policy?"), "Idempotency-Key", "cx1")
+		if again["runId"] != r["runId"] {
+			t.Fatal("replay returned another run")
+		}
+		// the CMI fails: onError skip (default) runs without context and says so on the stream
+		status = 503
+		r = e.must(202, "POST", "/v1/agents/informed/runs", "carol", runBody("ctx-2", "hello"), "Idempotency-Key", "cx2")
+		e.drive()
+		got = e.must(200, "GET", "/v1/runs/"+r["runId"].(string), "carol", nil)
+		if got["status"] != run.StatusCompleted || got["contextPackageId"] != nil {
+			t.Fatalf("%v", got)
+		}
+		skipped := false
+		for _, ev := range e.must(200, "GET", "/v1/runs/"+r["runId"].(string)+"/events", "carol", nil)["events"].([]any) {
+			if ev.(map[string]any)["event"].(map[string]any)["name"] == agui.CustomContextSkipped {
+				skipped = true
+			}
+		}
+		if !skipped {
+			t.Fatal("no context.skipped event")
+		}
+		// onError fail refuses the run
+		def.Context.OnError = "fail"
+		e.publish("strict-context", def)
+		if resp := e.must(502, "POST", "/v1/agents/strict-context/runs", "carol", runBody("ctx-3", "hello"), "Idempotency-Key", "cx3"); resp["error"].(map[string]any)["code"] != "CONTEXT_UNAVAILABLE" {
+			t.Fatalf("%v", resp)
+		}
+		// no CMI configured on this host: skip as well
+		e.host.CMI = nil
+		r = e.must(202, "POST", "/v1/agents/informed/runs", "carol", runBody("ctx-4", "hello"), "Idempotency-Key", "cx4")
+		e.drive()
+		if got = e.must(200, "GET", "/v1/runs/"+r["runId"].(string), "carol", nil); got["status"] != run.StatusCompleted {
+			t.Fatalf("%v", got)
 		}
 	})
 

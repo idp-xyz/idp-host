@@ -29,11 +29,15 @@ type CreateRunInput struct {
 	TraceID        string
 	ReleaseID      string // the approved release to run; "" = the agent's current release
 	ExecutionRef   string // the caller's execution reference (EER), recorded on the run
+	// D32: the CMI package the run's context came from, and the events that record how it was
+	// resolved (or why it was skipped), appended right after RUN_STARTED
+	ContextPackageID string
+	Extra            []agui.Event
 }
 
 const runCols = `tenant_id::text, id, thread_id, agent_id::text, release_id::text, release_digest, owner, status, idempotency_key, input, step_count, event_seq,
 	fencing_epoch, coalesce(lease_owner, ''), lease_until, cancel_requested, coalesce(failure_code, ''), coalesce(failure_message, ''), coalesce(execution_ref, ''),
-	credential_expires_at, coalesce(trace_id, ''), deadline_at, created_at, started_at, finished_at, coalesce(parent_run_id, ''), depth, coalesce(purpose, ''), coalesce(evaluation_id::text, '')`
+	credential_expires_at, coalesce(trace_id, ''), deadline_at, created_at, started_at, finished_at, coalesce(parent_run_id, ''), depth, coalesce(purpose, ''), coalesce(evaluation_id::text, ''), coalesce(context_package_id, '')`
 
 // activeStatuses are the statuses of a run that holds its thread and a place in the tenant's concurrency.
 const activeStatuses = `('QUEUED', 'RUNNING', 'AWAITING_INPUT', 'AWAITING_SUBAGENT')`
@@ -44,7 +48,7 @@ func scanRun(row pgx.Row) (*run.Run, error) {
 	var leaseUntil, credExp, startedAt, finishedAt *time.Time
 	if err := row.Scan(&r.TenantID, &r.ID, &r.ThreadID, &r.AgentID, &r.ReleaseID, &r.ReleaseDigest, &r.Owner, &r.Status, &r.IdempotencyKey, &input, &r.StepCount, &r.EventSeq,
 		&r.FencingEpoch, &r.LeaseOwner, &leaseUntil, &r.CancelRequested, &r.FailureCode, &r.FailureMessage, &r.ExecutionRef,
-		&credExp, &r.TraceID, &r.DeadlineAt, &r.CreatedAt, &startedAt, &finishedAt, &r.ParentRunID, &r.Depth, &r.Purpose, &r.EvaluationID); err != nil {
+		&credExp, &r.TraceID, &r.DeadlineAt, &r.CreatedAt, &startedAt, &finishedAt, &r.ParentRunID, &r.Depth, &r.Purpose, &r.EvaluationID, &r.ContextPackageID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, fail("NOT_FOUND", "run not found")
 		}
@@ -150,6 +154,13 @@ func (s *Store) CreateRun(ctx context.Context, tenant string, in CreateRunInput)
 				}
 			}
 			hashSrc := map[string]any{"agent": a.ID, "messages": in.Messages, "input": in.Input, "release": in.ReleaseID, "executionRef": in.ExecutionRef}
+			if n := contextItems(in.Extra); n > 0 && n <= len(in.Input.Context) {
+				// the CMI's items are resolved afresh on every request, so a replay compares the request
+				// without them
+				stripped := in.Input
+				stripped.Context = in.Input.Context[:len(in.Input.Context)-n]
+				hashSrc["input"] = stripped
+			}
 			hash, err := canonical.Digest(hashSrc)
 			if err != nil {
 				return err
@@ -250,16 +261,19 @@ func (s *Store) CreateRun(ctx context.Context, tenant string, in CreateRunInput)
 			}
 			inputRaw, _ := json.Marshal(in.Input)
 			deadline := s.now().Add(time.Duration(doc.Definition.Limits.RunTimeoutSeconds) * time.Second)
-			var trace, execRef any
+			var trace, execRef, ctxPkg any
 			if in.TraceID != "" {
 				trace = in.TraceID
 			}
 			if in.ExecutionRef != "" {
 				execRef = in.ExecutionRef
 			}
+			if in.ContextPackageID != "" {
+				ctxPkg = in.ContextPackageID
+			}
 			if _, err := tx.Exec(ctx, `INSERT INTO runs (tenant_id, id, thread_id, agent_id, release_id, release_digest, owner, status, idempotency_key, request_sha256, input,
-			credential, credential_expires_at, trace_id, deadline_at, execution_ref) VALUES ($1, $2, $3, $4, $5, $6, $7, 'QUEUED', $8, $9, $10, $11, $12, $13, $14, $15)`,
-				tenant, runID, threadID, a.ID, releaseID, env.Digest, in.Owner, in.IdempotencyKey, hash, inputRaw, cred, credExp, trace, deadline, execRef); err != nil {
+			credential, credential_expires_at, trace_id, deadline_at, execution_ref, context_package_id) VALUES ($1, $2, $3, $4, $5, $6, $7, 'QUEUED', $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+				tenant, runID, threadID, a.ID, releaseID, env.Digest, in.Owner, in.IdempotencyKey, hash, inputRaw, cred, credExp, trace, deadline, execRef, ctxPkg); err != nil {
 				if isUniqueViolation(err) {
 					if strings.Contains(constraintOf(err), "idempotency") {
 						return errRetry // the same request raced; the retry replays it
@@ -271,7 +285,7 @@ func (s *Store) CreateRun(ctx context.Context, tenant string, in CreateRunInput)
 			if _, err := appendMessages(ctx, tx, tenant, threadID, runID, fresh); err != nil {
 				return err
 			}
-			if err := appendEvents(ctx, tx, tenant, runID, []agui.Event{agui.RunStarted(threadID, runID)}); err != nil {
+			if err := appendEvents(ctx, tx, tenant, runID, append([]agui.Event{agui.RunStarted(threadID, runID)}, in.Extra...)); err != nil {
 				return err
 			}
 			out, err = scanRun(tx.QueryRow(ctx, `SELECT `+runCols+` FROM runs WHERE id = $1`, runID))
@@ -1150,4 +1164,18 @@ func (s *Store) ExpireConfirmations(ctx context.Context) (int, error) {
 		}
 	}
 	return n, nil
+}
+
+// contextItems is how many context entries the CMI contributed, read from the resolved event.
+func contextItems(events []agui.Event) int {
+	for _, e := range events {
+		if e["name"] == agui.CustomContextResolved {
+			if v, ok := e["value"].(map[string]any); ok {
+				if n, ok := v["items"].(int); ok {
+					return n
+				}
+			}
+		}
+	}
+	return 0
 }

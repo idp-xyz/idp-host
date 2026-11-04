@@ -19,6 +19,7 @@ import (
 	"idp-host/internal/agent"
 	"idp-host/internal/agui"
 	"idp-host/internal/authorization"
+	"idp-host/internal/cmiclient"
 	"idp-host/internal/credential"
 	"idp-host/internal/observability"
 	"idp-host/internal/run"
@@ -48,9 +49,13 @@ type API struct {
 	Auth      Verifier
 	Gateways  map[string]GatewayAuth // by gateway name as the release refers to it
 	Providers []string
-	Log       *slog.Logger
-	Metrics   *observability.Metrics
-	Version   string
+	// CMI resolves context packages for runs whose release asks for them (D32); nil disables.
+	CMI     *cmiclient.Client
+	CMIAuth GatewayAuth // how the HOST obtains the caller's CMI credential; APIKey when static
+	CMIKey  string
+	Log     *slog.Logger
+	Metrics *observability.Metrics
+	Version string
 
 	// StreamPoll is how often the event stream polls the store (default 150 ms).
 	StreamPoll time.Duration
@@ -593,10 +598,76 @@ func (a *API) createRun(r *http.Request, p authorization.Principal, ref, key str
 	if input.Context == nil {
 		input.Context = []agui.Context{}
 	}
+	// D32: context from the CMI, resolved for the caller before the run is queued
+	packageID, extra, err := a.resolveContext(r, p, doc, in, &input)
+	if err != nil {
+		return nil, false, err
+	}
 	out, replayed, err := a.Store.CreateRun(r.Context(), p.Tenant, postgres.CreateRunInput{ThreadID: in.ThreadID, RunID: in.RunID, AgentRef: ag.ID, Owner: p.Subject,
 		IdempotencyKey: key, Messages: in.Messages, Input: input, Credential: cred, TraceID: observability.TraceID(r.Context()),
-		ReleaseID: releaseID, ExecutionRef: opts.ExecutionRef})
+		ReleaseID: releaseID, ExecutionRef: opts.ExecutionRef, ContextPackageID: packageID, Extra: extra})
 	return out, replayed, err
+}
+
+// resolveContext asks the CMI for a package when the release wants one (D32) and appends its items
+// to the run's context. The caller's own context comes first; CMI items follow it. A CMI failure
+// skips the context (recorded on the run's stream) or refuses the run, as the release decides.
+func (a *API) resolveContext(r *http.Request, p authorization.Principal, doc *agent.Document, in agui.RunAgentInput, input *run.Input) (string, []agui.Event, error) {
+	pol := doc.Definition.Context
+	if !pol.CMI {
+		return "", nil, nil
+	}
+	skip := func(reason string, err error) (string, []agui.Event, error) {
+		if pol.OnError == "fail" {
+			return "", nil, transport.Fail(http.StatusBadGateway, "CONTEXT_UNAVAILABLE", "the context infrastructure is unavailable: "+reason)
+		}
+		a.Log.Warn("CMI context skipped", "reason", reason, "error", err)
+		return "", []agui.Event{agui.Custom(agui.CustomContextSkipped, map[string]any{"reason": reason})}, nil
+	}
+	if a.CMI == nil {
+		return skip("no CMI configured on this host", nil)
+	}
+	query := ""
+	for i := len(in.Messages) - 1; i >= 0; i-- {
+		if in.Messages[i].Role == agui.RoleUser && in.Messages[i].Content != "" {
+			query = in.Messages[i].Content
+			break
+		}
+	}
+	if query == "" {
+		return skip("no user message to resolve context for", nil)
+	}
+	if len(query) > 4096 {
+		query = query[:4096]
+	}
+	bearer := a.CMIKey
+	if a.CMIAuth.Exchanger != nil {
+		tok, _ := identity.Bearer(r)
+		cred, err := a.delegate(r.Context(), a.CMIAuth, tok)
+		if err != nil {
+			return skip("delegation to the CMI refused", err)
+		}
+		bearer = cred.AccessToken
+	}
+	req := cmiclient.Request{Query: query, Purpose: pol.Purpose, Kinds: pol.Kinds, Sources: pol.Sources}
+	if in.ThreadID != "" {
+		req.Scope = &struct {
+			Kind string `json:"kind"`
+			ID   string `json:"id,omitempty"`
+		}{Kind: "thread", ID: in.ThreadID}
+	}
+	if pol.MaxTokens > 0 || pol.MaxItems > 0 {
+		req.Budget = &struct {
+			MaxTokens int `json:"maxTokens,omitempty"`
+			MaxItems  int `json:"maxItems,omitempty"`
+		}{MaxTokens: pol.MaxTokens, MaxItems: pol.MaxItems}
+	}
+	pkg, err := a.CMI.Resolve(r.Context(), bearer, req)
+	if err != nil {
+		return skip("resolve failed", err)
+	}
+	input.Context = append(input.Context, cmiclient.ContextOf(pkg)...)
+	return pkg.PackageID, []agui.Event{agui.Custom(agui.CustomContextResolved, map[string]any{"packageId": pkg.PackageID, "digest": pkg.Digest, "items": len(pkg.Items), "tokens": pkg.Tokens})}, nil
 }
 
 // delegate exchanges the caller's token; the HOST's own actor token is cached until it is close to expiry.

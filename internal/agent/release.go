@@ -83,6 +83,20 @@ type Definition struct {
 	SkillMerge   SkillMerge         `json:"skillMerge,omitzero"` // how skills are merged into the effective definition (D24)
 	Guards       Guards             `json:"guards,omitzero"`     // input and output content guards (D27, D28)
 	Evaluation   Evaluation         `json:"evaluation,omitzero"` // the fixed evaluation set and whether approval needs it (D26)
+	Context      ContextPolicy      `json:"context,omitzero"`    // context from the CMI at run creation (D32)
+}
+
+// ContextPolicy asks the HOST to resolve a ContextPackage from the CMI for every run of the release
+// (D32): the caller's last user message is the query, the thread is the scope. OnError decides what
+// a CMI failure does: skip (run without CMI context, event recorded; default) or fail (run refused).
+type ContextPolicy struct {
+	CMI       bool     `json:"cmi,omitempty"`
+	Purpose   string   `json:"purpose,omitempty"`
+	MaxTokens int      `json:"maxTokens,omitempty"` // CMI budget (default 2000, at most 32000)
+	MaxItems  int      `json:"maxItems,omitempty"`  // CMI budget (default 20, at most 100)
+	Kinds     []string `json:"kinds,omitempty"`     // memory | knowledge (empty = both)
+	Sources   []string `json:"sources,omitempty"`   // knowledge sources (empty = all visible)
+	OnError   string   `json:"onError,omitempty"`   // skip (default) | fail
 }
 
 // Guards are the release's content guards.
@@ -398,6 +412,27 @@ func (d *Definition) Validate() error {
 	}
 	if err := d.Evaluation.Validate(); err != nil {
 		bad("evaluation: %v", err)
+	}
+	if c := d.Context; c.CMI || c.Purpose != "" || c.MaxTokens != 0 || c.MaxItems != 0 || len(c.Kinds) > 0 || len(c.Sources) > 0 || c.OnError != "" {
+		if !c.CMI {
+			bad("context: settings need context.cmi = true")
+		}
+		if len(c.Purpose) > 200 || c.MaxTokens < 0 || c.MaxTokens > 32000 || c.MaxItems < 0 || c.MaxItems > 100 {
+			bad("context: purpose at most 200 characters, maxTokens within [0, 32000], maxItems within [0, 100]")
+		}
+		for _, k := range c.Kinds {
+			if k != "memory" && k != "knowledge" {
+				bad("context.kinds entries must be memory or knowledge")
+			}
+		}
+		for _, s := range c.Sources {
+			if !nameRE.MatchString(s) {
+				bad("context.sources entries must be source names")
+			}
+		}
+		if c.OnError != "" && c.OnError != "skip" && c.OnError != "fail" {
+			bad("context.onError must be skip or fail")
+		}
 	}
 	l := d.Limits
 	if l.MaxSteps < 1 || l.MaxSteps > 200 || l.MaxToolCallsPerStep < 1 || l.MaxToolCallsPerStep > 64 ||

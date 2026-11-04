@@ -333,6 +333,9 @@ const (
 	CustomSubagentStarted       = "idp.host/subagent.started"
 	CustomSubagentAwaitingInput = "idp.host/subagent.awaiting_input"
 	CustomSubagentFinished      = "idp.host/subagent.finished"
+	// CMI context (ADR-0001 D32)
+	CustomContextResolved = "idp.host/context.resolved"
+	CustomContextSkipped  = "idp.host/context.skipped"
 	// model routing (ADR-0001 D29)
 	CustomModelRouted = "idp.host/model.routed"
 	// content guards (ADR-0001 D27, D28)

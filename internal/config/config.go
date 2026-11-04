@@ -19,6 +19,16 @@ type File struct {
 	Gateways    []Gateway    `yaml:"gateways"`
 	Classifiers []Classifier `yaml:"classifiers"` // external output classifiers (ADR-0001 D28)
 	A2APeers    []A2APeer    `yaml:"a2aPeers"`    // remote A2A agents this HOST may delegate to (ADR-0001 D30)
+	CMI         *CMI         `yaml:"cmi"`         // the context infrastructure runs may draw context from (ADR-0001 D32)
+}
+
+// CMI is the idp-cmi endpoint and how the HOST authenticates to it on the caller's behalf: the same
+// two modes as a gateway (delegation = RFC 8693 token exchange for the CMI audience; static = one
+// cmi-reader credential for development).
+type CMI struct {
+	Endpoint string      `yaml:"endpoint"`
+	CAFile   string      `yaml:"caFile"`
+	Auth     GatewayAuth `yaml:"auth"`
 }
 
 // A2APeer is the credential for remote agent cards under a URL prefix.
@@ -136,6 +146,32 @@ func Load(path string) (*File, error) {
 		}
 		if c.APIKey, err = secret(c.APIKey, c.APIKeyFile); err != nil {
 			return nil, fmt.Errorf("classifier %s: %w", c.Name, err)
+		}
+	}
+	if c := f.CMI; c != nil {
+		if c.Endpoint == "" {
+			return nil, errors.New("cmi: endpoint is required")
+		}
+		switch c.Auth.Mode {
+		case "delegation":
+			if c.Auth.TokenEndpoint == "" || c.Auth.ClientID == "" {
+				return nil, errors.New("cmi: delegation needs tokenEndpoint and clientId")
+			}
+			if c.Auth.ClientSecret, err = secret(c.Auth.ClientSecret, c.Auth.ClientSecretFile); err != nil {
+				return nil, fmt.Errorf("cmi: %w", err)
+			}
+			if c.Auth.ClientSecret == "" {
+				return nil, errors.New("cmi: delegation needs clientSecret[File]")
+			}
+		case "static":
+			if c.Auth.APIKey, err = secret(c.Auth.APIKey, c.Auth.APIKeyFile); err != nil {
+				return nil, fmt.Errorf("cmi: %w", err)
+			}
+			if c.Auth.APIKey == "" {
+				return nil, errors.New("cmi: static auth needs apiKey[File]")
+			}
+		default:
+			return nil, errors.New("cmi: auth.mode must be delegation or static")
 		}
 	}
 	for i := range f.Gateways {

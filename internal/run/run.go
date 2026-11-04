@@ -157,9 +157,10 @@ type Run struct {
 	FailureCode         string    `json:"failureCode,omitempty"`
 	FailureMessage      string    `json:"failureMessage,omitempty"`
 	ExecutionRef        string    `json:"executionRef,omitempty"`
-	ParentRunID         string    `json:"parentRunId,omitempty"` // the run that delegated to this one (D22)
-	Depth               int       `json:"depth,omitempty"`       // 0 for a caller's run, parent depth + 1 for a sub-agent run
-	Purpose             string    `json:"purpose,omitempty"`     // "" (a caller's run) or PurposeEvaluation (D26)
+	ParentRunID         string    `json:"parentRunId,omitempty"`      // the run that delegated to this one (D22)
+	Depth               int       `json:"depth,omitempty"`            // 0 for a caller's run, parent depth + 1 for a sub-agent run
+	Purpose             string    `json:"purpose,omitempty"`          // "" (a caller's run) or PurposeEvaluation (D26)
+	ContextPackageID    string    `json:"contextPackageId,omitempty"` // the CMI package the run's context came from (D32)
 	EvaluationID        string    `json:"-"`
 	CredentialExpiresAt time.Time `json:"-"`
 	TraceID             string    `json:"traceId,omitempty"`
