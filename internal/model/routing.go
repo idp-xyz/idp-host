@@ -164,7 +164,8 @@ func (r *Router) Order(p agent.ModelProfile, needs Needs) ([]agent.ModelRef, []D
 		case agent.RouteLatency:
 			ewma, errRate, known := r.snapshot(ref)
 			if known {
-				s.score = ewma * (1 + 4*errRate) // a failing candidate is treated as slow
+				// recent errors outweigh any latency advantage: each failure in the window costs ten seconds
+				s.score = ewma + errRate*10_000
 				s.why = "latency"
 			} else {
 				s.score = 0

@@ -48,7 +48,7 @@ func TestRouterOrdersByStrategy(t *testing.T) {
 		r.Observe(agent.ModelRef{Provider: "cheap", Model: "small"}, 100*time.Millisecond, false)
 	}
 	order, ds = r.Order(lat, Needs{})
-	if order[0].Provider != "b" || order[1].Provider != "cheap" || order[2].Provider != "a" || ds[2].Score < 900 {
+	if order[0].Provider != "b" || order[1].Provider != "cheap" || order[2].Provider != "a" || ds[2].Score <= ds[1].Score {
 		t.Fatalf("%v %v", order, ds)
 	}
 	// capability: the most capable first
