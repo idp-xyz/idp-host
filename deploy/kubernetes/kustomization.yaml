@@ -9,9 +9,14 @@ resources:
   - host.yaml
   - migrate-job.yaml
   - networkpolicy.yaml
-commonLabels:
-  app.kubernetes.io/name: idp-host
-  app.kubernetes.io/part-of: idp-telos
+# labels, not commonLabels: commonLabels also rewrites every selector, including the NetworkPolicy
+# peers that select other namespaces' pods (PostgreSQL, kube-dns, the MCP gateway), which then match
+# nothing (found by idp-telos-go tools/k8s_check.py and its kind run)
+labels:
+  - pairs:
+      app.kubernetes.io/name: idp-host
+      app.kubernetes.io/part-of: idp-telos
+    includeTemplates: true
 images:
   - name: idp-host
     newName: registry.example.com/idp/idp-host   # set to the image built by deploy/build.sh, pinned by digest
