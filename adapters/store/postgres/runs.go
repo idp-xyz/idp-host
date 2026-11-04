@@ -33,7 +33,10 @@ type CreateRunInput struct {
 
 const runCols = `tenant_id::text, id, thread_id, agent_id::text, release_id::text, release_digest, owner, status, idempotency_key, input, step_count, event_seq,
 	fencing_epoch, coalesce(lease_owner, ''), lease_until, cancel_requested, coalesce(failure_code, ''), coalesce(failure_message, ''), coalesce(execution_ref, ''),
-	credential_expires_at, coalesce(trace_id, ''), deadline_at, created_at, started_at, finished_at`
+	credential_expires_at, coalesce(trace_id, ''), deadline_at, created_at, started_at, finished_at, coalesce(parent_run_id, ''), depth`
+
+// activeStatuses are the statuses of a run that holds its thread and a place in the tenant's concurrency.
+const activeStatuses = `('QUEUED', 'RUNNING', 'AWAITING_INPUT', 'AWAITING_SUBAGENT')`
 
 func scanRun(row pgx.Row) (*run.Run, error) {
 	var r run.Run
@@ -41,7 +44,7 @@ func scanRun(row pgx.Row) (*run.Run, error) {
 	var leaseUntil, credExp, startedAt, finishedAt *time.Time
 	if err := row.Scan(&r.TenantID, &r.ID, &r.ThreadID, &r.AgentID, &r.ReleaseID, &r.ReleaseDigest, &r.Owner, &r.Status, &r.IdempotencyKey, &input, &r.StepCount, &r.EventSeq,
 		&r.FencingEpoch, &r.LeaseOwner, &leaseUntil, &r.CancelRequested, &r.FailureCode, &r.FailureMessage, &r.ExecutionRef,
-		&credExp, &r.TraceID, &r.DeadlineAt, &r.CreatedAt, &startedAt, &finishedAt); err != nil {
+		&credExp, &r.TraceID, &r.DeadlineAt, &r.CreatedAt, &startedAt, &finishedAt, &r.ParentRunID, &r.Depth); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, fail("NOT_FOUND", "run not found")
 		}
@@ -171,7 +174,7 @@ func (s *Store) CreateRun(ctx context.Context, tenant string, in CreateRunInput)
 			}
 			// a run on this thread that is still in flight must finish first: one turn at a time
 			var active int
-			if err := tx.QueryRow(ctx, `SELECT count(*) FROM runs WHERE thread_id = $1 AND status IN ('QUEUED', 'RUNNING', 'AWAITING_INPUT')`, threadID).Scan(&active); err != nil {
+			if err := tx.QueryRow(ctx, `SELECT count(*) FROM runs WHERE thread_id = $1 AND status IN `+activeStatuses, threadID).Scan(&active); err != nil {
 				return err
 			}
 			if active > 0 {
@@ -347,12 +350,12 @@ func (s *Store) Events(ctx context.Context, tenant, owner, runID string, afterID
 	return out, err
 }
 
-const callCols = `run_id, id, step, message_id, tool, arguments, arguments_sha256, state, confirmation_expires_at, coalesce(decided_by, ''), decided_at, coalesce(result, ''), is_error, created_at, finished_at`
+const callCols = `run_id, id, step, message_id, tool, arguments, arguments_sha256, state, confirmation_expires_at, coalesce(decided_by, ''), decided_at, coalesce(result, ''), is_error, created_at, finished_at, coalesce(child_run_id, '')`
 
 func scanCall(row pgx.Row) (*run.ToolCall, error) {
 	var c run.ToolCall
 	var exp, decided, finished *time.Time
-	if err := row.Scan(&c.RunID, &c.ID, &c.Step, &c.MessageID, &c.Tool, &c.Arguments, &c.ArgumentsSHA256, &c.State, &exp, &c.DecidedBy, &decided, &c.Result, &c.IsError, &c.CreatedAt, &finished); err != nil {
+	if err := row.Scan(&c.RunID, &c.ID, &c.Step, &c.MessageID, &c.Tool, &c.Arguments, &c.ArgumentsSHA256, &c.State, &exp, &c.DecidedBy, &decided, &c.Result, &c.IsError, &c.CreatedAt, &finished, &c.ChildRunID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, fail("NOT_FOUND", "tool call not found")
 		}
@@ -493,14 +496,8 @@ func (s *Store) CancelRun(ctx context.Context, tenant, owner, runID string) (*ru
 					return err
 				}
 			}
-		default: // QUEUED, AWAITING_INPUT
-			if _, err := tx.Exec(ctx, `UPDATE tool_calls SET state = 'REJECTED', decided_by = $2, decided_at = now() WHERE run_id = $1 AND state = 'PENDING_CONFIRMATION'`, runID, "cancel"); err != nil {
-				return err
-			}
-			if _, err := tx.Exec(ctx, `UPDATE runs SET status = 'CANCELED', failure_code = 'CANCELED', finished_at = now(), lease_owner = NULL, lease_until = NULL WHERE id = $1`, runID); err != nil {
-				return err
-			}
-			if err := appendEvents(ctx, tx, tenant, runID, []agui.Event{agui.RunError("canceled by the owner", "CANCELED")}); err != nil {
+		default: // QUEUED, AWAITING_INPUT, AWAITING_SUBAGENT
+			if err := s.cancelResting(ctx, tx, tenant, r, "canceled by the owner"); err != nil {
 				return err
 			}
 		}
@@ -508,6 +505,80 @@ func (s *Store) CancelRun(ctx context.Context, tenant, owner, runID string) (*ru
 		return err
 	})
 	return out, err
+}
+
+// cancelResting cancels a run that no worker holds, cascades to its active sub-agent runs (a running
+// child is asked to stop) and tells its own parent, if any, that it ended.
+func (s *Store) cancelResting(ctx context.Context, tx pgx.Tx, tenant string, r *run.Run, reason string) error {
+	if _, err := tx.Exec(ctx, `UPDATE tool_calls SET state = 'REJECTED', decided_by = $2, decided_at = now() WHERE run_id = $1 AND state = 'PENDING_CONFIRMATION'`, r.ID, "cancel"); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE runs SET status = 'CANCELED', failure_code = 'CANCELED', failure_message = $2, finished_at = now(), lease_owner = NULL, lease_until = NULL, credential = NULL WHERE id = $1`, r.ID, reason); err != nil {
+		return err
+	}
+	if err := appendEvents(ctx, tx, tenant, r.ID, []agui.Event{agui.RunError(reason, "CANCELED")}); err != nil {
+		return err
+	}
+	rows, err := tx.Query(ctx, `SELECT `+runCols+` FROM runs WHERE parent_run_id = $1 AND status IN `+activeStatuses+` ORDER BY created_at FOR UPDATE`, r.ID)
+	if err != nil {
+		return err
+	}
+	var children []*run.Run
+	for rows.Next() {
+		c, err := scanRun(rows)
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		children = append(children, c)
+	}
+	rows.Close()
+	for _, c := range children {
+		if c.Status == run.StatusRunning {
+			if !c.CancelRequested {
+				if _, err := tx.Exec(ctx, `UPDATE runs SET cancel_requested = true WHERE id = $1`, c.ID); err != nil {
+					return err
+				}
+				if err := appendEvents(ctx, tx, tenant, c.ID, []agui.Event{agui.Custom("idp.host/cancel.requested", map[string]any{"runId": c.ID, "parentRunId": r.ID})}); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if err := s.cancelResting(ctx, tx, tenant, c, "the parent run was canceled"); err != nil {
+			return err
+		}
+	}
+	return childEnded(ctx, tx, tenant, r, run.StatusCanceled, "CANCELED")
+}
+
+// childEnded is called in the transaction that ends a run with a parent: it tells the parent's event
+// stream and, when no child of the parent is active any more, queues the parent again.
+func childEnded(ctx context.Context, tx pgx.Tx, tenant string, child *run.Run, status, failureCode string) error {
+	if child.ParentRunID == "" {
+		return nil
+	}
+	parent, err := scanRun(tx.QueryRow(ctx, `SELECT `+runCols+` FROM runs WHERE id = $1 FOR UPDATE`, child.ParentRunID))
+	if err != nil {
+		return err
+	}
+	if run.Terminal(parent.Status) {
+		return nil // the parent ended first (canceled); nothing listens
+	}
+	if err := appendEvents(ctx, tx, tenant, parent.ID, []agui.Event{agui.Custom(agui.CustomSubagentFinished, map[string]any{"runId": child.ID, "status": status, "failureCode": failureCode})}); err != nil {
+		return err
+	}
+	if parent.Status != run.StatusAwaitingSubagent {
+		return nil // still running (it will see the child when it rests) or waiting for its owner
+	}
+	var active int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM runs WHERE parent_run_id = $1 AND status IN `+activeStatuses, parent.ID).Scan(&active); err != nil {
+		return err
+	}
+	if active == 0 {
+		_, err = tx.Exec(ctx, `UPDATE runs SET status = 'QUEUED' WHERE id = $1`, parent.ID)
+	}
+	return err
 }
 
 // ---- worker side ----
@@ -584,7 +655,7 @@ func (s *Store) Context(ctx context.Context, c *run.Claim) (*run.Context, error)
 		if out.Messages, err = threadMessages(ctx, tx, r.ThreadID); err != nil {
 			return err
 		}
-		out.ToolCalls, err = runCalls(ctx, tx, c.RunID, []string{run.CallPendingConfirmation, run.CallConfirmed, run.CallRejected, run.CallExpired, run.CallExecuting}, true)
+		out.ToolCalls, err = runCalls(ctx, tx, c.RunID, []string{run.CallPendingConfirmation, run.CallConfirmed, run.CallRejected, run.CallExpired, run.CallExecuting, run.CallDelegated}, true)
 		return err
 	})
 	if err != nil {
@@ -702,8 +773,12 @@ func (s *Store) RecordToolCalls(ctx context.Context, c *run.Claim, calls []run.T
 			if !tc.ConfirmationExpiresAt.IsZero() {
 				exp = tc.ConfirmationExpiresAt
 			}
-			if _, err := tx.Exec(ctx, `INSERT INTO tool_calls (tenant_id, run_id, id, step, message_id, tool, arguments, arguments_sha256, state, confirmation_expires_at)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`, c.TenantID, c.RunID, tc.ID, tc.Step, tc.MessageID, tc.Tool, tc.Arguments, tc.ArgumentsSHA256, tc.State, exp); err != nil {
+			var child any
+			if tc.ChildRunID != "" {
+				child = tc.ChildRunID
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO tool_calls (tenant_id, run_id, id, step, message_id, tool, arguments, arguments_sha256, state, confirmation_expires_at, child_run_id)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`, c.TenantID, c.RunID, tc.ID, tc.Step, tc.MessageID, tc.Tool, tc.Arguments, tc.ArgumentsSHA256, tc.State, exp, child); err != nil {
 				if isUniqueViolation(err) {
 					return fail("CONFLICT", "tool call id %s repeated", tc.ID)
 				}
@@ -737,8 +812,19 @@ func (s *Store) UpdateToolCall(ctx context.Context, c *run.Claim, id, state, res
 // the final events are appended in the same transaction.
 func (s *Store) Finish(ctx context.Context, c *run.Claim, status, failureCode, failureMessage string, events []agui.Event) error {
 	return s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
-		if _, err := s.owned(ctx, tx, c); err != nil {
+		r, err := s.owned(ctx, tx, c)
+		if err != nil {
 			return err
+		}
+		if status == run.StatusAwaitingSubagent {
+			// a child may have ended while this turn was still running: then there is nothing to wait for
+			var active int
+			if err := tx.QueryRow(ctx, `SELECT count(*) FROM runs WHERE parent_run_id = $1 AND status IN `+activeStatuses, c.RunID).Scan(&active); err != nil {
+				return err
+			}
+			if active == 0 {
+				status = run.StatusQueued
+			}
 		}
 		var code, msg any
 		if failureCode != "" {
@@ -757,8 +843,201 @@ func (s *Store) Finish(ctx context.Context, c *run.Claim, status, failureCode, f
 				return err
 			}
 		}
-		return appendEvents(ctx, tx, c.TenantID, c.RunID, events)
+		if err := appendEvents(ctx, tx, c.TenantID, c.RunID, events); err != nil {
+			return err
+		}
+		if r.ParentRunID != "" {
+			if finished {
+				return childEnded(ctx, tx, c.TenantID, r, status, failureCode)
+			}
+			if status == run.StatusAwaitingInput {
+				return appendEvents(ctx, tx, c.TenantID, r.ParentRunID, []agui.Event{agui.Custom(agui.CustomSubagentAwaitingInput, map[string]any{"runId": r.ID})})
+			}
+		}
+		return nil
 	})
+}
+
+// CreateChildRun creates the sub-agent run a DELEGATED tool call of the claimed run points at (D22):
+// a new thread named after the child run, the parent's owner, the pinned release of the other agent,
+// the parent's context, executionRef and trace, and - when both use the same gateway - the parent's
+// credential. The call is marked DELEGATED in the same transaction. The child's id is derived from
+// the parent run and the tool call, so a retried turn finds the child it already created.
+func (s *Store) CreateChildRun(ctx context.Context, c *run.Claim, in run.ChildRunInput) (*run.Run, error) {
+	var out *run.Run
+	err := s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
+		parent, err := s.owned(ctx, tx, c)
+		if err != nil {
+			return err
+		}
+		childID := run.ChildRunID(parent.ID, in.ToolCallID)
+		existing, err := scanRun(tx.QueryRow(ctx, `SELECT `+runCols+` FROM runs WHERE id = $1`, childID))
+		if err == nil {
+			out = existing
+		} else if se := new(Error); !errors.As(err, &se) {
+			return err
+		} else {
+			ag, err := getAgent(ctx, tx, in.Agent.AgentID, false)
+			if err != nil {
+				return fail("CONFLICT", "sub-agent %s no longer exists", in.Agent.Name)
+			}
+			var releaseID string
+			if err := tx.QueryRow(ctx, `SELECT id::text FROM agent_releases WHERE agent_id = $1 AND digest = $2 AND status IN ('APPROVED', 'SUPERSEDED')`, ag.ID, in.Agent.Digest).Scan(&releaseID); err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					return fail("CONFLICT", "sub-agent %s has no approved release with digest %s", in.Agent.Name, in.Agent.Digest)
+				}
+				return err
+			}
+			env, err := envelopeOf(ctx, tx, releaseID)
+			if err != nil {
+				return err
+			}
+			doc, err := agent.Open(env)
+			if err != nil {
+				return fail("GONE", "release of sub-agent %s is corrupt: %s", in.Agent.Name, err)
+			}
+			policy, err := policyOf(ctx, tx, c.TenantID)
+			if err != nil {
+				return err
+			}
+			if policy.MaxConcurrentRuns > 0 {
+				n, err := activeRuns(ctx, tx)
+				if err != nil {
+					return err
+				}
+				if n >= policy.MaxConcurrentRuns {
+					return fail("QUOTA_EXCEEDED", "the tenant's limit of %d concurrent runs is reached", policy.MaxConcurrentRuns)
+				}
+			}
+			if policy.TokensPerDay > 0 {
+				used, err := s.tokensLastDay(ctx, tx)
+				if err != nil {
+					return err
+				}
+				if used >= policy.TokensPerDay {
+					return fail("QUOTA_EXCEEDED", "the tenant's daily token budget (%d) is exhausted", policy.TokensPerDay)
+				}
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO threads (tenant_id, id, owner, agent_id) VALUES ($1, $2, $3, $4)`, c.TenantID, childID, parent.Owner, ag.ID); err != nil {
+				return err
+			}
+			var cred []byte
+			var credExp *time.Time
+			if eff := doc.Effective(); in.Gateway != "" && eff.Tools.Gateway == in.Gateway && len(eff.Tools.Allow) > 0 {
+				if err := tx.QueryRow(ctx, `SELECT credential, credential_expires_at FROM runs WHERE id = $1`, parent.ID).Scan(&cred, &credExp); err != nil {
+					return err
+				}
+			}
+			input := run.Input{Tools: []agui.Tool{}, Context: parent.Input.Context, MaxOutputTokens: parent.Input.MaxOutputTokens}
+			if input.Context == nil {
+				input.Context = []agui.Context{}
+			}
+			msg := agui.Message{ID: "u_" + childID, Role: agui.RoleUser, Content: in.Input}
+			hash, err := canonical.Digest(map[string]any{"agent": ag.ID, "messages": []agui.Message{msg}, "input": input, "release": releaseID, "executionRef": parent.ExecutionRef})
+			if err != nil {
+				return err
+			}
+			inputRaw, _ := json.Marshal(input)
+			deadline := s.now().Add(time.Duration(doc.Definition.Limits.RunTimeoutSeconds) * time.Second)
+			var trace, execRef, exp any
+			if parent.TraceID != "" {
+				trace = parent.TraceID
+			}
+			if parent.ExecutionRef != "" {
+				execRef = parent.ExecutionRef
+			}
+			if credExp != nil {
+				exp = *credExp
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO runs (tenant_id, id, thread_id, agent_id, release_id, release_digest, owner, status, idempotency_key, request_sha256, input,
+			credential, credential_expires_at, trace_id, deadline_at, execution_ref, parent_run_id, depth) VALUES ($1, $2, $2, $3, $4, $5, $6, 'QUEUED', $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+				c.TenantID, childID, ag.ID, releaseID, env.Digest, parent.Owner, "sub:"+in.ToolCallID, hash, inputRaw, cred, exp, trace, deadline, execRef, parent.ID, parent.Depth+1); err != nil {
+				return err
+			}
+			if _, err := appendMessages(ctx, tx, c.TenantID, childID, childID, []agui.Message{msg}); err != nil {
+				return err
+			}
+			if err := appendEvents(ctx, tx, c.TenantID, childID, []agui.Event{agui.RunStarted(childID, childID)}); err != nil {
+				return err
+			}
+			if out, err = scanRun(tx.QueryRow(ctx, `SELECT `+runCols+` FROM runs WHERE id = $1`, childID)); err != nil {
+				return err
+			}
+		}
+		tag, err := tx.Exec(ctx, `UPDATE tool_calls SET state = 'DELEGATED', child_run_id = $3 WHERE run_id = $1 AND id = $2 AND state <> 'DELEGATED'`, c.RunID, in.ToolCallID, childID)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return nil // already delegated by an earlier attempt of this turn
+		}
+		return appendEvents(ctx, tx, c.TenantID, c.RunID, []agui.Event{agui.Custom(agui.CustomSubagentStarted, map[string]any{"toolCallId": in.ToolCallID, "agent": in.Agent.Name, "runId": childID, "threadId": childID})})
+	})
+	if se := new(Error); errors.As(err, &se) {
+		return nil, &run.Refusal{Code: se.Code, Message: se.Message}
+	}
+	return out, err
+}
+
+// ChildOutcome reports the state of a sub-agent run of the claimed run and, when it ended, its last
+// assistant message.
+func (s *Store) ChildOutcome(ctx context.Context, c *run.Claim, childID string) (*run.ChildOutcome, error) {
+	var out run.ChildOutcome
+	err := s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
+		if _, err := s.owned(ctx, tx, c); err != nil {
+			return err
+		}
+		child, err := scanRun(tx.QueryRow(ctx, `SELECT `+runCols+` FROM runs WHERE id = $1 AND parent_run_id = $2`, childID, c.RunID))
+		if err != nil {
+			return err
+		}
+		out = run.ChildOutcome{RunID: child.ID, Status: child.Status, FailureCode: child.FailureCode, FailureMessage: child.FailureMessage}
+		if !run.Terminal(child.Status) {
+			return nil
+		}
+		var raw []byte
+		err = tx.QueryRow(ctx, `SELECT message FROM thread_messages WHERE thread_id = $1 AND message->>'role' = 'assistant' AND coalesce(message->>'content', '') <> '' ORDER BY seq DESC LIMIT 1`, child.ThreadID).Scan(&raw)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		var m agui.Message
+		if err := json.Unmarshal(raw, &m); err != nil {
+			return err
+		}
+		out.Output = m.Content
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ListChildRuns returns the sub-agent runs of a run, oldest first.
+func (s *Store) ListChildRuns(ctx context.Context, tenant, owner, parentID string) ([]run.Run, error) {
+	out := []run.Run{}
+	err := s.InTenant(ctx, tenant, func(tx pgx.Tx) error {
+		if _, err := scanRun(tx.QueryRow(ctx, `SELECT `+runCols+` FROM runs WHERE id = $1 AND ($2 = '' OR owner = $2)`, parentID, owner)); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `SELECT `+runCols+` FROM runs WHERE parent_run_id = $1 ORDER BY created_at LIMIT 500`, parentID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			r, err := scanRun(rows)
+			if err != nil {
+				return err
+			}
+			out = append(out, *r)
+		}
+		return rows.Err()
+	})
+	return out, err
 }
 
 // Credential returns the run's decrypted gateway token.

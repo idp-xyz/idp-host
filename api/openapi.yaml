@@ -165,6 +165,11 @@ paths:
   /v1/runs/{id}:
     parameters: [{$ref: '#/components/parameters/id'}]
     get: {summary: Get a run, responses: {'200': {description: run, content: {application/json: {schema: {$ref: '#/components/schemas/Run'}}}}, '404': {$ref: '#/components/responses/Problem'}}}
+  /v1/runs/{id}/subruns:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    get:
+      summary: The sub-agent runs this run delegated to (ADR-0001 D22), oldest first
+      responses: {'200': {description: runs, content: {application/json: {schema: {type: object, properties: {runs: {type: array, items: {$ref: '#/components/schemas/Run'}}}}}}}, '404': {$ref: '#/components/responses/Problem'}}
   /v1/runs/{id}/tool-calls:
     parameters: [{$ref: '#/components/parameters/id'}]
     get: {summary: The run's tool calls (pending confirmations included), responses: {'200': {description: tool calls}}}
@@ -208,8 +213,10 @@ components:
         model: {type: object, required: [provider, model], properties: {provider: {type: string}, model: {type: string}, temperature: {type: number}, maxOutputTokens: {type: integer}, fallbacks: {type: array, items: {type: object, properties: {provider: {type: string}, model: {type: string}}}}}}
         tools: {type: object, required: [allow], properties: {gateway: {type: string}, allow: {type: array, items: {type: string}}}}
         confirmation: {type: object, required: [default], properties: {default: {type: string, enum: [auto, confirm]}, tools: {type: object, additionalProperties: {type: string, enum: [auto, confirm]}}}}
-        limits: {type: object, properties: {maxSteps: {type: integer}, maxToolCallsPerStep: {type: integer}, runTimeoutSeconds: {type: integer}, confirmationTimeoutSeconds: {type: integer}, maxTokensPerRun: {type: integer, description: 0 = the tenant policy's default}}}
+        limits: {type: object, properties: {maxSteps: {type: integer}, maxToolCallsPerStep: {type: integer}, runTimeoutSeconds: {type: integer}, confirmationTimeoutSeconds: {type: integer}, maxTokensPerRun: {type: integer, description: 0 = the tenant policy's default}, maxSubagentDepth: {type: integer, description: 'how deep delegation may nest below a run of this release (default 1, at most 5; ADR-0001 D22)'}}}
         skills: {type: array, description: skills by name, optionally pinned to a version (0 = current); embedded when a release is compiled, items: {type: object, required: [name], properties: {name: {type: string}, version: {type: integer}}}}
+        subagents: {type: array, description: 'other agents of the tenant this agent may delegate to, offered to the model as tools agent__<name>; resolved to a release digest when a release is compiled (ADR-0001 D22)', items: {type: object, required: [name, description], properties: {name: {type: string}, version: {type: integer}, description: {type: string}}}}
+        skillMerge: {type: object, description: 'how skills merge into the effective definition (ADR-0001 D24); defaults append / union / strictest', properties: {instructions: {type: string, enum: [append, prepend, placeholder]}, tools: {type: string, enum: [union, ceiling]}, confirmation: {type: string, enum: [strictest, agent]}}}
     Policy:
       description: Tenant governance (zero = unlimited); runs beyond the limits are refused with 429 QUOTA_EXCEEDED, runs that exhaust a budget mid-way fail with BUDGET_EXCEEDED
       type: object
@@ -218,7 +225,11 @@ components:
       description: The editable content of a skill (contract idp.telos.host SkillDefinition)
       type: object
       required: [instructions, tools]
-      properties: {instructions: {type: string}, tools: {type: array, items: {type: string}}, confirmation: {type: object, additionalProperties: {type: string, enum: [auto, confirm]}}}
+      properties:
+        instructions: {type: string}
+        tools: {type: array, items: {type: string}}
+        confirmation: {type: object, additionalProperties: {type: string, enum: [auto, confirm]}}
+        resources: {type: array, description: 'reference documents published with the skill (ADR-0001 D23): inline ones follow the skill instructions, on-demand ones are read by the model through resource__read', items: {type: object, required: [name, mediaType, content], properties: {name: {type: string}, mediaType: {type: string, enum: [text/plain, text/markdown, application/json]}, content: {type: string}, onDemand: {type: boolean}}}}
     Skill:
       type: object
       properties: {skillId: {type: string}, name: {type: string}, displayName: {type: string}, definition: {$ref: '#/components/schemas/SkillDefinition'}, currentReleaseId: {type: [string, 'null']}, createdBy: {type: string}, createdAt: {type: string, format: date-time}, updatedAt: {type: string, format: date-time}}
@@ -262,7 +273,7 @@ components:
     Run:
       description: contract idp.telos.host AgentRun
       type: object
-      properties: {runId: {type: string}, threadId: {type: string}, agentId: {type: string}, releaseId: {type: string}, releaseDigest: {type: string}, owner: {type: string}, status: {type: string, enum: [QUEUED, RUNNING, AWAITING_INPUT, COMPLETED, FAILED, CANCELED]}, stepCount: {type: integer}, cancelRequested: {type: boolean}, failureCode: {type: string}, failureMessage: {type: string}, executionRef: {type: string}, traceId: {type: string}, deadlineAt: {type: string, format: date-time}, createdAt: {type: string, format: date-time}, startedAt: {type: string, format: date-time}, finishedAt: {type: string, format: date-time}}
+      properties: {runId: {type: string}, threadId: {type: string}, agentId: {type: string}, releaseId: {type: string}, releaseDigest: {type: string}, owner: {type: string}, status: {type: string, enum: [QUEUED, RUNNING, AWAITING_INPUT, AWAITING_SUBAGENT, COMPLETED, FAILED, CANCELED]}, stepCount: {type: integer}, cancelRequested: {type: boolean}, failureCode: {type: string}, failureMessage: {type: string}, executionRef: {type: string}, parentRunId: {type: string, description: 'the run that delegated to this one (sub-agent run, ADR-0001 D22)'}, depth: {type: integer}, traceId: {type: string}, deadlineAt: {type: string, format: date-time}, createdAt: {type: string, format: date-time}, startedAt: {type: string, format: date-time}, finishedAt: {type: string, format: date-time}}
     ToolCall:
       type: object
       properties: {runId: {type: string}, toolCallId: {type: string}, step: {type: integer}, messageId: {type: string}, tool: {type: string}, arguments: {type: string}, argumentsSha256: {type: string}, state: {type: string, enum: [PENDING_CONFIRMATION, CONFIRMED, REJECTED, EXPIRED, EXECUTING, DONE, FAILED, FRONTEND, DENIED]}, confirmationExpiresAt: {type: string, format: date-time}, decidedBy: {type: string}, decidedAt: {type: string, format: date-time}, result: {type: string}, isError: {type: boolean}, createdAt: {type: string, format: date-time}, finishedAt: {type: string, format: date-time}}

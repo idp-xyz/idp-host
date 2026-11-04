@@ -34,6 +34,9 @@ type Store interface {
 	UpdateToolCall(ctx context.Context, c *run.Claim, id, state, result string, isError bool, events []agui.Event) error
 	Finish(ctx context.Context, c *run.Claim, status, failureCode, failureMessage string, events []agui.Event) error
 	Credential(ctx context.Context, c *run.Claim) (string, error)
+	// sub-agent runs (D22)
+	CreateChildRun(ctx context.Context, c *run.Claim, in run.ChildRunInput) (*run.Run, error)
+	ChildOutcome(ctx context.Context, c *run.Claim, childID string) (*run.ChildOutcome, error)
 }
 
 // Gateway is one configured MCP Infrastructure gateway.
@@ -89,17 +92,20 @@ func (h *Harness) defaults() {
 }
 
 type turn struct {
-	h        *Harness
-	ctx      context.Context
-	claim    *run.Claim
-	rc       *run.Context
-	def      agent.Definition
-	messages []agui.Message
-	gateway  *Gateway
-	bearer   string
-	tools    []model.ToolSpec
-	frontend map[string]bool
-	visible  map[string]bool
+	h         *Harness
+	ctx       context.Context
+	claim     *run.Claim
+	rc        *run.Context
+	def       agent.Definition
+	messages  []agui.Message
+	gateway   *Gateway
+	bearer    string
+	tools     []model.ToolSpec
+	frontend  map[string]bool
+	visible   map[string]bool
+	subagents map[string]agent.EmbeddedSubagent    // by tool name (D22)
+	resources map[string]map[string]agent.Resource // on-demand skill resources by skill and name (D23)
+	waiting   bool                                 // a delegated call's child run has not ended yet
 }
 
 // Run executes one claim to its next resting state. It returns run.ErrFenced when the claim was
@@ -113,13 +119,19 @@ func (h *Harness) Run(ctx context.Context, c *run.Claim) error {
 		}
 		return h.fail(ctx, c, run.FailReleaseGone, "the run's release cannot be loaded: "+err.Error())
 	}
-	t := &turn{h: h, ctx: ctx, claim: c, rc: rc, def: rc.Release.Effective(), messages: rc.Messages, frontend: map[string]bool{}, visible: map[string]bool{}}
+	t := &turn{h: h, ctx: ctx, claim: c, rc: rc, def: rc.Release.Effective(), messages: rc.Messages, frontend: map[string]bool{}, visible: map[string]bool{},
+		subagents: map[string]agent.EmbeddedSubagent{}, resources: rc.Release.OnDemandResources()}
 	if rc.Run.Input.ToolExecution == run.ToolExecutionCaller {
 		// ADR-0001 D19: the caller executes every tool. No gateway tools are offered (the release's
-		// and its skills' alike), and the run is one model call: a final answer, or proposals the
-		// caller executes and answers in its next run.
+		// and its skills' alike), no sub-agents and no resources, and the run is one model call: a
+		// final answer, or proposals the caller executes and answers in its next run.
 		t.def.Tools = agent.ToolPolicy{Allow: []string{}}
 		t.def.Limits.MaxSteps = 1
+		t.resources = nil
+	} else if rc.Run.Depth < t.def.Limits.MaxSubagentDepth {
+		for _, sub := range rc.Release.Subagents {
+			t.subagents[agent.SubagentToolName(sub.Name)] = sub
+		}
 	}
 	if m := rc.Run.Input.MaxOutputTokens; m > 0 && (t.def.Model.MaxOutputTokens == 0 || m < t.def.Model.MaxOutputTokens) {
 		t.def.Model.MaxOutputTokens = m
@@ -138,6 +150,9 @@ func (h *Harness) Run(ctx context.Context, c *run.Claim) error {
 	}
 	if err := t.resolveDecided(); err != nil {
 		return err
+	}
+	if t.waiting {
+		return h.Store.Finish(ctx, c, run.StatusAwaitingSubagent, "", "", nil)
 	}
 	return t.loop()
 }
@@ -183,6 +198,10 @@ func (t *turn) prepareTools() error {
 			if !t.def.Tools.Allows(tool.Name) {
 				continue
 			}
+			if agent.Reserved(tool.Name) {
+				h.Log.Warn("gateway tool uses a reserved prefix and is ignored", "tool", tool.Name)
+				continue
+			}
 			t.visible[tool.Name] = true
 			desc := tool.Description
 			if desc == "" {
@@ -192,12 +211,33 @@ func (t *turn) prepareTools() error {
 		}
 	}
 	for _, ft := range t.rc.Run.Input.Tools {
-		if t.visible[ft.Name] {
-			h.Log.Warn("frontend tool shadows a gateway tool and is ignored", "tool", ft.Name)
+		if t.visible[ft.Name] || agent.Reserved(ft.Name) {
+			h.Log.Warn("frontend tool shadows a gateway or HOST tool and is ignored", "tool", ft.Name)
 			delete(t.frontend, ft.Name)
 			continue
 		}
 		t.tools = append(t.tools, model.ToolSpec{Name: ft.Name, Description: ft.Description, Parameters: ft.Parameters})
+	}
+	// HOST tools (D22, D23): sub-agents and on-demand skill resources, in release order
+	for _, ref := range t.rc.Release.Definition.Subagents {
+		name := agent.SubagentToolName(ref.Name)
+		if _, ok := t.subagents[name]; !ok {
+			continue
+		}
+		t.tools = append(t.tools, model.ToolSpec{Name: name, Description: ref.Description,
+			Parameters: json.RawMessage(`{"type":"object","properties":{"input":{"type":"string","description":"The task for the agent, with everything it needs to know."}},"required":["input"],"additionalProperties":false}`)})
+	}
+	if len(t.resources) > 0 {
+		var names []string
+		for _, s := range t.rc.Release.Skills {
+			for _, r := range s.Definition.Resources {
+				if r.OnDemand {
+					names = append(names, s.Name+"/"+r.Name)
+				}
+			}
+		}
+		t.tools = append(t.tools, model.ToolSpec{Name: agent.ResourceReadTool, Description: "Read a reference document published with one of your skills. Available: " + strings.Join(names, ", ") + ".",
+			Parameters: json.RawMessage(`{"type":"object","properties":{"skill":{"type":"string"},"name":{"type":"string"}},"required":["skill","name"],"additionalProperties":false}`)})
 	}
 	return nil
 }
@@ -234,9 +274,75 @@ func (t *turn) resolveDecided() error {
 			if err := t.answer(tc, tc.State, "", reason); err != nil {
 				return err
 			}
+		case run.CallDelegated:
+			if err := t.collect(tc); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
+}
+
+// collect answers a delegated call from its child run when that run has ended; otherwise the turn
+// keeps waiting.
+func (t *turn) collect(tc run.ToolCall) error {
+	out, err := t.h.Store.ChildOutcome(t.ctx, t.claim, tc.ChildRunID)
+	if err != nil {
+		return err
+	}
+	if !run.Terminal(out.Status) {
+		t.waiting = true
+		return nil
+	}
+	name := strings.TrimPrefix(tc.Tool, agent.SubagentToolPrefix)
+	switch out.Status {
+	case run.StatusCompleted:
+		return t.answer(tc, run.CallDone, out.Output, "")
+	case run.StatusCanceled:
+		return t.answer(tc, run.CallFailed, "", "sub-agent "+name+" was canceled")
+	default:
+		return t.answer(tc, run.CallFailed, "", fmt.Sprintf("sub-agent %s failed: %s: %s", name, out.FailureCode, out.FailureMessage))
+	}
+}
+
+// delegate creates the child run of a sub-agent call. The call rests as DELEGATED; a store refusal
+// (quota, missing release) becomes the tool's error result and the model continues.
+func (t *turn) delegate(tc run.ToolCall) error {
+	sub := t.subagents[tc.Tool]
+	var args struct {
+		Input string `json:"input"`
+	}
+	if err := json.Unmarshal([]byte(tc.Arguments), &args); err != nil || strings.TrimSpace(args.Input) == "" {
+		return t.answer(tc, run.CallFailed, "", "the input argument is required")
+	}
+	if _, err := t.h.Store.CreateChildRun(t.ctx, t.claim, run.ChildRunInput{ToolCallID: tc.ID, Agent: sub, Input: args.Input, Gateway: t.def.Tools.Gateway}); err != nil {
+		if errors.Is(err, run.ErrFenced) || t.ctx.Err() != nil {
+			return err
+		}
+		var ref *run.Refusal
+		if errors.As(err, &ref) {
+			return t.answer(tc, run.CallFailed, "", "delegation refused: "+ref.Message)
+		}
+		return err
+	}
+	t.waiting = true
+	return nil
+}
+
+// readResource answers a resource__read call from the release's own content.
+func (t *turn) readResource(tc run.ToolCall) error {
+	var args struct {
+		Skill string `json:"skill"`
+		Name  string `json:"name"`
+	}
+	if err := json.Unmarshal([]byte(tc.Arguments), &args); err != nil {
+		return t.answer(tc, run.CallFailed, "", "skill and name are required")
+	}
+	r, ok := t.resources[args.Skill][args.Name]
+	if !ok {
+		return t.answer(tc, run.CallFailed, "", fmt.Sprintf("no on-demand resource %s/%s", args.Skill, args.Name))
+	}
+	return t.answer(tc, run.CallDone, r.Content, "")
 }
 
 // answer appends the tool message for a call and marks the call resolved.
@@ -258,9 +364,16 @@ func (t *turn) answer(tc run.ToolCall, state, result, errText string) error {
 	return nil
 }
 
-// execute calls the gateway for a confirmed or automatic call and records the result.
+// execute runs a confirmed or automatic call: a sub-agent delegation, a resource read, or a gateway
+// call whose result is recorded.
 func (t *turn) execute(tc run.ToolCall) (bool, error) {
 	h := t.h
+	if _, ok := t.subagents[tc.Tool]; ok {
+		return true, t.delegate(tc)
+	}
+	if tc.Tool == agent.ResourceReadTool && t.resources != nil {
+		return true, t.readResource(tc)
+	}
 	if t.gateway == nil {
 		return false, t.answer(tc, run.CallFailed, "", "no gateway configured")
 	}
@@ -515,7 +628,7 @@ func (t *turn) dispatch(step int, msg agui.Message) (string, error) {
 			events = append(events, agui.Custom(agui.CustomToolDenied, map[string]any{"toolCallId": tc.ID, "tool": tc.Tool, "reason": "too many tool calls in one step"}))
 		case t.frontend[tc.Tool]:
 			tc.State = run.CallFrontend
-		case !t.visible[tc.Tool]:
+		case !t.visible[tc.Tool] && !t.hostTool(tc.Tool):
 			tc.State = run.CallDenied
 			events = append(events, agui.Custom(agui.CustomToolDenied, map[string]any{"toolCallId": tc.ID, "tool": tc.Tool, "reason": "tool not available to this agent"}))
 		case t.def.Confirmation.For(tc.Tool) == agent.ConfirmConfirm:
@@ -559,5 +672,20 @@ func (t *turn) dispatch(step int, msg agui.Message) (string, error) {
 	if frontend {
 		return run.StatusCompleted, t.complete()
 	}
+	if t.waiting {
+		// the stream stays open: no RUN_FINISHED until the sub-agents end and this run resumes
+		if err := h.Store.Finish(t.ctx, t.claim, run.StatusAwaitingSubagent, "", "", nil); err != nil {
+			return "", err
+		}
+		return run.StatusAwaitingSubagent, nil
+	}
 	return "", nil
+}
+
+// hostTool reports whether the HOST itself serves the tool in this turn.
+func (t *turn) hostTool(name string) bool {
+	if _, ok := t.subagents[name]; ok {
+		return true
+	}
+	return name == agent.ResourceReadTool && len(t.resources) > 0
 }

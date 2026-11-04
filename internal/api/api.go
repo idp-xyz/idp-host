@@ -415,6 +415,10 @@ func (a *API) Handler() http.Handler {
 		out, err := a.Store.GetRun(r.Context(), p.Tenant, ownerScope(p), r.PathValue("id"))
 		return 200, out, err
 	}))
+	mux.Handle("GET /v1/runs/{id}/subruns", a.role(user, func(r *http.Request, p authorization.Principal) (int, any, error) {
+		out, err := a.Store.ListChildRuns(r.Context(), p.Tenant, ownerScope(p), r.PathValue("id"))
+		return 200, map[string]any{"runs": out}, err
+	}))
 	mux.Handle("GET /v1/runs/{id}/tool-calls", a.role(user, func(r *http.Request, p authorization.Principal) (int, any, error) {
 		out, err := a.Store.ToolCalls(r.Context(), p.Tenant, ownerScope(p), r.PathValue("id"))
 		return 200, map[string]any{"toolCalls": out}, err

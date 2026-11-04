@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:idp:telos:host:1.2.0",
-  "title": "idp.telos.host 1.2.0",
-  "description": "idp-host（Agent Hosting & Coordination）对外发布的契约：AgentRelease（agent 行为的不可变发布件，ADR-0001 D2；1.1.0 起可嵌入 Skill，D17）、SkillRelease（skill 的不可变发布件）、Envelope（发布件加内容摘要）、AgentRun（一次运行的记录，API 返回的形态）和 RunOptions（1.2.0 起：创建运行时的调用方选项，D19）。生产者是 idp-host，权威副本在 idp-host/api/contracts/，由 go test ./internal/run -run TestContract 保证与实现一致；idp-contracts 中的副本只能与之逐字节相同。JSON Schema 只描述形状与可本地判定的规则；摘要是否匹配由 agent.Open / agent.OpenSkill 判定，运行时不变量由 HOST 的状态机判定。",
+  "$id": "urn:idp:telos:host:1.3.0",
+  "title": "idp.telos.host 1.3.0",
+  "description": "idp-host（Agent Hosting & Coordination）对外发布的契约：AgentRelease（agent 行为的不可变发布件，ADR-0001 D2；1.1.0 起可嵌入 Skill，D17）、SkillRelease（skill 的不可变发布件）、Envelope（发布件加内容摘要）、AgentRun（一次运行的记录，API 返回的形态；1.3.0 起可为子 agent 运行，D22）和 RunOptions（1.2.0 起：创建运行时的调用方选项，D19）。1.3.0 新增：Definition 的 subagents 与 skillMerge（D22、D24）、Limits 的 maxSubagentDepth、SkillDefinition 的 resources（D23）、AgentRelease 的 subagents、AgentRun 的 parentRunId / depth 与状态 AWAITING_SUBAGENT。生产者是 idp-host，权威副本在 idp-host/api/contracts/，由 go test ./internal/run -run TestContract 保证与实现一致；idp-contracts 中的副本只能与之逐字节相同。JSON Schema 只描述形状与可本地判定的规则；摘要是否匹配由 agent.Open / agent.OpenSkill 判定，运行时不变量由 HOST 的状态机判定。",
   "oneOf": [
     {"$ref": "#/$defs/AgentRelease"},
     {"$ref": "#/$defs/SkillRelease"},
@@ -29,12 +29,13 @@
         "createdBy": {"type": "string", "minLength": 1},
         "approvedBy": {"type": "string", "minLength": 1},
         "definition": {"$ref": "#/$defs/Definition"},
-        "skills": {"type": "array", "items": {"$ref": "#/$defs/EmbeddedSkill"}}
+        "skills": {"type": "array", "items": {"$ref": "#/$defs/EmbeddedSkill"}},
+        "subagents": {"type": "array", "items": {"$ref": "#/$defs/EmbeddedSubagent"}}
       }
     },
     "Definition": {
       "title": "Definition",
-      "description": "agent 行为的全部输入：系统指令、模型配置、工具策略、确认策略、限制，以及按名字（可钉版本）引用的 skill。",
+      "description": "agent 行为的全部输入：系统指令、模型配置、工具策略、确认策略、限制，按名字（可钉版本）引用的 skill，可委派的子 agent（D22）与 skill 合并规则（D24；缺省 append / union / strictest）。",
       "x-idp-telos-owner": "idp.telos.host",
       "type": "object",
       "additionalProperties": false,
@@ -45,7 +46,49 @@
         "tools": {"$ref": "#/$defs/ToolPolicy"},
         "confirmation": {"$ref": "#/$defs/ConfirmationPolicy"},
         "limits": {"$ref": "#/$defs/Limits"},
-        "skills": {"type": "array", "items": {"$ref": "#/$defs/SkillRef"}}
+        "skills": {"type": "array", "items": {"$ref": "#/$defs/SkillRef"}},
+        "subagents": {"type": "array", "items": {"$ref": "#/$defs/SubagentRef"}},
+        "skillMerge": {"$ref": "#/$defs/SkillMerge"}
+      }
+    },
+    "SubagentRef": {
+      "title": "SubagentRef",
+      "description": "agent 定义对另一个 agent 的委派引用（D22）：名字，可选钉住的版本（缺省 = 编译时该 agent 的当前发布），以及给模型看的说明（模型据此决定何时委派）。模型看到的工具名为 agent__<name>。",
+      "x-idp-telos-owner": "idp.telos.host",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "description"],
+      "properties": {
+        "name": {"type": "string", "pattern": "^[a-z0-9]([a-z0-9-]{0,55}[a-z0-9])?$"},
+        "version": {"type": "integer", "minimum": 1},
+        "description": {"type": "string", "minLength": 1, "maxLength": 1024}
+      }
+    },
+    "EmbeddedSubagent": {
+      "title": "EmbeddedSubagent",
+      "description": "编译 AgentRelease 时解析出的子 agent 身份：名字、agentId、版本与该 AgentRelease 的摘要。只嵌入身份，不嵌入内容；委派时运行的就是这一份发布件。",
+      "x-idp-telos-owner": "idp.telos.host",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "agentId", "version", "digest"],
+      "properties": {
+        "name": {"type": "string", "pattern": "^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$"},
+        "agentId": {"type": "string", "minLength": 1},
+        "version": {"type": "integer", "minimum": 1},
+        "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      }
+    },
+    "SkillMerge": {
+      "title": "SkillMerge",
+      "description": "skill 合并进有效定义的规则（D24）：instructions 为 append（skill 指令附在 agent 指令之后）、prepend 或 placeholder（放在 agent 指令的 {{skills}} 处）；tools 为 union（并集）或 ceiling（agent 的 allow 是上限，越界的 skill 工具在编译时被拒）；confirmation 为 strictest（任一处要求确认即确认）或 agent（agent 的按工具覆盖优先）。",
+      "x-idp-telos-owner": "idp.telos.host",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["instructions", "tools", "confirmation"],
+      "properties": {
+        "instructions": {"enum": ["append", "prepend", "placeholder"]},
+        "tools": {"enum": ["union", "ceiling"]},
+        "confirmation": {"enum": ["strictest", "agent"]}
       }
     },
     "SkillRef": {
@@ -62,15 +105,30 @@
     },
     "SkillDefinition": {
       "title": "SkillDefinition",
-      "description": "skill 的内容：指令片段、它需要的工具（网关暴露名）、它要求的确认覆盖（confirm 在合并时优先）。",
+      "description": "skill 的内容：指令片段、它需要的工具（网关暴露名；不得使用 HOST 保留前缀 agent__ 与 resource__）、它要求的确认覆盖（confirm 在合并时优先），以及随 skill 发布的资源（D23）。",
       "x-idp-telos-owner": "idp.telos.host",
       "type": "object",
       "additionalProperties": false,
       "required": ["instructions", "tools"],
       "properties": {
         "instructions": {"type": "string", "minLength": 1, "maxLength": 65536},
-        "tools": {"type": "array", "items": {"type": "string", "pattern": "^[A-Za-z0-9_.-]{1,128}$"}},
-        "confirmation": {"type": "object", "additionalProperties": {"enum": ["auto", "confirm"]}}
+        "tools": {"type": "array", "items": {"type": "string", "pattern": "^[A-Za-z0-9_.-]{1,128}$", "not": {"pattern": "^(agent__|resource__)"}}},
+        "confirmation": {"type": "object", "additionalProperties": {"enum": ["auto", "confirm"]}},
+        "resources": {"type": "array", "items": {"$ref": "#/$defs/Resource"}}
+      }
+    },
+    "Resource": {
+      "title": "Resource",
+      "description": "skill 随发布携带的参考文档（D23）：名字（skill 内唯一）、媒体类型、内容（≤ 256 KiB，一个 skill 合计 ≤ 1 MiB）。缺省内联：合并时以 ### Resource: <name> 附在该 skill 指令之后；onDemand 为 true 时由模型通过 HOST 内部工具 resource__read（参数 skill、name）按需读取，不经网关。",
+      "x-idp-telos-owner": "idp.telos.host",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "mediaType", "content"],
+      "properties": {
+        "name": {"type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$"},
+        "mediaType": {"enum": ["text/plain", "text/markdown", "application/json"]},
+        "content": {"type": "string", "minLength": 1, "maxLength": 262144},
+        "onDemand": {"type": "boolean"}
       }
     },
     "EmbeddedSkill": {
@@ -136,14 +194,14 @@
     },
     "ToolPolicy": {
       "title": "ToolPolicy",
-      "description": "agent 可用的工具：gateway 是 HOST 配置里登记的 MCP 网关名，allow 是网关对调用者暴露的工具名（\"*\" = 全部）；空 allow 表示没有工具。",
+      "description": "agent 可用的工具：gateway 是 HOST 配置里登记的 MCP 网关名，allow 是网关对调用者暴露的工具名（\"*\" = 全部；不得使用 HOST 保留前缀 agent__ 与 resource__）；空 allow 表示没有工具。",
       "x-idp-telos-owner": "idp.telos.host",
       "type": "object",
       "additionalProperties": false,
       "required": ["allow"],
       "properties": {
         "gateway": {"type": "string", "pattern": "^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$"},
-        "allow": {"type": "array", "items": {"type": "string", "pattern": "^([A-Za-z0-9_.-]{1,128}|\\*)$"}}
+        "allow": {"type": "array", "items": {"type": "string", "pattern": "^([A-Za-z0-9_.-]{1,128}|\\*)$", "not": {"pattern": "^(agent__|resource__)"}}}
       }
     },
     "ConfirmationPolicy": {
@@ -160,7 +218,7 @@
     },
     "Limits": {
       "title": "Limits",
-      "description": "一次 Run 的上限：步数、每步工具调用数、运行时限、确认等待时限（秒）、token 上限（缺省或 0 = 租户策略的默认值）。",
+      "description": "一次 Run 的上限：步数、每步工具调用数、运行时限、确认等待时限（秒）、token 上限（缺省或 0 = 租户策略的默认值）、委派嵌套深度（缺省 1：本 release 的运行可以委派，其子运行不能再委派；D22）。",
       "x-idp-telos-owner": "idp.telos.host",
       "type": "object",
       "additionalProperties": false,
@@ -170,7 +228,8 @@
         "maxToolCallsPerStep": {"type": "integer", "minimum": 1, "maximum": 64},
         "runTimeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 86400},
         "confirmationTimeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 86400},
-        "maxTokensPerRun": {"type": "integer", "minimum": 1, "maximum": 100000000}
+        "maxTokensPerRun": {"type": "integer", "minimum": 1, "maximum": 100000000},
+        "maxSubagentDepth": {"type": "integer", "minimum": 1, "maximum": 5}
       }
     },
     "Envelope": {
@@ -187,7 +246,7 @@
     },
     "AgentRun": {
       "title": "AgentRun",
-      "description": "一次运行的记录（HOST 的权威状态，ADR-0001 D3）：线程、agent 与运行它的 release 摘要、所有者、状态机状态、步数、失败原因、调用方（EER）的 executionRef、追踪 id 与时间。其他系统用 runId 引用它，不复制它的状态。",
+      "description": "一次运行的记录（HOST 的权威状态，ADR-0001 D3）：线程、agent 与运行它的 release 摘要、所有者、状态机状态、步数、失败原因、调用方（EER）的 executionRef、追踪 id 与时间；子 agent 运行（D22）另有 parentRunId 与 depth，委派中的父运行状态为 AWAITING_SUBAGENT（不发 RUN_FINISHED，流保持打开）。其他系统用 runId 引用它，不复制它的状态。",
       "x-idp-telos-owner": "idp.telos.host",
       "type": "object",
       "additionalProperties": false,
@@ -199,12 +258,14 @@
         "releaseId": {"type": "string", "minLength": 1},
         "releaseDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
         "owner": {"type": "string", "minLength": 1},
-        "status": {"enum": ["QUEUED", "RUNNING", "AWAITING_INPUT", "COMPLETED", "FAILED", "CANCELED"]},
+        "status": {"enum": ["QUEUED", "RUNNING", "AWAITING_INPUT", "AWAITING_SUBAGENT", "COMPLETED", "FAILED", "CANCELED"]},
         "stepCount": {"type": "integer", "minimum": 0},
         "cancelRequested": {"type": "boolean"},
         "failureCode": {"type": "string", "minLength": 1},
         "failureMessage": {"type": "string", "minLength": 1},
-        "executionRef": {"type": "string", "minLength": 1, "description": "调用方（EER）的 Execution 引用，由 RunOptions 的 idp.host/executionRef 设置（ADR-0001 D10、D19）"},
+        "executionRef": {"type": "string", "minLength": 1, "description": "调用方（EER）的 Execution 引用，由 RunOptions 的 idp.host/executionRef 设置（ADR-0001 D10、D19）；子 agent 运行继承父运行的值"},
+        "parentRunId": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$", "description": "委派出本运行的父运行（子 agent 运行，D22）；调用方自己的运行没有"},
+        "depth": {"type": "integer", "minimum": 0, "description": "委派深度：调用方的运行为 0（缺省），子运行为父运行 + 1"},
         "traceId": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
         "deadlineAt": {"type": "string", "format": "date-time"},
         "createdAt": {"type": "string", "format": "date-time"},

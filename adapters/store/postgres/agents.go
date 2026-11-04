@@ -214,6 +214,9 @@ func (s *Store) CreateRelease(ctx context.Context, tenant, ref, by string) (*Rel
 		if doc.Skills, err = resolveSkills(ctx, tx, doc.Definition.Skills); err != nil {
 			return err
 		}
+		if doc.Subagents, err = resolveSubagents(ctx, tx, a.ID, doc.Definition.Subagents); err != nil {
+			return err
+		}
 		if err := doc.Validate(); err != nil {
 			return fail("INVALID", "%s", err)
 		}
@@ -232,6 +235,39 @@ func (s *Store) CreateRelease(ctx context.Context, tenant, ref, by string) (*Rel
 		return err
 	})
 	return out, err
+}
+
+// resolveSubagents turns the definition's sub-agent references into the identity of the release each
+// delegation will run (D22): the pinned version when given, else the agent's current release. Only
+// the identity is embedded; the other agent's content stays its own.
+func resolveSubagents(ctx context.Context, tx pgx.Tx, selfID string, refs []agent.SubagentRef) ([]agent.EmbeddedSubagent, error) {
+	var out []agent.EmbeddedSubagent
+	for _, ref := range refs {
+		other, err := getAgent(ctx, tx, ref.Name, false)
+		if err != nil {
+			return nil, fail("CONFLICT", "sub-agent %s does not exist", ref.Name)
+		}
+		if other.ID == selfID {
+			return nil, fail("CONFLICT", "an agent cannot delegate to itself")
+		}
+		var digest *string
+		var version int
+		if ref.Version > 0 {
+			err = tx.QueryRow(ctx, `SELECT digest, version FROM agent_releases WHERE agent_id = $1 AND version = $2 AND status IN ('APPROVED', 'SUPERSEDED')`, other.ID, ref.Version).Scan(&digest, &version)
+		} else if other.CurrentReleaseID != nil {
+			err = tx.QueryRow(ctx, `SELECT digest, version FROM agent_releases WHERE id = $1 AND status = 'APPROVED'`, *other.CurrentReleaseID).Scan(&digest, &version)
+		} else {
+			err = pgx.ErrNoRows
+		}
+		if errors.Is(err, pgx.ErrNoRows) || (err == nil && digest == nil) {
+			return nil, fail("CONFLICT", "sub-agent %s has no approved release to delegate to (version %d)", ref.Name, ref.Version)
+		}
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, agent.EmbeddedSubagent{Name: other.Name, AgentID: other.ID, Version: version, Digest: *digest})
+	}
+	return out, nil
 }
 
 // ApproveRelease seals a candidate with the approver's name (four eyes: never the creator) and makes

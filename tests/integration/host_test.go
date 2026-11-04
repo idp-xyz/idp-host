@@ -822,6 +822,244 @@ func TestHostEndToEnd(t *testing.T) {
 		}
 	})
 
+	t.Run("subagents", func(t *testing.T) {
+		// ADR-0001 D22: a lead agent delegates to a helper agent; the helper runs as a child run
+		// with its own thread, the lead rests in AWAITING_SUBAGENT and resumes with the helper's answer
+		delegating := func(msgs []fakemodel.Message, tools []string) fakemodel.Turn {
+			last := msgs[len(msgs)-1]
+			has := func(name string) bool {
+				for _, t := range tools {
+					if t == name {
+						return true
+					}
+				}
+				return false
+			}
+			switch {
+			case last.Role == "tool":
+				return fakemodel.Turn{Text: "Result: " + last.Content}
+			case strings.Contains(last.Content, "delegate") && has("agent__helper"):
+				return fakemodel.Turn{ToolCalls: []fakemodel.Call{{Name: "agent__helper", Args: `{"input":"please sum"}`}}}
+			case strings.Contains(last.Content, "delegate-echo") || strings.Contains(last.Content, "delegate") && has("agent__echoer"):
+				return fakemodel.Turn{ToolCalls: []fakemodel.Call{{Name: "agent__echoer", Args: `{"input":"echo this"}`}}}
+			case strings.Contains(last.Content, "sum") && has("sum"):
+				return fakemodel.Turn{ToolCalls: []fakemodel.Call{{Name: "sum", Args: `{"a":1,"b":2}`}}}
+			case strings.Contains(last.Content, "echo") && has("echo"):
+				return fakemodel.Turn{ToolCalls: []fakemodel.Call{{Name: "echo", Args: `{"text":"hi"}`}}}
+			}
+			return fakemodel.Turn{Text: "Echo: " + last.Content}
+		}
+		e.model.Script = delegating
+		defer func() { e.model.Script = fakemodel.DefaultScript }()
+		e.publish("helper", definition("edge", []string{"sum"}, nil))
+		// compile-time rules: the referenced agent must exist and be published; no self-reference
+		lead := definition("edge", []string{"sum"}, nil)
+		lead.Subagents = []agent.SubagentRef{{Name: "nobody", Description: "x"}}
+		e.must(201, "POST", "/api/v1/agents", "alice", map[string]any{"name": "lead", "displayName": "Lead", "definition": lead})
+		e.must(409, "POST", "/api/v1/agents/lead/releases", "alice", nil)
+		lead.Subagents = []agent.SubagentRef{{Name: "lead", Description: "x"}}
+		e.must(200, "PATCH", "/api/v1/agents/lead", "alice", map[string]any{"definition": lead})
+		e.must(409, "POST", "/api/v1/agents/lead/releases", "alice", nil)
+		lead.Subagents = []agent.SubagentRef{{Name: "helper", Description: "Delegate arithmetic to the helper."}}
+		e.must(200, "PATCH", "/api/v1/agents/lead", "alice", map[string]any{"definition": lead})
+		rel := e.must(201, "POST", "/api/v1/agents/lead/releases", "alice", nil)
+		e.must(200, "POST", "/api/v1/releases/"+rel["releaseId"].(string)+"/approve", "bob", nil)
+		helperRel := e.must(200, "GET", "/api/v1/agents/helper/releases", "alice", nil)["releases"].([]any)[0].(map[string]any)
+		if subs := rel["document"].(map[string]any)["subagents"].([]any); len(subs) != 1 || subs[0].(map[string]any)["digest"] != helperRel["digest"] || subs[0].(map[string]any)["version"] != 1.0 {
+			t.Fatalf("%v", rel["document"].(map[string]any)["subagents"])
+		}
+		gatewayCalls := len(e.mcp.Calls())
+		// the delegation: the lead's first turn creates the child and rests without RUN_FINISHED
+		r := e.must(202, "POST", "/v1/agents/lead/runs", "carol", runBody("lead-1", "please delegate"), "Idempotency-Key", "sa1")
+		parent := r["runId"].(string)
+		if ok, err := e.worker.Once(context.Background()); err != nil || !ok {
+			t.Fatal(ok, err)
+		}
+		got := e.must(200, "GET", "/v1/runs/"+parent, "carol", nil)
+		if got["status"] != run.StatusAwaitingSubagent {
+			t.Fatalf("%v", got)
+		}
+		children := e.must(200, "GET", "/v1/runs/"+parent+"/subruns", "carol", nil)["runs"].([]any)
+		if len(children) != 1 {
+			t.Fatalf("%v", children)
+		}
+		child := children[0].(map[string]any)
+		if child["parentRunId"] != parent || child["depth"] != 1.0 || child["status"] != run.StatusQueued || child["releaseDigest"] != helperRel["digest"] || child["owner"] != "carol" {
+			t.Fatalf("%v", child)
+		}
+		calls := e.must(200, "GET", "/v1/runs/"+parent+"/tool-calls", "carol", nil)["toolCalls"].([]any)
+		if len(calls) != 1 || calls[0].(map[string]any)["state"] != run.CallDelegated || calls[0].(map[string]any)["childRunId"] != child["runId"] {
+			t.Fatalf("%v", calls)
+		}
+		page := e.must(200, "GET", "/v1/runs/"+parent+"/events", "carol", nil)["events"].([]any)
+		if last := page[len(page)-1].(map[string]any)["event"].(map[string]any); last["type"] != agui.EventCustom || last["name"] != agui.CustomSubagentStarted {
+			t.Fatalf("%v", last)
+		}
+		e.must(404, "GET", "/v1/runs/"+parent+"/subruns", "dave", nil)
+		// the child runs on its own thread with the gateway credential; the parent is queued and finishes
+		e.drive()
+		got = e.must(200, "GET", "/v1/runs/"+parent, "carol", nil)
+		if got["status"] != run.StatusCompleted || got["stepCount"] != 2.0 {
+			t.Fatalf("%v", got)
+		}
+		childGot := e.must(200, "GET", "/v1/runs/"+child["runId"].(string), "carol", nil)
+		if childGot["status"] != run.StatusCompleted || childGot["threadId"] != child["runId"] {
+			t.Fatalf("%v", childGot)
+		}
+		cm := e.must(200, "GET", "/v1/threads/"+child["runId"].(string)+"/messages", "carol", nil)["messages"].([]any)
+		if len(cm) != 4 || cm[0].(map[string]any)["content"] != "please sum" || cm[3].(map[string]any)["content"] != "Result: 3" {
+			t.Fatalf("%v", cm)
+		}
+		pm := e.must(200, "GET", "/v1/threads/lead-1/messages", "carol", nil)["messages"].([]any)
+		if last := pm[len(pm)-1].(map[string]any); len(pm) != 4 || last["content"] != "Result: Result: 3" {
+			t.Fatalf("%d %v", len(pm), last)
+		}
+		if n := len(e.mcp.Calls()); n != gatewayCalls+1 {
+			t.Fatalf("gateway calls %d, want %d", n, gatewayCalls+1)
+		}
+		types, _, _ := e.sse("GET", "/v1/runs/"+parent+"/events", "carol", nil)
+		joined := strings.Join(types, ",")
+		if strings.Count(joined, agui.EventRunFinished) != 1 || !strings.HasSuffix(joined, agui.EventRunFinished) || strings.Count(joined, agui.EventRunStarted) != 1 {
+			t.Fatalf("%s", joined)
+		}
+		calls = e.must(200, "GET", "/v1/runs/"+parent+"/tool-calls", "carol", nil)["toolCalls"].([]any)
+		if calls[0].(map[string]any)["state"] != run.CallDone || calls[0].(map[string]any)["result"] != "Result: 3" {
+			t.Fatalf("%v", calls)
+		}
+		// a repeated request replays the parent, not a second child
+		again := e.must(200, "POST", "/v1/agents/lead/runs", "carol", runBody("lead-1", "please delegate"), "Idempotency-Key", "sa1")
+		if again["runId"] != parent || len(e.must(200, "GET", "/v1/runs/"+parent+"/subruns", "carol", nil)["runs"].([]any)) != 1 {
+			t.Fatal("replay created another child")
+		}
+
+		// a child that needs the owner's confirmation: the parent's stream learns of it, the owner
+		// decides on the child's call, both finish
+		e.publish("echoer", definition("edge", []string{"echo"}, map[string]string{"echo": agent.ConfirmConfirm}))
+		lead.Subagents = []agent.SubagentRef{{Name: "echoer", Description: "Delegate echoing."}}
+		e.must(200, "PATCH", "/api/v1/agents/lead", "alice", map[string]any{"definition": lead})
+		rel = e.must(201, "POST", "/api/v1/agents/lead/releases", "alice", nil)
+		e.must(200, "POST", "/api/v1/releases/"+rel["releaseId"].(string)+"/approve", "bob", nil)
+		r = e.must(202, "POST", "/v1/agents/lead/runs", "carol", runBody("lead-2", "please delegate-echo"), "Idempotency-Key", "sa2")
+		parent = r["runId"].(string)
+		e.drive()
+		if got := e.must(200, "GET", "/v1/runs/"+parent, "carol", nil); got["status"] != run.StatusAwaitingSubagent {
+			t.Fatalf("%v", got)
+		}
+		child = e.must(200, "GET", "/v1/runs/"+parent+"/subruns", "carol", nil)["runs"].([]any)[0].(map[string]any)
+		if child["status"] != run.StatusAwaitingInput {
+			t.Fatalf("%v", child)
+		}
+		page = e.must(200, "GET", "/v1/runs/"+parent+"/events", "carol", nil)["events"].([]any)
+		if last := page[len(page)-1].(map[string]any)["event"].(map[string]any); last["name"] != agui.CustomSubagentAwaitingInput {
+			t.Fatalf("%v", last)
+		}
+		cc := e.must(200, "GET", "/v1/runs/"+child["runId"].(string)+"/tool-calls", "carol", nil)["toolCalls"].([]any)
+		e.must(200, "POST", "/v1/runs/"+child["runId"].(string)+"/tool-calls/"+cc[0].(map[string]any)["toolCallId"].(string)+"/decide", "carol", map[string]any{"decision": "confirm"})
+		e.drive()
+		pm = e.must(200, "GET", "/v1/threads/lead-2/messages", "carol", nil)["messages"].([]any)
+		if got := e.must(200, "GET", "/v1/runs/"+parent, "carol", nil); got["status"] != run.StatusCompleted || pm[len(pm)-1].(map[string]any)["content"] != "Result: Result: hi" {
+			t.Fatalf("%v %v", got, pm[len(pm)-1])
+		}
+
+		// canceling a waiting parent cancels its waiting child
+		r = e.must(202, "POST", "/v1/agents/lead/runs", "carol", runBody("lead-3", "please delegate-echo"), "Idempotency-Key", "sa3")
+		parent = r["runId"].(string)
+		e.drive()
+		child = e.must(200, "GET", "/v1/runs/"+parent+"/subruns", "carol", nil)["runs"].([]any)[0].(map[string]any)
+		if got := e.must(200, "POST", "/v1/runs/"+parent+"/cancel", "carol", nil); got["status"] != run.StatusCanceled {
+			t.Fatalf("%v", got)
+		}
+		if got := e.must(200, "GET", "/v1/runs/"+child["runId"].(string), "carol", nil); got["status"] != run.StatusCanceled {
+			t.Fatalf("child after parent cancel: %v", got)
+		}
+		e.drive()
+		// a parent whose child is canceled directly gets a tool error and continues
+		r = e.must(202, "POST", "/v1/agents/lead/runs", "carol", runBody("lead-4", "please delegate-echo"), "Idempotency-Key", "sa4")
+		parent = r["runId"].(string)
+		e.drive()
+		child = e.must(200, "GET", "/v1/runs/"+parent+"/subruns", "carol", nil)["runs"].([]any)[0].(map[string]any)
+		e.must(200, "POST", "/v1/runs/"+child["runId"].(string)+"/cancel", "carol", nil)
+		if got := e.must(200, "GET", "/v1/runs/"+parent, "carol", nil); got["status"] != run.StatusQueued {
+			t.Fatalf("parent after child cancel: %v", got)
+		}
+		e.drive()
+		pm = e.must(200, "GET", "/v1/threads/lead-4/messages", "carol", nil)["messages"].([]any)
+		if got := e.must(200, "GET", "/v1/runs/"+parent, "carol", nil); got["status"] != run.StatusCompleted || !strings.Contains(pm[len(pm)-1].(map[string]any)["content"].(string), "sub-agent echoer was canceled") {
+			t.Fatalf("%v %v", got, pm[len(pm)-1])
+		}
+		// the tenant's concurrency counts the waiting parent and the child
+		e.must(200, "PUT", "/api/v1/policy", "alice", map[string]any{"maxConcurrentRuns": 1})
+		r = e.must(202, "POST", "/v1/agents/lead/runs", "carol", runBody("lead-5", "please delegate-echo"), "Idempotency-Key", "sa5")
+		parent = r["runId"].(string)
+		e.drive()
+		pm = e.must(200, "GET", "/v1/threads/lead-5/messages", "carol", nil)["messages"].([]any)
+		if got := e.must(200, "GET", "/v1/runs/"+parent, "carol", nil); got["status"] != run.StatusCompleted || !strings.Contains(pm[len(pm)-1].(map[string]any)["content"].(string), "delegation refused") {
+			t.Fatalf("%v %v", got, pm[len(pm)-1])
+		}
+		e.must(200, "PUT", "/api/v1/policy", "alice", map[string]any{"maxConcurrentRuns": 0})
+	})
+
+	t.Run("skill-resources-and-merge", func(t *testing.T) {
+		// ADR-0001 D23, D24: an inline resource follows the skill's instructions; an on-demand one is
+		// read through resource__read without touching the gateway; ceiling refuses a skill tool
+		// outside the agent's allow list at compile time
+		e.model.Script = func(msgs []fakemodel.Message, tools []string) fakemodel.Turn {
+			last := msgs[len(msgs)-1]
+			if last.Role == "tool" {
+				return fakemodel.Turn{Text: "Result: " + last.Content}
+			}
+			for _, t := range tools {
+				if t == agent.ResourceReadTool && strings.Contains(last.Content, "chapter") {
+					return fakemodel.Turn{ToolCalls: []fakemodel.Call{{Name: t, Args: `{"skill":"tariffs","name":"chapters"}`}}}
+				}
+			}
+			return fakemodel.Turn{Text: "Echo: " + last.Content}
+		}
+		defer func() { e.model.Script = fakemodel.DefaultScript }()
+		e.must(201, "POST", "/api/v1/skills", "alice", map[string]any{"name": "tariffs", "displayName": "Tariffs", "definition": map[string]any{
+			"instructions": "Classify goods.", "tools": []string{"sum"},
+			"resources": []map[string]any{{"name": "note", "mediaType": "text/plain", "content": "Chapter 01 covers live animals."},
+				{"name": "chapters", "mediaType": "application/json", "content": `{"01":"Live animals","02":"Meat"}`, "onDemand": true}}}})
+		e.must(422, "POST", "/api/v1/skills", "alice", map[string]any{"name": "badres", "displayName": "x", "definition": map[string]any{"instructions": "x", "tools": []string{},
+			"resources": []map[string]any{{"name": "a", "mediaType": "image/png", "content": "x"}}}})
+		sr := e.must(201, "POST", "/api/v1/skills/tariffs/releases", "alice", nil)
+		e.must(200, "POST", "/api/v1/skill-releases/"+sr["releaseId"].(string)+"/approve", "bob", nil)
+		// ceiling: the skill's sum tool is outside an allow list of only echo
+		def := definition("edge", []string{"echo"}, nil)
+		def.Skills = []agent.SkillRef{{Name: "tariffs"}}
+		def.SkillMerge = agent.SkillMerge{Tools: agent.MergeCeiling}
+		e.must(201, "POST", "/api/v1/agents", "alice", map[string]any{"name": "classifier", "displayName": "Classifier", "definition": def})
+		st, out := e.call("POST", "/api/v1/agents/classifier/releases", "alice", nil)
+		if st != 422 || !strings.Contains(fmt.Sprint(out), "exceeds the agent's allow list") {
+			t.Fatalf("%d %v", st, out)
+		}
+		def.Tools.Allow = []string{"echo", "sum"}
+		def.Instructions = "You classify goods. {{skills}} Answer briefly."
+		def.SkillMerge = agent.SkillMerge{Instructions: agent.MergePlaceholder, Tools: agent.MergeCeiling}
+		e.must(200, "PATCH", "/api/v1/agents/classifier", "alice", map[string]any{"definition": def})
+		ar := e.must(201, "POST", "/api/v1/agents/classifier/releases", "alice", nil)
+		e.must(200, "POST", "/api/v1/releases/"+ar["releaseId"].(string)+"/approve", "bob", nil)
+		gatewayCalls := len(e.mcp.Calls())
+		r := e.must(202, "POST", "/v1/agents/classifier/runs", "carol", runBody("res-1", "which chapter is meat?"), "Idempotency-Key", "r1")
+		e.drive()
+		msgs := e.must(200, "GET", "/v1/threads/res-1/messages", "carol", nil)["messages"].([]any)
+		if got := e.must(200, "GET", "/v1/runs/"+r["runId"].(string), "carol", nil); got["status"] != run.StatusCompleted || msgs[len(msgs)-1].(map[string]any)["content"] != `Result: {"01":"Live animals","02":"Meat"}` {
+			t.Fatalf("%v %v", got, msgs[len(msgs)-1])
+		}
+		if n := len(e.mcp.Calls()); n != gatewayCalls {
+			t.Fatalf("a resource read reached the gateway (%d calls)", n-gatewayCalls)
+		}
+		sys := e.model.Last()[0].Content
+		if !strings.HasPrefix(sys, "You classify goods. ## Skill: tariffs") || !strings.Contains(sys, "### Resource: note (text/plain)\n\nChapter 01 covers live animals.") ||
+			strings.Contains(sys, "Live animals\",") || !strings.HasSuffix(sys, "Answer briefly.") {
+			t.Fatalf("instructions: %q", sys)
+		}
+		calls := e.must(200, "GET", "/v1/runs/"+r["runId"].(string)+"/tool-calls", "carol", nil)["toolCalls"].([]any)
+		if len(calls) != 1 || calls[0].(map[string]any)["tool"] != agent.ResourceReadTool || calls[0].(map[string]any)["state"] != run.CallDone {
+			t.Fatalf("%v", calls)
+		}
+	})
+
 	t.Run("tenant-isolation", func(t *testing.T) {
 		if ags := e.must(200, "GET", "/api/v1/agents", "dave", nil)["agents"].([]any); len(ags) != 0 {
 			t.Fatalf("%v", ags)

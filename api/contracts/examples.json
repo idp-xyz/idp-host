@@ -1,5 +1,5 @@
 {
-  "description": "idp.telos.host 1.2.0 的示例：每一个都是 idp-host 实际产出或原样接受的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录，RunOptions 经 run.ParseOptions 解析后原样往返）。",
+  "description": "idp.telos.host 1.3.0 的示例：每一个都是 idp-host 实际产出或原样接受的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录，RunOptions 经 run.ParseOptions 解析后原样往返）。",
   "generatedBy": "go test ./internal/run -run TestContract -update",
   "examples": [
     {
@@ -21,6 +21,7 @@
           "limits": {
             "confirmationTimeoutSeconds": 1800,
             "maxSteps": 12,
+            "maxSubagentDepth": 2,
             "maxTokensPerRun": 200000,
             "maxToolCallsPerStep": 4,
             "runTimeoutSeconds": 600
@@ -37,16 +38,30 @@
             "provider": "local",
             "temperature": 0.2
           },
+          "skillMerge": {
+            "confirmation": "strictest",
+            "instructions": "append",
+            "tools": "ceiling"
+          },
           "skills": [
             {
               "name": "customs-declaration",
               "version": 2
             }
           ],
+          "subagents": [
+            {
+              "description": "Delegate tariff classification questions (HS codes, duty rates) to the tariff expert.",
+              "name": "tariff-expert",
+              "version": 4
+            }
+          ],
           "tools": {
             "allow": [
               "parcel__create_shipment",
-              "parcel__get_shipment"
+              "parcel__file_declaration",
+              "parcel__get_shipment",
+              "parcel__get_tariff"
             ],
             "gateway": "edge"
           }
@@ -60,14 +75,35 @@
                 "parcel__file_declaration": "confirm"
               },
               "instructions": "When a shipment crosses a border, prepare the customs declaration with the declaration tool and ask before filing.",
+              "resources": [
+                {
+                  "content": "| Term | Risk passes |\n|---|---|\n| EXW | at the seller's premises |\n| DAP | at the named place |",
+                  "mediaType": "text/markdown",
+                  "name": "incoterms"
+                },
+                {
+                  "content": "{\"01\":\"Live animals\",\"02\":\"Meat\"}",
+                  "mediaType": "application/json",
+                  "name": "tariff-chapters",
+                  "onDemand": true
+                }
+              ],
               "tools": [
                 "parcel__file_declaration",
                 "parcel__get_tariff"
               ]
             },
-            "digest": "sha256:e23bd8ae343ad0c2e60c32bc0c0357997f085b4bbac2f304c2bde75135bd65c3",
+            "digest": "sha256:34fb26472f5e8a33255e2aefad20ec6bd210022166a83b32c398cf611c156f33",
             "name": "customs-declaration",
             "version": 2
+          }
+        ],
+        "subagents": [
+          {
+            "agentId": "5a6b7c8d-0000-4000-8000-000000000005",
+            "digest": "sha256:7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e",
+            "name": "tariff-expert",
+            "version": 4
           }
         ],
         "tenantId": "1a2b3c4d-0000-4000-8000-000000000001",
@@ -89,12 +125,18 @@
           "limits": {
             "confirmationTimeoutSeconds": 900,
             "maxSteps": 10,
+            "maxSubagentDepth": 1,
             "maxToolCallsPerStep": 8,
             "runTimeoutSeconds": 300
           },
           "model": {
             "model": "qwen3.8-flash",
             "provider": "local"
+          },
+          "skillMerge": {
+            "confirmation": "strictest",
+            "instructions": "append",
+            "tools": "union"
           },
           "tools": {
             "allow": []
@@ -117,6 +159,19 @@
             "parcel__file_declaration": "confirm"
           },
           "instructions": "When a shipment crosses a border, prepare the customs declaration with the declaration tool and ask before filing.",
+          "resources": [
+            {
+              "content": "| Term | Risk passes |\n|---|---|\n| EXW | at the seller's premises |\n| DAP | at the named place |",
+              "mediaType": "text/markdown",
+              "name": "incoterms"
+            },
+            {
+              "content": "{\"01\":\"Live animals\",\"02\":\"Meat\"}",
+              "mediaType": "application/json",
+              "name": "tariff-chapters",
+              "onDemand": true
+            }
+          ],
           "tools": [
             "parcel__file_declaration",
             "parcel__get_tariff"
@@ -133,7 +188,7 @@
     {
       "definition": "Envelope",
       "value": {
-        "digest": "sha256:99c909fc3287bae693b7ca356444e14cd6a840ad5e4963c091b93c24d498f2ef",
+        "digest": "sha256:c6dc57f71db64558c8955a7d1f36558b3cb7bd70086ead7f40e88973fd540348",
         "document": {
           "agentId": "9e8d7c6b-0000-4000-8000-000000000002",
           "agentName": "parcel-assistant",
@@ -151,6 +206,7 @@
             "limits": {
               "confirmationTimeoutSeconds": 1800,
               "maxSteps": 12,
+              "maxSubagentDepth": 2,
               "maxTokensPerRun": 200000,
               "maxToolCallsPerStep": 4,
               "runTimeoutSeconds": 600
@@ -167,16 +223,30 @@
               "provider": "local",
               "temperature": 0.2
             },
+            "skillMerge": {
+              "confirmation": "strictest",
+              "instructions": "append",
+              "tools": "ceiling"
+            },
             "skills": [
               {
                 "name": "customs-declaration",
                 "version": 2
               }
             ],
+            "subagents": [
+              {
+                "description": "Delegate tariff classification questions (HS codes, duty rates) to the tariff expert.",
+                "name": "tariff-expert",
+                "version": 4
+              }
+            ],
             "tools": {
               "allow": [
                 "parcel__create_shipment",
-                "parcel__get_shipment"
+                "parcel__file_declaration",
+                "parcel__get_shipment",
+                "parcel__get_tariff"
               ],
               "gateway": "edge"
             }
@@ -190,14 +260,35 @@
                   "parcel__file_declaration": "confirm"
                 },
                 "instructions": "When a shipment crosses a border, prepare the customs declaration with the declaration tool and ask before filing.",
+                "resources": [
+                  {
+                    "content": "| Term | Risk passes |\n|---|---|\n| EXW | at the seller's premises |\n| DAP | at the named place |",
+                    "mediaType": "text/markdown",
+                    "name": "incoterms"
+                  },
+                  {
+                    "content": "{\"01\":\"Live animals\",\"02\":\"Meat\"}",
+                    "mediaType": "application/json",
+                    "name": "tariff-chapters",
+                    "onDemand": true
+                  }
+                ],
                 "tools": [
                   "parcel__file_declaration",
                   "parcel__get_tariff"
                 ]
               },
-              "digest": "sha256:e23bd8ae343ad0c2e60c32bc0c0357997f085b4bbac2f304c2bde75135bd65c3",
+              "digest": "sha256:34fb26472f5e8a33255e2aefad20ec6bd210022166a83b32c398cf611c156f33",
               "name": "customs-declaration",
               "version": 2
+            }
+          ],
+          "subagents": [
+            {
+              "agentId": "5a6b7c8d-0000-4000-8000-000000000005",
+              "digest": "sha256:7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e",
+              "name": "tariff-expert",
+              "version": 4
             }
           ],
           "tenantId": "1a2b3c4d-0000-4000-8000-000000000001",
@@ -208,7 +299,7 @@
     {
       "definition": "Envelope",
       "value": {
-        "digest": "sha256:e23bd8ae343ad0c2e60c32bc0c0357997f085b4bbac2f304c2bde75135bd65c3",
+        "digest": "sha256:34fb26472f5e8a33255e2aefad20ec6bd210022166a83b32c398cf611c156f33",
         "document": {
           "approvedBy": "bob",
           "createdAt": "2026-11-03T11:00:00Z",
@@ -218,6 +309,19 @@
               "parcel__file_declaration": "confirm"
             },
             "instructions": "When a shipment crosses a border, prepare the customs declaration with the declaration tool and ask before filing.",
+            "resources": [
+              {
+                "content": "| Term | Risk passes |\n|---|---|\n| EXW | at the seller's premises |\n| DAP | at the named place |",
+                "mediaType": "text/markdown",
+                "name": "incoterms"
+              },
+              {
+                "content": "{\"01\":\"Live animals\",\"02\":\"Meat\"}",
+                "mediaType": "application/json",
+                "name": "tariff-chapters",
+                "onDemand": true
+              }
+            ],
             "tools": [
               "parcel__file_declaration",
               "parcel__get_tariff"
@@ -241,7 +345,7 @@
         "deadlineAt": "2026-11-03T13:10:00Z",
         "finishedAt": "2026-11-03T13:00:09Z",
         "owner": "carol",
-        "releaseDigest": "sha256:99c909fc3287bae693b7ca356444e14cd6a840ad5e4963c091b93c24d498f2ef",
+        "releaseDigest": "sha256:c6dc57f71db64558c8955a7d1f36558b3cb7bd70086ead7f40e88973fd540348",
         "releaseId": "7f3c1a2e-5b6d-4c8e-9f01-23456789abcd",
         "runId": "run_01JD7Q3Z8M8T0G3C6N4V9S2A1B",
         "startedAt": "2026-11-03T13:00:01Z",
@@ -259,7 +363,7 @@
         "createdAt": "2026-11-03T13:10:00Z",
         "deadlineAt": "2026-11-03T13:20:00Z",
         "owner": "carol",
-        "releaseDigest": "sha256:99c909fc3287bae693b7ca356444e14cd6a840ad5e4963c091b93c24d498f2ef",
+        "releaseDigest": "sha256:c6dc57f71db64558c8955a7d1f36558b3cb7bd70086ead7f40e88973fd540348",
         "releaseId": "7f3c1a2e-5b6d-4c8e-9f01-23456789abcd",
         "runId": "run_01JD7Q3Z8M8T0G3C6N4V9S2A1C",
         "startedAt": "2026-11-03T13:10:01Z",
@@ -275,12 +379,48 @@
         "cancelRequested": false,
         "createdAt": "2026-11-03T13:20:00Z",
         "deadlineAt": "2026-11-03T13:30:00Z",
+        "owner": "carol",
+        "releaseDigest": "sha256:c6dc57f71db64558c8955a7d1f36558b3cb7bd70086ead7f40e88973fd540348",
+        "releaseId": "7f3c1a2e-5b6d-4c8e-9f01-23456789abcd",
+        "runId": "run_01JD7Q3Z8M8T0G3C6N4V9S2A1E",
+        "startedAt": "2026-11-03T13:20:01Z",
+        "status": "AWAITING_SUBAGENT",
+        "stepCount": 1,
+        "threadId": "thr-ops-44"
+      }
+    },
+    {
+      "definition": "AgentRun",
+      "value": {
+        "agentId": "5a6b7c8d-0000-4000-8000-000000000005",
+        "cancelRequested": false,
+        "createdAt": "2026-11-03T13:20:02Z",
+        "deadlineAt": "2026-11-03T13:30:00Z",
+        "depth": 1,
+        "owner": "carol",
+        "parentRunId": "run_01JD7Q3Z8M8T0G3C6N4V9S2A1E",
+        "releaseDigest": "sha256:7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e",
+        "releaseId": "e1f2a3b4-5b6d-4c8e-9f01-23456789abd0",
+        "runId": "run_2471e9f28b43138d137d707a93ff4358",
+        "startedAt": "2026-11-03T13:20:03Z",
+        "status": "RUNNING",
+        "stepCount": 1,
+        "threadId": "run_2471e9f28b43138d137d707a93ff4358"
+      }
+    },
+    {
+      "definition": "AgentRun",
+      "value": {
+        "agentId": "9e8d7c6b-0000-4000-8000-000000000002",
+        "cancelRequested": false,
+        "createdAt": "2026-11-03T13:20:00Z",
+        "deadlineAt": "2026-11-03T13:30:00Z",
         "executionRef": "eer:execution:0192f3a1",
         "failureCode": "STEP_LIMIT",
         "failureMessage": "the run reached its limit of 12 steps",
         "finishedAt": "2026-11-03T13:25:00Z",
         "owner": "carol",
-        "releaseDigest": "sha256:99c909fc3287bae693b7ca356444e14cd6a840ad5e4963c091b93c24d498f2ef",
+        "releaseDigest": "sha256:c6dc57f71db64558c8955a7d1f36558b3cb7bd70086ead7f40e88973fd540348",
         "releaseId": "7f3c1a2e-5b6d-4c8e-9f01-23456789abcd",
         "runId": "run_01JD7Q3Z8M8T0G3C6N4V9S2A1D",
         "startedAt": "2026-11-03T13:20:01Z",
@@ -294,14 +434,14 @@
       "value": {
         "idp.host/executionRef": "execution:shipment-7f3a",
         "idp.host/maxOutputTokens": 1024,
-        "idp.host/releaseDigest": "sha256:99c909fc3287bae693b7ca356444e14cd6a840ad5e4963c091b93c24d498f2ef",
+        "idp.host/releaseDigest": "sha256:c6dc57f71db64558c8955a7d1f36558b3cb7bd70086ead7f40e88973fd540348",
         "idp.host/toolExecution": "caller"
       }
     },
     {
       "definition": "RunOptions",
       "value": {
-        "idp.host/releaseDigest": "sha256:99c909fc3287bae693b7ca356444e14cd6a840ad5e4963c091b93c24d498f2ef"
+        "idp.host/releaseDigest": "sha256:c6dc57f71db64558c8955a7d1f36558b3cb7bd70086ead7f40e88973fd540348"
       }
     }
   ]

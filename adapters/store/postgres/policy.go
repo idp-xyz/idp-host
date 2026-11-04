@@ -98,7 +98,7 @@ func (s *Store) tokensLastDay(ctx context.Context, tx pgx.Tx) (int64, error) {
 
 func activeRuns(ctx context.Context, tx pgx.Tx) (int, error) {
 	var n int
-	err := tx.QueryRow(ctx, `SELECT count(*) FROM runs WHERE status IN ('QUEUED', 'RUNNING', 'AWAITING_INPUT')`).Scan(&n)
+	err := tx.QueryRow(ctx, `SELECT count(*) FROM runs WHERE status IN ('QUEUED', 'RUNNING', 'AWAITING_INPUT', 'AWAITING_SUBAGENT')`).Scan(&n)
 	return n, err
 }
 

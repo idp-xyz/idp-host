@@ -3,6 +3,8 @@
 package run
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"time"
@@ -16,9 +18,12 @@ const (
 	StatusQueued        = "QUEUED"
 	StatusRunning       = "RUNNING"
 	StatusAwaitingInput = "AWAITING_INPUT"
-	StatusCompleted     = "COMPLETED"
-	StatusFailed        = "FAILED"
-	StatusCanceled      = "CANCELED"
+	// StatusAwaitingSubagent: the run delegated to sub-agents and rests until they end (D22). It is
+	// not claimable, counts as active, and its event stream stays open (no RUN_FINISHED).
+	StatusAwaitingSubagent = "AWAITING_SUBAGENT"
+	StatusCompleted        = "COMPLETED"
+	StatusFailed           = "FAILED"
+	StatusCanceled         = "CANCELED"
 )
 
 // Terminal reports whether status is final.
@@ -35,8 +40,9 @@ const (
 	CallExecuting           = "EXECUTING"
 	CallDone                = "DONE"
 	CallFailed              = "FAILED"
-	CallFrontend            = "FRONTEND" // a tool of the caller; the HOST never executes it
-	CallDenied              = "DENIED"   // not allowed by the release or not visible at the gateway
+	CallFrontend            = "FRONTEND"  // a tool of the caller; the HOST never executes it
+	CallDenied              = "DENIED"    // not allowed by the release or not visible at the gateway
+	CallDelegated           = "DELEGATED" // a sub-agent run was created for it; answered when that run ends (D22)
 )
 
 // Failure codes.
@@ -50,6 +56,16 @@ const (
 	FailInternal    = "INTERNAL"
 	FailReleaseGone = "RELEASE_UNAVAILABLE"
 )
+
+// Refusal is a store decision against a worker's request (quota, missing release) as opposed to an
+// infrastructure failure: the harness reports it to the model as a tool error and continues.
+type Refusal struct {
+	Code    string
+	Message string
+}
+
+// Error implements error.
+func (r *Refusal) Error() string { return r.Code + ": " + r.Message }
 
 // ErrFenced is returned to a worker whose claim is no longer valid (lease expired and re-claimed,
 // run canceled or finished by someone else). The worker stops without writing anything.
@@ -72,7 +88,31 @@ type Context struct {
 	Run       Run
 	Release   *agent.Document
 	Messages  []agui.Message
-	ToolCalls []ToolCall // unresolved: pending, confirmed, rejected or expired but not yet answered
+	ToolCalls []ToolCall // unresolved: pending, confirmed, rejected, expired or delegated but not yet answered
+}
+
+// ChildRunInput creates a sub-agent run under the parent's claim (D22).
+type ChildRunInput struct {
+	ToolCallID string                 // the parent's DELEGATED tool call
+	Agent      agent.EmbeddedSubagent // which agent and which of its releases
+	Input      string                 // the user message the child starts with
+	Gateway    string                 // the parent's effective gateway; the credential is inherited when the child uses the same one
+}
+
+// ChildOutcome is what a parent learns of a finished (or still running) child run.
+type ChildOutcome struct {
+	RunID          string
+	Status         string
+	FailureCode    string
+	FailureMessage string
+	Output         string // the child's last assistant message
+}
+
+// ChildRunID derives the deterministic id of the child run a tool call delegates to, so a retried
+// parent turn replays the child instead of creating a second one.
+func ChildRunID(parentRunID, toolCallID string) string {
+	sum := sha256.Sum256([]byte(parentRunID + "\x00" + toolCallID))
+	return "run_" + hex.EncodeToString(sum[:16])
 }
 
 // Input is the part of the request that is not the conversation.
@@ -111,6 +151,8 @@ type Run struct {
 	FailureCode         string    `json:"failureCode,omitempty"`
 	FailureMessage      string    `json:"failureMessage,omitempty"`
 	ExecutionRef        string    `json:"executionRef,omitempty"`
+	ParentRunID         string    `json:"parentRunId,omitempty"` // the run that delegated to this one (D22)
+	Depth               int       `json:"depth,omitempty"`       // 0 for a caller's run, parent depth + 1 for a sub-agent run
 	CredentialExpiresAt time.Time `json:"-"`
 	TraceID             string    `json:"traceId,omitempty"`
 	DeadlineAt          time.Time `json:"deadlineAt"`
@@ -139,6 +181,7 @@ type ToolCall struct {
 	Arguments             string    `json:"arguments"`
 	ArgumentsSHA256       string    `json:"argumentsSha256"`
 	State                 string    `json:"state"`
+	ChildRunID            string    `json:"childRunId,omitempty"` // the sub-agent run of a DELEGATED call
 	ConfirmationExpiresAt time.Time `json:"confirmationExpiresAt,omitzero"`
 	DecidedBy             string    `json:"decidedBy,omitempty"`
 	DecidedAt             time.Time `json:"decidedAt,omitzero"`

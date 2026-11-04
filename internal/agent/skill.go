@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -24,7 +25,29 @@ type SkillDefinition struct {
 	Instructions string            `json:"instructions"`
 	Tools        []string          `json:"tools"`
 	Confirmation map[string]string `json:"confirmation,omitempty"`
+	Resources    []Resource        `json:"resources,omitempty"` // reference material published with the skill (D23)
 }
+
+// Resource is a document a skill ships besides its instructions: examples, tables, rules. An inline
+// resource is appended to the skill's instructions; an on-demand one is read by the model through
+// the HOST's resource__read tool, which serves the release's own content and touches no gateway.
+type Resource struct {
+	Name      string `json:"name"`
+	MediaType string `json:"mediaType"` // text/plain | text/markdown | application/json
+	Content   string `json:"content"`
+	OnDemand  bool   `json:"onDemand,omitempty"`
+}
+
+// Resource bounds.
+const (
+	MaxResourceSize  = 256 << 10
+	MaxResourcesSize = 1 << 20
+)
+
+var (
+	resourceNameRE = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
+	mediaTypes     = map[string]bool{"text/plain": true, "text/markdown": true, "application/json": true}
+)
 
 // Normalize sorts the tool list so equal definitions compile to equal releases.
 func (d *SkillDefinition) Normalize() {
@@ -42,8 +65,8 @@ func (d *SkillDefinition) Validate() error {
 	}
 	seen := map[string]bool{}
 	for _, t := range d.Tools {
-		if !toolNameRE.MatchString(t) || seen[t] {
-			errs = append(errs, fmt.Sprintf("tools entry %q is invalid or duplicated", t))
+		if !toolNameRE.MatchString(t) || seen[t] || Reserved(t) {
+			errs = append(errs, fmt.Sprintf("tools entry %q is invalid, reserved or duplicated", t))
 		}
 		seen[t] = true
 	}
@@ -52,11 +75,42 @@ func (d *SkillDefinition) Validate() error {
 			errs = append(errs, fmt.Sprintf("confirmation[%q] is invalid", tool))
 		}
 	}
+	names := map[string]bool{}
+	total := 0
+	for i, r := range d.Resources {
+		if !resourceNameRE.MatchString(r.Name) || names[r.Name] {
+			errs = append(errs, fmt.Sprintf("resources[%d]: name is invalid or duplicated", i))
+		}
+		names[r.Name] = true
+		if !mediaTypes[r.MediaType] {
+			errs = append(errs, fmt.Sprintf("resources[%d]: mediaType must be text/plain, text/markdown or application/json", i))
+		}
+		if r.Content == "" || len(r.Content) > MaxResourceSize {
+			errs = append(errs, fmt.Sprintf("resources[%d]: content is required (at most %d bytes)", i, MaxResourceSize))
+		}
+		if r.MediaType == "application/json" && !json.Valid([]byte(r.Content)) {
+			errs = append(errs, fmt.Sprintf("resources[%d]: content is not JSON", i))
+		}
+		total += len(r.Content)
+	}
+	if total > MaxResourcesSize {
+		errs = append(errs, fmt.Sprintf("resources exceed %d bytes in total", MaxResourcesSize))
+	}
 	if len(errs) > 0 {
 		sort.Strings(errs)
 		return fmt.Errorf("invalid skill definition: %s", strings.Join(errs, "; "))
 	}
 	return nil
+}
+
+// Resource finds a resource by name.
+func (d *SkillDefinition) Resource(name string) (Resource, bool) {
+	for _, r := range d.Resources {
+		if r.Name == name {
+			return r, true
+		}
+	}
+	return Resource{}, false
 }
 
 // SkillRef names a skill in an agent definition; Version 0 means the skill's current release.
@@ -143,16 +197,17 @@ func OpenSkill(e *Envelope) (*SkillDocument, error) {
 	return &d, nil
 }
 
-// Effective is what the harness runs: the agent's definition with its embedded skills merged in -
-// instructions concatenated, tool allow lists united, and a tool needing confirmation anywhere
-// needing it everywhere.
+// Effective is what the harness runs: the agent's definition with its embedded skills merged in
+// under the definition's SkillMerge rules (D24) - instructions appended, prepended or placed at the
+// placeholder; tools united or bounded by the agent's allow list; a confirmation requirement
+// anywhere winning, or the agent's overrides winning. Inline skill resources (D23) follow their
+// skill's instructions.
 func (d *Document) Effective() Definition {
 	eff := d.Definition
 	if len(d.Skills) == 0 {
 		return eff
 	}
-	var sb strings.Builder
-	sb.WriteString(eff.Instructions)
+	rules := eff.SkillMerge
 	allow := map[string]bool{}
 	for _, t := range eff.Tools.Allow {
 		allow[t] = true
@@ -161,18 +216,41 @@ func (d *Document) Effective() Definition {
 	for k, v := range eff.Confirmation.Tools {
 		conf[k] = v
 	}
+	var sb strings.Builder
 	for _, s := range d.Skills {
 		sb.WriteString("\n\n## Skill: " + s.Name + "\n\n" + s.Definition.Instructions)
+		for _, r := range s.Definition.Resources {
+			if !r.OnDemand {
+				sb.WriteString("\n\n### Resource: " + r.Name + " (" + r.MediaType + ")\n\n" + r.Content)
+			}
+		}
 		for _, t := range s.Definition.Tools {
-			allow[t] = true
+			if rules.Tools != MergeCeiling || eff.Tools.Allows(t) {
+				allow[t] = true
+			}
 		}
 		for k, v := range s.Definition.Confirmation {
-			if v == ConfirmConfirm || conf[k] == "" {
-				conf[k] = v
+			switch rules.Confirmation {
+			case MergeAgent:
+				if _, set := eff.Confirmation.Tools[k]; !set {
+					conf[k] = v
+				}
+			default:
+				if v == ConfirmConfirm || conf[k] == "" {
+					conf[k] = v
+				}
 			}
 		}
 	}
-	eff.Instructions = sb.String()
+	skills := sb.String()
+	switch rules.Instructions {
+	case MergePrepend:
+		eff.Instructions = strings.TrimPrefix(skills, "\n\n") + "\n\n" + eff.Instructions
+	case MergePlaceholder:
+		eff.Instructions = strings.Replace(eff.Instructions, SkillsPlaceholder, strings.TrimPrefix(skills, "\n\n"), 1)
+	default:
+		eff.Instructions += skills
+	}
 	eff.Tools.Allow = make([]string, 0, len(allow))
 	for t := range allow {
 		eff.Tools.Allow = append(eff.Tools.Allow, t)
@@ -180,4 +258,20 @@ func (d *Document) Effective() Definition {
 	sort.Strings(eff.Tools.Allow)
 	eff.Confirmation.Tools = conf
 	return eff
+}
+
+// OnDemandResources lists the resources the model may read through resource__read, by skill then name.
+func (d *Document) OnDemandResources() map[string]map[string]Resource {
+	out := map[string]map[string]Resource{}
+	for _, s := range d.Skills {
+		for _, r := range s.Definition.Resources {
+			if r.OnDemand {
+				if out[s.Name] == nil {
+					out[s.Name] = map[string]Resource{}
+				}
+				out[s.Name][r.Name] = r
+			}
+		}
+	}
+	return out
 }

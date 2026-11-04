@@ -27,6 +27,37 @@ const (
 // AllowAll in a tool allow list grants every tool the gateway shows the caller.
 const AllowAll = "*"
 
+// Tool names the HOST reserves for itself (ADR-0001 D22, D23): a sub-agent is offered to the model as
+// agent__<name>; an on-demand skill resource is read through resource__read. A gateway tool with one
+// of these prefixes is never offered, and an allow list may not name one.
+const (
+	SubagentToolPrefix = "agent__"
+	ResourceToolPrefix = "resource__"
+	ResourceReadTool   = ResourceToolPrefix + "read"
+)
+
+// Reserved reports whether a tool name belongs to the HOST's reserved prefixes.
+func Reserved(tool string) bool {
+	return strings.HasPrefix(tool, SubagentToolPrefix) || strings.HasPrefix(tool, ResourceToolPrefix)
+}
+
+// SubagentToolName is the model-facing tool name of a sub-agent reference.
+func SubagentToolName(name string) string { return SubagentToolPrefix + name }
+
+// Skill merge rules (ADR-0001 D24).
+const (
+	MergeAppend      = "append"      // skill instructions follow the agent's (default)
+	MergePrepend     = "prepend"     // skill instructions precede the agent's
+	MergePlaceholder = "placeholder" // skill instructions replace {{skills}} in the agent's instructions
+	MergeUnion       = "union"       // tools: the agent's allow list plus every skill's tools (default)
+	MergeCeiling     = "ceiling"     // tools: the agent's allow list is an upper bound; a skill may not exceed it
+	MergeStrictest   = "strictest"   // confirmation: confirm anywhere means confirm (default)
+	MergeAgent       = "agent"       // confirmation: the agent's per-tool overrides win
+)
+
+// SkillsPlaceholder marks where MergePlaceholder puts the skills' instructions.
+const SkillsPlaceholder = "{{skills}}"
+
 var (
 	nameRE     = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$`)
 	toolNameRE = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)
@@ -45,7 +76,34 @@ type Definition struct {
 	Tools        ToolPolicy         `json:"tools"`
 	Confirmation ConfirmationPolicy `json:"confirmation"`
 	Limits       Limits             `json:"limits"`
-	Skills       []SkillRef         `json:"skills,omitempty"` // resolved and embedded when a release is compiled (D17)
+	Skills       []SkillRef         `json:"skills,omitempty"`    // resolved and embedded when a release is compiled (D17)
+	Subagents    []SubagentRef      `json:"subagents,omitempty"` // other agents this one may delegate to (D22)
+	SkillMerge   SkillMerge         `json:"skillMerge,omitzero"` // how skills are merged into the effective definition (D24)
+}
+
+// SubagentRef names another agent of the tenant this agent may delegate to; Version 0 means the
+// agent's current release at compile time. Description is what the model reads to decide when to
+// delegate.
+type SubagentRef struct {
+	Name        string `json:"name"`
+	Version     int    `json:"version,omitempty"`
+	Description string `json:"description"`
+}
+
+// EmbeddedSubagent is a resolved sub-agent reference inside an agent release: which release of
+// the other agent a delegation runs. Only its identity is embedded, never its content.
+type EmbeddedSubagent struct {
+	Name    string `json:"name"`
+	AgentID string `json:"agentId"`
+	Version int    `json:"version"`
+	Digest  string `json:"digest"`
+}
+
+// SkillMerge fixes how embedded skills combine with the agent's own definition.
+type SkillMerge struct {
+	Instructions string `json:"instructions"` // append | prepend | placeholder
+	Tools        string `json:"tools"`        // union | ceiling
+	Confirmation string `json:"confirmation"` // strictest | agent
 }
 
 // ModelProfile selects the model and its parameters; Fallbacks are tried in order when the
@@ -86,16 +144,22 @@ func (c ConfirmationPolicy) For(tool string) string {
 }
 
 // Limits bound a run. MaxTokensPerRun 0 means "the tenant policy's default" (ADR-0001 D15).
+// MaxSubagentDepth is how deep delegation may nest below a run of this release: a run at depth d
+// may delegate only while d < MaxSubagentDepth (D22).
 type Limits struct {
 	MaxSteps                   int   `json:"maxSteps"`
 	MaxToolCallsPerStep        int   `json:"maxToolCallsPerStep"`
 	RunTimeoutSeconds          int   `json:"runTimeoutSeconds"`
 	ConfirmationTimeoutSeconds int   `json:"confirmationTimeoutSeconds"`
 	MaxTokensPerRun            int64 `json:"maxTokensPerRun,omitempty"`
+	MaxSubagentDepth           int   `json:"maxSubagentDepth,omitempty"`
 }
 
 // Defaults applied by Normalize.
-var DefaultLimits = Limits{MaxSteps: 10, MaxToolCallsPerStep: 8, RunTimeoutSeconds: 300, ConfirmationTimeoutSeconds: 900}
+var DefaultLimits = Limits{MaxSteps: 10, MaxToolCallsPerStep: 8, RunTimeoutSeconds: 300, ConfirmationTimeoutSeconds: 900, MaxSubagentDepth: 1}
+
+// MaxSubagentDepth is the deepest nesting a release may allow.
+const MaxSubagentDepth = 5
 
 // Normalize fills defaults and sorts the allow list so equal definitions compile to equal releases.
 func (d *Definition) Normalize() {
@@ -110,6 +174,18 @@ func (d *Definition) Normalize() {
 	}
 	if d.Limits.ConfirmationTimeoutSeconds == 0 {
 		d.Limits.ConfirmationTimeoutSeconds = DefaultLimits.ConfirmationTimeoutSeconds
+	}
+	if d.Limits.MaxSubagentDepth == 0 {
+		d.Limits.MaxSubagentDepth = DefaultLimits.MaxSubagentDepth
+	}
+	if d.SkillMerge.Instructions == "" {
+		d.SkillMerge.Instructions = MergeAppend
+	}
+	if d.SkillMerge.Tools == "" {
+		d.SkillMerge.Tools = MergeUnion
+	}
+	if d.SkillMerge.Confirmation == "" {
+		d.SkillMerge.Confirmation = MergeStrictest
 	}
 	if d.Confirmation.Default == "" {
 		d.Confirmation.Default = ConfirmAuto
@@ -146,8 +222,8 @@ func (d *Definition) Validate() error {
 	}
 	seen := map[string]bool{}
 	for _, t := range d.Tools.Allow {
-		if t != AllowAll && !toolNameRE.MatchString(t) || seen[t] {
-			bad("tools.allow entry %q is invalid or duplicated", t)
+		if t != AllowAll && !toolNameRE.MatchString(t) || seen[t] || Reserved(t) {
+			bad("tools.allow entry %q is invalid, reserved or duplicated", t)
 		}
 		seen[t] = true
 	}
@@ -172,10 +248,28 @@ func (d *Definition) Validate() error {
 		}
 		names[s.Name] = true
 	}
+	subs := map[string]bool{}
+	for i, s := range d.Subagents {
+		// the model-facing tool name must fit every provider's 64-character limit
+		if !ValidName(s.Name) || len(SubagentToolName(s.Name)) > 64 || s.Version < 0 || subs[s.Name] {
+			bad("subagents[%d]: invalid, too long or duplicated", i)
+		}
+		if strings.TrimSpace(s.Description) == "" || len(s.Description) > 1024 {
+			bad("subagents[%d]: description is required (at most 1024 characters)", i)
+		}
+		subs[s.Name] = true
+	}
+	if m := d.SkillMerge; m.Instructions != MergeAppend && m.Instructions != MergePrepend && m.Instructions != MergePlaceholder ||
+		m.Tools != MergeUnion && m.Tools != MergeCeiling || m.Confirmation != MergeStrictest && m.Confirmation != MergeAgent {
+		bad("skillMerge values are invalid")
+	}
+	if d.SkillMerge.Instructions == MergePlaceholder && strings.Count(d.Instructions, SkillsPlaceholder) != 1 {
+		bad("skillMerge.instructions placeholder needs exactly one %s in the instructions", SkillsPlaceholder)
+	}
 	l := d.Limits
 	if l.MaxSteps < 1 || l.MaxSteps > 200 || l.MaxToolCallsPerStep < 1 || l.MaxToolCallsPerStep > 64 ||
 		l.RunTimeoutSeconds < 1 || l.RunTimeoutSeconds > 86400 || l.ConfirmationTimeoutSeconds < 1 || l.ConfirmationTimeoutSeconds > 86400 ||
-		l.MaxTokensPerRun < 0 || l.MaxTokensPerRun > 100_000_000 {
+		l.MaxTokensPerRun < 0 || l.MaxTokensPerRun > 100_000_000 || l.MaxSubagentDepth < 1 || l.MaxSubagentDepth > MaxSubagentDepth {
 		bad("limits out of range")
 	}
 	if len(errs) > 0 {
@@ -210,6 +304,9 @@ type Document struct {
 	// Skills are the skill releases the definition referenced, resolved when the release was
 	// compiled (one per reference, same order).
 	Skills []EmbeddedSkill `json:"skills,omitempty"`
+	// Subagents are the agent releases the definition's sub-agent references resolved to when the
+	// release was compiled (one per reference, same order).
+	Subagents []EmbeddedSubagent `json:"subagents,omitempty"`
 }
 
 // Validate checks the document, including that the embedded skills match the references and
@@ -240,6 +337,27 @@ func (d *Document) Validate() error {
 		}
 		if err := s.Definition.Validate(); err != nil {
 			return fmt.Errorf("skills[%d]: %w", i, err)
+		}
+	}
+	if len(d.Subagents) != len(d.Definition.Subagents) {
+		return errors.New("subagents: every reference must be embedded exactly once")
+	}
+	for i, s := range d.Subagents {
+		ref := d.Definition.Subagents[i]
+		if s.Name != ref.Name || s.AgentID == "" || s.Version < 1 || (ref.Version != 0 && s.Version != ref.Version) || !digestRE.MatchString(s.Digest) {
+			return fmt.Errorf("subagents[%d]: does not match reference %s", i, ref.Name)
+		}
+		if s.Name == d.AgentName || s.AgentID == d.AgentID {
+			return fmt.Errorf("subagents[%d]: an agent cannot delegate to itself", i)
+		}
+	}
+	if d.Definition.SkillMerge.Tools == MergeCeiling {
+		for i, s := range d.Skills {
+			for _, t := range s.Definition.Tools {
+				if !d.Definition.Tools.Allows(t) {
+					return fmt.Errorf("skills[%d]: tool %s exceeds the agent's allow list (skillMerge.tools = ceiling)", i, t)
+				}
+			}
 		}
 	}
 	if eff := d.Effective(); len(eff.Tools.Allow) > 0 && !gatewayRE.MatchString(eff.Tools.Gateway) {

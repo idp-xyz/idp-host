@@ -35,11 +35,15 @@ type memStore struct {
 	fenced   bool
 	fenceAt  int // fence after this many event appends (0 = never)
 	appends  int
+	// sub-agent runs: what CreateChildRun was asked for, and what ChildOutcome answers
+	children map[string]*run.ChildOutcome
+	inputs   map[string]run.ChildRunInput
+	refuse   error
 }
 
 func newMem(def agent.Definition, msgs []agui.Message, input run.Input) *memStore {
 	def.Normalize()
-	return &memStore{calls: map[string]*run.ToolCall{}, cred: "tok", status: run.StatusRunning,
+	return &memStore{calls: map[string]*run.ToolCall{}, cred: "tok", status: run.StatusRunning, children: map[string]*run.ChildOutcome{}, inputs: map[string]run.ChildRunInput{},
 		rc: run.Context{Run: run.Run{ID: "run_1", ThreadID: "thr_1", Owner: "alice", Status: run.StatusRunning, Input: input, DeadlineAt: time.Now().Add(time.Minute)},
 			Release: &agent.Document{Definition: def}, Messages: msgs},
 		events: []agui.Event{agui.RunStarted("thr_1", "run_1")}}
@@ -158,6 +162,48 @@ func (m *memStore) Finish(_ context.Context, _ *run.Claim, status, code, _ strin
 	m.status, m.failCode = status, code
 	m.rc.Run.Status = status
 	return m.appendEvents(events)
+}
+
+func (m *memStore) CreateChildRun(_ context.Context, _ *run.Claim, in run.ChildRunInput) (*run.Run, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.check(); err != nil {
+		return nil, err
+	}
+	if m.refuse != nil {
+		return nil, m.refuse
+	}
+	id := run.ChildRunID(m.rc.Run.ID, in.ToolCallID)
+	if _, ok := m.children[id]; !ok {
+		m.children[id] = &run.ChildOutcome{RunID: id, Status: run.StatusQueued}
+	}
+	m.inputs[id] = in
+	c := m.calls[in.ToolCallID]
+	c.State, c.ChildRunID = run.CallDelegated, id
+	return &run.Run{ID: id, ThreadID: id, Status: run.StatusQueued, ParentRunID: m.rc.Run.ID, Depth: m.rc.Run.Depth + 1},
+		m.appendEvents([]agui.Event{agui.Custom(agui.CustomSubagentStarted, map[string]any{"toolCallId": in.ToolCallID, "agent": in.Agent.Name, "runId": id})})
+}
+
+func (m *memStore) ChildOutcome(_ context.Context, _ *run.Claim, childID string) (*run.ChildOutcome, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.check(); err != nil {
+		return nil, err
+	}
+	out, ok := m.children[childID]
+	if !ok {
+		return nil, errors.New("no such child")
+	}
+	return out, nil
+}
+
+// childEnds records a child's end and, like the real store, queues the parent again.
+func (m *memStore) childEnds(id, status, output, code string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.children[id].Status, m.children[id].Output, m.children[id].FailureCode = status, output, code
+	m.events = append(m.events, agui.Custom(agui.CustomSubagentFinished, map[string]any{"runId": id, "status": status}))
+	m.status, m.rc.Run.Status = run.StatusRunning, run.StatusRunning
 }
 
 func (m *memStore) Credential(context.Context, *run.Claim) (string, error) {
@@ -498,5 +544,179 @@ func TestMissingCredentialFailsTheRun(t *testing.T) {
 	e.h.Store = m
 	if err := e.h.Run(context.Background(), claim); err != nil || m.status != run.StatusCompleted {
 		t.Fatal(err, m.status)
+	}
+}
+
+// subagentRelease is a release of a parent agent that may delegate to "helper".
+func subagentRelease(depth int) *agent.Document {
+	d := def()
+	d.Subagents = []agent.SubagentRef{{Name: "helper", Description: "Delegate arithmetic to the helper."}}
+	d.Limits.MaxSubagentDepth = depth
+	d.Normalize()
+	return &agent.Document{Definition: d, Subagents: []agent.EmbeddedSubagent{{Name: "helper", AgentID: "a-helper", Version: 1, Digest: "sha256:" + strings.Repeat("ab", 32)}}}
+}
+
+// delegating is a model script: a user asking to "delegate" calls the helper agent, a tool result is
+// reported, anything else is echoed.
+func delegating(messages []fakemodel.Message, tools []string) fakemodel.Turn {
+	last := messages[len(messages)-1]
+	if last.Role == "tool" {
+		return fakemodel.Turn{Text: "Result: " + last.Content}
+	}
+	if strings.Contains(last.Content, "delegate") {
+		for _, t := range tools {
+			if t == agent.SubagentToolName("helper") {
+				return fakemodel.Turn{ToolCalls: []fakemodel.Call{{Name: t, Args: `{"input":"what is 19+23"}`}}}
+			}
+		}
+		return fakemodel.Turn{Text: "no helper offered"}
+	}
+	return fakemodel.Turn{Text: "Echo: " + last.Content}
+}
+
+func TestDelegatesToSubagentAndCollectsItsAnswer(t *testing.T) {
+	e := setup(t)
+	e.model.Script = delegating
+	m := newMem(def(), user("please delegate"), run.Input{})
+	m.rc.Release = subagentRelease(1)
+	e.h.Store = m
+	if err := e.h.Run(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	if m.status != run.StatusAwaitingSubagent {
+		t.Fatalf("status %s, want AWAITING_SUBAGENT", m.status)
+	}
+	var childID string
+	for _, c := range m.calls {
+		if c.State != run.CallDelegated || c.Tool != "agent__helper" {
+			t.Fatalf("%+v", c)
+		}
+		childID = c.ChildRunID
+	}
+	if in := m.inputs[childID]; in.Input != "what is 19+23" || in.Agent.Name != "helper" || in.Gateway != "edge" {
+		t.Fatalf("%+v", in)
+	}
+	types := strings.Join(m.types(), ",")
+	if !strings.Contains(types, "CUSTOM:"+agui.CustomSubagentStarted) || strings.Contains(types, agui.EventRunFinished) {
+		t.Fatalf("%s", types) // the parent's stream stays open
+	}
+	// the child ends; the parent is queued and claimed again
+	m.childEnds(childID, run.StatusCompleted, "42", "")
+	if err := e.h.Run(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	if m.status != run.StatusCompleted || m.last().Content != "Result: 42" {
+		t.Fatalf("%s %q", m.status, m.last().Content)
+	}
+	if c := m.calls[func() string {
+		for id := range m.calls {
+			return id
+		}
+		return ""
+	}()]; c.State != run.CallDone || c.Result != "42" {
+		t.Fatalf("%+v", c)
+	}
+}
+
+func TestSubagentFailureBecomesToolError(t *testing.T) {
+	e := setup(t)
+	e.model.Script = delegating
+	m := newMem(def(), user("please delegate"), run.Input{})
+	m.rc.Release = subagentRelease(1)
+	e.h.Store = m
+	if err := e.h.Run(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	for id := range m.children {
+		m.childEnds(id, run.StatusFailed, "", run.FailStepLimit)
+	}
+	if err := e.h.Run(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	if m.status != run.StatusCompleted || !strings.Contains(m.last().Content, "sub-agent helper failed: STEP_LIMIT") {
+		t.Fatalf("%s %q", m.status, m.last().Content)
+	}
+}
+
+func TestSubagentRefusedByStoreContinuesTheRun(t *testing.T) {
+	e := setup(t)
+	e.model.Script = delegating
+	m := newMem(def(), user("please delegate"), run.Input{})
+	m.rc.Release = subagentRelease(1)
+	m.refuse = &run.Refusal{Code: "QUOTA_EXCEEDED", Message: "the tenant's limit of 1 concurrent runs is reached"}
+	e.h.Store = m
+	if err := e.h.Run(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	if m.status != run.StatusCompleted || !strings.Contains(m.last().Content, "delegation refused: the tenant's limit") {
+		t.Fatalf("%s %q", m.status, m.last().Content)
+	}
+}
+
+func TestSubagentToolNotOfferedBeyondDepthOrInCallerMode(t *testing.T) {
+	e := setup(t)
+	e.model.Script = delegating
+	m := newMem(def(), user("please delegate"), run.Input{})
+	m.rc.Release = subagentRelease(1)
+	m.rc.Run.Depth = 1 // a child of a release allowing depth 1 may not delegate further
+	e.h.Store = m
+	if err := e.h.Run(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	if m.status != run.StatusCompleted || m.last().Content != "no helper offered" {
+		t.Fatalf("%s %q", m.status, m.last().Content)
+	}
+	m = newMem(def(), user("please delegate"), run.Input{ToolExecution: run.ToolExecutionCaller})
+	m.rc.Release = subagentRelease(3)
+	e.h.Store = m
+	if err := e.h.Run(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	if m.last().Content != "no helper offered" {
+		t.Fatalf("%q", m.last().Content)
+	}
+}
+
+func TestOnDemandSkillResource(t *testing.T) {
+	e := setup(t)
+	e.model.Script = func(messages []fakemodel.Message, tools []string) fakemodel.Turn {
+		last := messages[len(messages)-1]
+		if last.Role == "tool" {
+			return fakemodel.Turn{Text: "Result: " + last.Content}
+		}
+		for _, t := range tools {
+			if t == agent.ResourceReadTool {
+				return fakemodel.Turn{ToolCalls: []fakemodel.Call{{Name: t, Args: `{"skill":"tariffs","name":"table"}`}}}
+			}
+		}
+		return fakemodel.Turn{Text: "no resource tool"}
+	}
+	d := def()
+	d.Skills = []agent.SkillRef{{Name: "tariffs"}}
+	d.Normalize()
+	rel := &agent.Document{Definition: d, Skills: []agent.EmbeddedSkill{{Name: "tariffs", Version: 1, Digest: "sha256:" + strings.Repeat("cd", 32),
+		Definition: agent.SkillDefinition{Instructions: "Use the tariff table.", Tools: []string{}, Resources: []agent.Resource{
+			{Name: "note", MediaType: "text/plain", Content: "inline note"},
+			{Name: "table", MediaType: "text/markdown", Content: "| hs | rate |\n| 01 | 5% |", OnDemand: true}}}}}}
+	m := newMem(d, user("rate for 01?"), run.Input{})
+	m.rc.Release = rel
+	e.h.Store = m
+	if err := e.h.Run(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	if m.status != run.StatusCompleted || !strings.Contains(m.last().Content, "| 01 | 5% |") {
+		t.Fatalf("%s %q", m.status, m.last().Content)
+	}
+	sys := e.model.Last()[0]
+	if sys.Role != "system" || !strings.Contains(sys.Content, "### Resource: note (text/plain)\n\ninline note") || strings.Contains(sys.Content, "| 01 | 5% |") {
+		t.Fatalf("instructions: %q", sys.Content)
+	}
+	for _, c := range m.calls {
+		if c.Tool != agent.ResourceReadTool || c.State != run.CallDone {
+			t.Fatalf("%+v", c)
+		}
+	}
+	if n := len(e.mcp.Calls()); n != 0 {
+		t.Fatalf("gateway called %d times for a resource read", n)
 	}
 }

@@ -329,4 +329,8 @@ const (
 	CustomConfirmationDecided  = "idp.host/confirmation.decided"
 	CustomUsage                = "idp.host/model.usage"
 	CustomToolDenied           = "idp.host/tool.denied"
+	// sub-agent runs (ADR-0001 D22), emitted on the parent run's stream
+	CustomSubagentStarted       = "idp.host/subagent.started"
+	CustomSubagentAwaitingInput = "idp.host/subagent.awaiting_input"
+	CustomSubagentFinished      = "idp.host/subagent.finished"
 )

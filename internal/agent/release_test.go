@@ -99,3 +99,122 @@ func TestPolicies(t *testing.T) {
 		t.Fatal("confirmation policy")
 	}
 }
+
+func TestSkillMergeRulesAndResources(t *testing.T) {
+	skill := func(tools []string, conf map[string]string) EmbeddedSkill {
+		return EmbeddedSkill{Name: "customs", Version: 1, Digest: "sha256:" + strings.Repeat("ab", 32), Definition: SkillDefinition{Instructions: "File customs.", Tools: tools, Confirmation: conf,
+			Resources: []Resource{{Name: "codes", MediaType: "text/plain", Content: "HS 0101"}, {Name: "big", MediaType: "text/markdown", Content: "# big", OnDemand: true}}}}
+	}
+	base := func() *Document {
+		return &Document{SchemaVersion: SchemaVersion, ReleaseID: "r", TenantID: "t", AgentID: "a", AgentName: "parcel", Version: 1, CreatedAt: "2026-11-04T00:00:00Z", CreatedBy: "alice",
+			Definition: Definition{Instructions: "Help. {{skills}} Done.", Model: ModelProfile{Provider: "local", Model: "m"}, Tools: ToolPolicy{Gateway: "edge", Allow: []string{"get"}},
+				Confirmation: ConfirmationPolicy{Default: ConfirmAuto, Tools: map[string]string{"file": ConfirmAuto}}, Skills: []SkillRef{{Name: "customs"}}},
+			Skills: []EmbeddedSkill{skill([]string{"file", "get"}, map[string]string{"file": ConfirmConfirm})}}
+	}
+	// defaults: append, union, strictest; inline resource follows the skill, on-demand one does not
+	d := base()
+	d.Definition.Normalize()
+	if err := d.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	eff := d.Effective()
+	if !strings.HasSuffix(eff.Instructions, "## Skill: customs\n\nFile customs.\n\n### Resource: codes (text/plain)\n\nHS 0101") || strings.Contains(eff.Instructions, "# big") {
+		t.Fatalf("%q", eff.Instructions)
+	}
+	if strings.Join(eff.Tools.Allow, ",") != "file,get" || eff.Confirmation.Tools["file"] != ConfirmConfirm {
+		t.Fatalf("%v %v", eff.Tools.Allow, eff.Confirmation.Tools)
+	}
+	if res := d.OnDemandResources(); res["customs"]["big"].Content != "# big" || len(res["customs"]) != 1 {
+		t.Fatalf("%v", res)
+	}
+	// placeholder + ceiling + agent
+	d = base()
+	d.Definition.SkillMerge = SkillMerge{Instructions: MergePlaceholder, Tools: MergeCeiling, Confirmation: MergeAgent}
+	d.Definition.Normalize()
+	if err := d.Validate(); err == nil || !strings.Contains(err.Error(), "exceeds the agent's allow list") {
+		t.Fatalf("ceiling must reject a skill tool outside the allow list: %v", err)
+	}
+	d.Skills[0].Definition.Tools = []string{"get"}
+	if err := d.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	eff = d.Effective()
+	if !strings.HasPrefix(eff.Instructions, "Help. ## Skill: customs") || !strings.HasSuffix(eff.Instructions, "HS 0101 Done.") {
+		t.Fatalf("%q", eff.Instructions)
+	}
+	if strings.Join(eff.Tools.Allow, ",") != "get" || eff.Confirmation.Tools["file"] != ConfirmAuto {
+		t.Fatalf("%v %v", eff.Tools.Allow, eff.Confirmation.Tools)
+	}
+	// prepend
+	d = base()
+	d.Definition.Instructions = "Help."
+	d.Definition.SkillMerge.Instructions = MergePrepend
+	d.Definition.Normalize()
+	if eff := d.Effective(); !strings.HasPrefix(eff.Instructions, "## Skill: customs") || !strings.HasSuffix(eff.Instructions, "\n\nHelp.") {
+		t.Fatalf("%q", eff.Instructions)
+	}
+	// placeholder requires exactly one marker
+	d = base()
+	d.Definition.Instructions = "Help."
+	d.Definition.SkillMerge.Instructions = MergePlaceholder
+	d.Definition.Normalize()
+	if err := d.Definition.Validate(); err == nil || !strings.Contains(err.Error(), "{{skills}}") {
+		t.Fatalf("%v", err)
+	}
+}
+
+func TestSubagentReferencesAndReservedTools(t *testing.T) {
+	d := Definition{Instructions: "x", Model: ModelProfile{Provider: "p", Model: "m"}, Subagents: []SubagentRef{{Name: "helper", Description: "Arithmetic."}}}
+	d.Normalize()
+	if err := d.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if d.Limits.MaxSubagentDepth != 1 || d.SkillMerge != (SkillMerge{MergeAppend, MergeUnion, MergeStrictest}) {
+		t.Fatalf("%+v %+v", d.Limits, d.SkillMerge)
+	}
+	bad := []Definition{
+		{Instructions: "x", Model: ModelProfile{Provider: "p", Model: "m"}, Subagents: []SubagentRef{{Name: "helper"}}},                                             // no description
+		{Instructions: "x", Model: ModelProfile{Provider: "p", Model: "m"}, Subagents: []SubagentRef{{Name: "a", Description: "d"}, {Name: "a", Description: "d"}}}, // duplicate
+		{Instructions: "x", Model: ModelProfile{Provider: "p", Model: "m"}, Subagents: []SubagentRef{{Name: strings.Repeat("a", 60), Description: "d"}}},            // tool name > 64
+		{Instructions: "x", Model: ModelProfile{Provider: "p", Model: "m"}, Tools: ToolPolicy{Gateway: "g", Allow: []string{"agent__x"}}},                           // reserved
+		{Instructions: "x", Model: ModelProfile{Provider: "p", Model: "m"}, Limits: Limits{MaxSubagentDepth: 9}},                                                    // depth
+		{Instructions: "x", Model: ModelProfile{Provider: "p", Model: "m"}, SkillMerge: SkillMerge{Instructions: "mix"}},                                            // merge value
+	}
+	for i, b := range bad {
+		b.Normalize()
+		if err := b.Validate(); err == nil {
+			t.Fatalf("bad[%d] accepted", i)
+		}
+	}
+	doc := &Document{SchemaVersion: SchemaVersion, ReleaseID: "r", TenantID: "t", AgentID: "a", AgentName: "parent", Version: 1, CreatedAt: "2026-11-04T00:00:00Z", CreatedBy: "alice", Definition: d}
+	if err := doc.Validate(); err == nil || !strings.Contains(err.Error(), "embedded exactly once") {
+		t.Fatalf("%v", err)
+	}
+	doc.Subagents = []EmbeddedSubagent{{Name: "helper", AgentID: "a", Version: 1, Digest: "sha256:" + strings.Repeat("ab", 32)}}
+	if err := doc.Validate(); err == nil || !strings.Contains(err.Error(), "itself") {
+		t.Fatalf("%v", err)
+	}
+	doc.Subagents[0].AgentID = "b"
+	if err := doc.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	env, err := Seal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(env); err != nil {
+		t.Fatal(err)
+	}
+	sk := SkillDefinition{Instructions: "x", Tools: []string{"resource__read"}}
+	if err := sk.Validate(); err == nil {
+		t.Fatal("reserved skill tool accepted")
+	}
+	sk = SkillDefinition{Instructions: "x", Resources: []Resource{{Name: "a", MediaType: "application/json", Content: "{"}}}
+	if err := sk.Validate(); err == nil || !strings.Contains(err.Error(), "not JSON") {
+		t.Fatalf("%v", err)
+	}
+	sk = SkillDefinition{Instructions: "x", Resources: []Resource{{Name: "a", MediaType: "text/plain", Content: strings.Repeat("x", MaxResourceSize+1)}}}
+	if err := sk.Validate(); err == nil {
+		t.Fatal("oversized resource accepted")
+	}
+}

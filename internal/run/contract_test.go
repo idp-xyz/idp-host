@@ -31,7 +31,7 @@ var update = flag.Bool("update", false, "regenerate api/contracts/examples.json 
 
 const (
 	contractDir = "../../api/contracts"
-	contractID  = "urn:idp:telos:host:1.2.0"
+	contractID  = "urn:idp:telos:host:1.3.0"
 )
 
 type noLoader struct{}
@@ -107,7 +107,9 @@ func exampleSkill() *agent.SkillDocument {
 	return &agent.SkillDocument{SchemaVersion: agent.SkillSchemaVersion, ReleaseID: "c4d5e6f7-5b6d-4c8e-9f01-23456789abcf", TenantID: "1a2b3c4d-0000-4000-8000-000000000001",
 		SkillID: "a1b2c3d4-0000-4000-8000-000000000004", SkillName: "customs-declaration", Version: 2, CreatedAt: "2026-11-03T11:00:00Z", CreatedBy: "alice", ApprovedBy: "bob",
 		Definition: agent.SkillDefinition{Instructions: "When a shipment crosses a border, prepare the customs declaration with the declaration tool and ask before filing.",
-			Tools: []string{"parcel__file_declaration", "parcel__get_tariff"}, Confirmation: map[string]string{"parcel__file_declaration": agent.ConfirmConfirm}}}
+			Tools: []string{"parcel__file_declaration", "parcel__get_tariff"}, Confirmation: map[string]string{"parcel__file_declaration": agent.ConfirmConfirm},
+			Resources: []agent.Resource{{Name: "incoterms", MediaType: "text/markdown", Content: "| Term | Risk passes |\n|---|---|\n| EXW | at the seller's premises |\n| DAP | at the named place |"},
+				{Name: "tariff-chapters", MediaType: "application/json", Content: `{"01":"Live animals","02":"Meat"}`, OnDemand: true}}}}
 }
 
 func exampleDocuments() (full, minimal *agent.Document) {
@@ -119,11 +121,14 @@ func exampleDocuments() (full, minimal *agent.Document) {
 		AgentID: "9e8d7c6b-0000-4000-8000-000000000002", AgentName: "parcel-assistant", Version: 3, CreatedAt: "2026-11-03T12:00:00Z", CreatedBy: "alice", ApprovedBy: "bob",
 		Definition: agent.Definition{Instructions: "You help operators with parcels. Use tools for facts; never invent shipment data.",
 			Model:        agent.ModelProfile{Provider: "local", Model: "qwen3.8-flash", Temperature: &temp, MaxOutputTokens: 2048, Fallbacks: []agent.ModelRef{{Provider: "cloud", Model: "claude-sonnet-5-5"}}},
-			Tools:        agent.ToolPolicy{Gateway: "edge", Allow: []string{"parcel__get_shipment", "parcel__create_shipment"}},
+			Tools:        agent.ToolPolicy{Gateway: "edge", Allow: []string{"parcel__create_shipment", "parcel__file_declaration", "parcel__get_shipment", "parcel__get_tariff"}},
 			Confirmation: agent.ConfirmationPolicy{Default: agent.ConfirmAuto, Tools: map[string]string{"parcel__create_shipment": agent.ConfirmConfirm}},
-			Limits:       agent.Limits{MaxSteps: 12, MaxToolCallsPerStep: 4, RunTimeoutSeconds: 600, ConfirmationTimeoutSeconds: 1800, MaxTokensPerRun: 200000},
-			Skills:       []agent.SkillRef{{Name: "customs-declaration", Version: 2}}},
-		Skills: []agent.EmbeddedSkill{{Name: "customs-declaration", Version: 2, Digest: skillEnv.Digest, Definition: skill.Definition}}}
+			Limits:       agent.Limits{MaxSteps: 12, MaxToolCallsPerStep: 4, RunTimeoutSeconds: 600, ConfirmationTimeoutSeconds: 1800, MaxTokensPerRun: 200000, MaxSubagentDepth: 2},
+			Skills:       []agent.SkillRef{{Name: "customs-declaration", Version: 2}},
+			Subagents:    []agent.SubagentRef{{Name: "tariff-expert", Version: 4, Description: "Delegate tariff classification questions (HS codes, duty rates) to the tariff expert."}},
+			SkillMerge:   agent.SkillMerge{Instructions: agent.MergeAppend, Tools: agent.MergeCeiling, Confirmation: agent.MergeStrictest}},
+		Skills:    []agent.EmbeddedSkill{{Name: "customs-declaration", Version: 2, Digest: skillEnv.Digest, Definition: skill.Definition}},
+		Subagents: []agent.EmbeddedSubagent{{Name: "tariff-expert", AgentID: "5a6b7c8d-0000-4000-8000-000000000005", Version: 4, Digest: "sha256:" + strings.Repeat("7e", 32)}}}
 	minimal = &agent.Document{SchemaVersion: agent.SchemaVersion, ReleaseID: "0b1c2d3e-5b6d-4c8e-9f01-23456789abce", TenantID: "1a2b3c4d-0000-4000-8000-000000000001",
 		AgentID: "4f5e6d7c-0000-4000-8000-000000000003", AgentName: "faq", Version: 1, CreatedAt: "2026-11-03T12:30:00Z", CreatedBy: "alice",
 		Definition: agent.Definition{Instructions: "Answer questions about the handbook.", Model: agent.ModelProfile{Provider: "local", Model: "qwen3.8-flash"}}}
@@ -137,6 +142,11 @@ func exampleRuns(releaseID, digest string) []run.Run {
 			Status: run.StatusCompleted, StepCount: 2, TraceID: "4bf92f3577b34da6a3ce929d0e0e4736", DeadlineAt: at.Add(10 * time.Minute), CreatedAt: at, StartedAt: at.Add(time.Second), FinishedAt: at.Add(9 * time.Second)},
 		{ID: "run_01JD7Q3Z8M8T0G3C6N4V9S2A1C", ThreadID: "thr-ops-42", AgentID: "9e8d7c6b-0000-4000-8000-000000000002", ReleaseID: releaseID, ReleaseDigest: digest, Owner: "carol",
 			Status: run.StatusAwaitingInput, StepCount: 1, DeadlineAt: at.Add(20 * time.Minute), CreatedAt: at.Add(10 * time.Minute), StartedAt: at.Add(10*time.Minute + time.Second)},
+		{ID: "run_01JD7Q3Z8M8T0G3C6N4V9S2A1E", ThreadID: "thr-ops-44", AgentID: "9e8d7c6b-0000-4000-8000-000000000002", ReleaseID: releaseID, ReleaseDigest: digest, Owner: "carol",
+			Status: run.StatusAwaitingSubagent, StepCount: 1, DeadlineAt: at.Add(30 * time.Minute), CreatedAt: at.Add(20 * time.Minute), StartedAt: at.Add(20*time.Minute + time.Second)},
+		{ID: run.ChildRunID("run_01JD7Q3Z8M8T0G3C6N4V9S2A1E", "call_tariff_1"), ThreadID: run.ChildRunID("run_01JD7Q3Z8M8T0G3C6N4V9S2A1E", "call_tariff_1"), AgentID: "5a6b7c8d-0000-4000-8000-000000000005",
+			ReleaseID: "e1f2a3b4-5b6d-4c8e-9f01-23456789abd0", ReleaseDigest: "sha256:" + strings.Repeat("7e", 32), Owner: "carol", Status: run.StatusRunning, StepCount: 1,
+			ParentRunID: "run_01JD7Q3Z8M8T0G3C6N4V9S2A1E", Depth: 1, DeadlineAt: at.Add(30 * time.Minute), CreatedAt: at.Add(20*time.Minute + 2*time.Second), StartedAt: at.Add(20*time.Minute + 3*time.Second)},
 		{ID: "run_01JD7Q3Z8M8T0G3C6N4V9S2A1D", ThreadID: "thr-ops-43", AgentID: "9e8d7c6b-0000-4000-8000-000000000002", ReleaseID: releaseID, ReleaseDigest: digest, Owner: "carol",
 			Status: run.StatusFailed, StepCount: 12, CancelRequested: false, FailureCode: run.FailStepLimit, FailureMessage: "the run reached its limit of 12 steps",
 			ExecutionRef: "eer:execution:0192f3a1", DeadlineAt: at.Add(30 * time.Minute), CreatedAt: at.Add(20 * time.Minute), StartedAt: at.Add(20*time.Minute + time.Second), FinishedAt: at.Add(25 * time.Minute)},
@@ -197,7 +207,7 @@ func buildExamples(t *testing.T) []byte {
 		add("RunOptions", o)
 	}
 	b, err := json.MarshalIndent(examplesFile{
-		Description: "idp.telos.host 1.2.0 的示例：每一个都是 idp-host 实际产出或原样接受的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录，RunOptions 经 run.ParseOptions 解析后原样往返）。",
+		Description: "idp.telos.host 1.3.0 的示例：每一个都是 idp-host 实际产出或原样接受的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录，RunOptions 经 run.ParseOptions 解析后原样往返）。",
 		GeneratedBy: "go test ./internal/run -run TestContract -update",
 		Examples:    out,
 	}, "", "  ")
@@ -309,7 +319,7 @@ func TestContractFieldsMatchGo(t *testing.T) {
 	closed := map[string]any{"AgentRelease": agent.Document{}, "Definition": agent.Definition{}, "ModelProfile": agent.ModelProfile{}, "ModelRef": agent.ModelRef{},
 		"ToolPolicy": agent.ToolPolicy{}, "ConfirmationPolicy": agent.ConfirmationPolicy{}, "Limits": agent.Limits{}, "Envelope": agent.Envelope{}, "AgentRun": run.Run{},
 		"SkillRef": agent.SkillRef{}, "SkillDefinition": agent.SkillDefinition{}, "EmbeddedSkill": agent.EmbeddedSkill{}, "SkillRelease": agent.SkillDocument{},
-		"RunOptions": run.Options{}}
+		"RunOptions": run.Options{}, "SubagentRef": agent.SubagentRef{}, "EmbeddedSubagent": agent.EmbeddedSubagent{}, "SkillMerge": agent.SkillMerge{}, "Resource": agent.Resource{}}
 	for def, zero := range closed {
 		d, ok := defs[def].(map[string]any)
 		if !ok {
@@ -404,15 +414,29 @@ func TestContractRejectsWhatOpenRejects(t *testing.T) {
 		"skill digest malformed":    {"skills.0.digest", "sha256:zz"},
 		"skill bad tool":            {"skills.0.definition.tools.0", "bad name"},
 		"skill ref bad name":        {"definition.skills.0.name", "Customs"},
+		"subagent digest malformed": {"subagents.0.digest", "sha256:zz"},
+		"subagent ref no text":      {"definition.subagents.0.description", ""},
+		"subagent ref bad name":     {"definition.subagents.0.name", "Tariff Expert"},
+		"merge rule unknown":        {"definition.skillMerge.tools", "mix"},
+		"depth out of range":        {"definition.limits.maxSubagentDepth", 9},
+		"resource bad media type":   {"skills.0.definition.resources.0.mediaType", "image/png"},
+		"resource empty content":    {"skills.0.definition.resources.0.content", ""},
+		"resource bad name":         {"skills.0.definition.resources.0.name", "has space"},
+		"reserved allow entry":      {"definition.tools.allow.0", "agent__tariff-expert"},
+		"reserved skill tool":       {"skills.0.definition.tools.0", "resource__read"},
 	}
 	// cross-reference rules only the implementation can check (a schema cannot relate two arrays)
 	implOnly := map[string]struct {
 		path  string
 		value any
 	}{
-		"skill name mismatch":    {"skills.0.name", "other-skill"},
-		"embedded skill missing": {"skills", []any{}},
-		"skill version mismatch": {"skills.0.version", 3},
+		"skill name mismatch":     {"skills.0.name", "other-skill"},
+		"embedded skill missing":  {"skills", []any{}},
+		"skill version mismatch":  {"skills.0.version", 3},
+		"subagent name mismatch":  {"subagents.0.name", "other-agent"},
+		"subagent missing":        {"subagents", []any{}},
+		"subagent is itself":      {"subagents.0.agentId", "9e8d7c6b-0000-4000-8000-000000000002"},
+		"skill tool over ceiling": {"skills.0.definition.tools.0", "parcel__pay_duty"},
 	}
 	for name, c := range implOnly {
 		var m map[string]any
@@ -453,6 +477,8 @@ func TestContractRejectsWhatOpenRejects(t *testing.T) {
 		"unknown run field": {"arguments", "x"},
 		"empty owner":       {"owner", ""},
 		"bad deadline":      {"deadlineAt", "tomorrow"},
+		"negative depth":    {"depth", -1},
+		"bad parent id":     {"parentRunId", "run 1"},
 	}
 	r := exampleRuns(full.ReleaseID, env.Digest)[0]
 	for name, c := range runCases {
