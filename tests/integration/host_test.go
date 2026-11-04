@@ -86,6 +86,7 @@ type env struct {
 	t        *testing.T
 	store    *postgres.Store
 	host     *api.API
+	harness  *harness.Harness
 	api      *httptest.Server
 	worker   *worker.Worker
 	model    *fakemodel.Server
@@ -190,7 +191,7 @@ func newEnv(t *testing.T) *env {
 	deleg.Name = "delegated"
 	h := &harness.Harness{Store: store, Providers: model.NewRegistry(prov), Gateways: map[string]*harness.Gateway{"edge": edge, "delegated": deleg}, Log: log, DeltaFlush: time.Millisecond}
 	w := &worker.Worker{ID: "it-worker", Store: store, Harness: h, Lease: 30 * time.Second, Log: log}
-	return &env{t: t, store: store, host: a, api: srv, worker: w, model: fm, mcp: fx, mcpDeleg: fx2, tokens: tokens, tenantA: tenantA, tenantB: tenantB}
+	return &env{t: t, store: store, host: a, harness: h, api: srv, worker: w, model: fm, mcp: fx, mcpDeleg: fx2, tokens: tokens, tenantA: tenantA, tenantB: tenantB}
 }
 
 // drive lets the worker serve every claimable run.
@@ -1446,6 +1447,86 @@ func TestHostEndToEnd(t *testing.T) {
 		e.drive()
 		if got = e.must(200, "GET", "/v1/runs/"+r["runId"].(string), "carol", nil); got["status"] != run.StatusCompleted {
 			t.Fatalf("%v", got)
+		}
+	})
+
+	t.Run("cmi-verify-at-steps", func(t *testing.T) {
+		// CMI ADR-0001 D24: a later step re-checks the package; onStale decides what a stale one means
+		stale := false
+		cmi := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch {
+			case r.URL.Path == "/v1/context/resolve":
+				_, _ = fmt.Fprint(w, `{"packageId":"pkg_v1","digest":"sha256:`+strings.Repeat("cd", 32)+`","package":{"items":[
+				{"kind":"knowledge","id":"k9","source":"ops-handbook","trust":"authoritative","ref":"handbook#sum","title":"Sums","excerpt":"Always add carefully.","observedAt":"2026-11-01T00:00:00Z","tokens":4}],"budget":{"usedTokens":4}}}`)
+			case strings.HasSuffix(r.URL.Path, "/verify"):
+				if r.Header.Get("Authorization") != "Bearer cmi-reader-key" {
+					http.Error(w, "nope", 401)
+					return
+				}
+				_, _ = fmt.Fprintf(w, `{"packageId":"pkg_v1","stale":%v,"staleItems":%s,"redacted":false}`, stale, map[bool]string{true: `["k9"]`, false: `[]`}[stale])
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer cmi.Close()
+		client := &cmiclient.Client{Endpoint: cmi.URL, HTTP: cmi.Client()}
+		e.host.CMI, e.host.CMIKey = client, "cmi-reader-key"
+		e.harness.CMI, e.harness.CMIKey = client, "cmi-reader-key"
+		defer func() { e.host.CMI, e.harness.CMI = nil, nil }()
+		// a two-step run: the model calls sum, then answers; the package goes stale in between
+		def := definition("edge", []string{"sum"}, nil)
+		def.Context = agent.ContextPolicy{CMI: true, OnStale: "fail"}
+		e.publish("strict-stale", def)
+		r := e.must(202, "POST", "/v1/agents/strict-stale/runs", "carol", runBody("stale-1", "please sum"), "Idempotency-Key", "vs1")
+		stale = true
+		e.drive()
+		got := e.must(200, "GET", "/v1/runs/"+r["runId"].(string), "carol", nil)
+		if got["status"] != run.StatusFailed || got["failureCode"] != run.FailContext {
+			t.Fatalf("%v", got)
+		}
+		var staleEvent map[string]any
+		for _, ev := range e.must(200, "GET", "/v1/runs/"+r["runId"].(string)+"/events", "carol", nil)["events"].([]any) {
+			if p := ev.(map[string]any)["event"].(map[string]any); p["name"] == agui.CustomContextStale {
+				staleEvent = p["value"].(map[string]any)
+			}
+		}
+		if staleEvent == nil || staleEvent["onStale"] != "fail" || fmt.Sprint(staleEvent["staleItems"]) != "[k9]" {
+			t.Fatalf("%v", staleEvent)
+		}
+		// the default: report and continue
+		def.Context.OnStale = ""
+		e.publish("lenient-stale", def)
+		r = e.must(202, "POST", "/v1/agents/lenient-stale/runs", "carol", runBody("stale-2", "please sum"), "Idempotency-Key", "vs2")
+		e.drive()
+		if got = e.must(200, "GET", "/v1/runs/"+r["runId"].(string), "carol", nil); got["status"] != run.StatusCompleted {
+			t.Fatalf("%v", got)
+		}
+		var reported bool
+		for _, ev := range e.must(200, "GET", "/v1/runs/"+r["runId"].(string)+"/events", "carol", nil)["events"].([]any) {
+			if p := ev.(map[string]any)["event"].(map[string]any); p["name"] == agui.CustomContextStale && p["value"].(map[string]any)["onStale"] == "continue" {
+				reported = true
+			}
+		}
+		if !reported {
+			t.Fatal("stale package not reported")
+		}
+		// refresh: the stale items are replaced by a fresh resolve before the step
+		def.Context.OnStale = "refresh"
+		e.publish("refresh-stale", def)
+		r = e.must(202, "POST", "/v1/agents/refresh-stale/runs", "carol", runBody("stale-3", "please sum"), "Idempotency-Key", "vs3")
+		e.drive()
+		if got = e.must(200, "GET", "/v1/runs/"+r["runId"].(string), "carol", nil); got["status"] != run.StatusCompleted {
+			t.Fatalf("%v", got)
+		}
+		var refreshed bool
+		for _, ev := range e.must(200, "GET", "/v1/runs/"+r["runId"].(string)+"/events", "carol", nil)["events"].([]any) {
+			if p := ev.(map[string]any)["event"].(map[string]any); p["name"] == agui.CustomContextStale && p["value"].(map[string]any)["refreshedPackageId"] == "pkg_v1" {
+				refreshed = true
+			}
+		}
+		if !refreshed {
+			t.Fatal("stale package not refreshed")
 		}
 	})
 

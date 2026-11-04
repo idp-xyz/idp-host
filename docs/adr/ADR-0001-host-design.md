@@ -221,6 +221,8 @@ idp-cmi（Context, Memory & Knowledge Infrastructure）M1 完成并发布契约 
 
 **验证**：单元与契约（1.6.0：示例发布件带 context 策略、示例运行带 contextPackageId，5 种新拒绝用例）、集成（新增 cmi-context 场景：假 CMI 收到 bearer、查询、线程 scope 与预算；模型看到两条 CMI developer 消息；运行记录 packageId 与 resolved 事件；同一请求重放同一运行；CMI 503 时 skip 并记 skipped 事件；onError = fail 时 502 CONTEXT_UNAVAILABLE；未配置 CMI 时 skip）全部通过。
 
+**D32 补充（2026-11-04，CMI ADR-0001 D24 的 HOST 侧）**：ContextPolicy 增 `onStale`（continue 缺省 / refresh / fail）。Worker 在第二步及之后的每一步开始前以 HOST 自己的 cmi-reader 凭据调 CMI 的 `POST /v1/context/packages/{id}/verify`（每运行至多一次发现失效或无法回答）；包失效时记 `idp.host/context.stale`（含 staleItems、redacted、onStale），continue 照常，refresh 重新解析并替换运行里的 CMI 上下文（只在 static 凭据下可行，委派模式等同 continue），fail 以 `CONTEXT_STALE` 结束运行。契约 1.7.0 只加 `onStale`。集成测试：fail / continue / refresh 三种各一个两步运行。
+
 **局限（不标 PASS）**
 - 与真实 idp-cmi 进程的 compose 联调已在 idp-cmi 仓库完成（`HOST=1 bash deploy/e2e.sh`，idp-cmi ADR-0001 第 6 节，2026-11-04）：真实 HOST 运行的 `contextPackageId` 与事件摘要与 CMI 保存的包一致。委派模式对真实 Keycloak 未验证（static 模式已测）。
 - 只在创建时取一次；后续用户在同一线程追问要再创建运行才会取新上下文。

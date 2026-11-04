@@ -336,6 +336,7 @@ const (
 	// CMI context (ADR-0001 D32)
 	CustomContextResolved = "idp.host/context.resolved"
 	CustomContextSkipped  = "idp.host/context.skipped"
+	CustomContextStale    = "idp.host/context.stale" // a later step found the package stale (CMI D24)
 	// model routing (ADR-0001 D29)
 	CustomModelRouted = "idp.host/model.routed"
 	// content guards (ADR-0001 D27, D28)

@@ -60,6 +60,7 @@ const (
 	FailInternal    = "INTERNAL"
 	FailReleaseGone = "RELEASE_UNAVAILABLE"
 	FailGuard       = "GUARD_BLOCKED" // the output guard refused the model's answer (D28)
+	FailContext     = "CONTEXT_STALE" // the CMI package the run drew on went stale and the release said fail (CMI D24)
 )
 
 // Refusal is a store decision against a worker's request (quota, missing release) as opposed to an

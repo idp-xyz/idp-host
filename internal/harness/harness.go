@@ -19,6 +19,7 @@ import (
 	"idp-host/internal/agent"
 	"idp-host/internal/agui"
 	"idp-host/internal/canonical"
+	"idp-host/internal/cmiclient"
 	"idp-host/internal/guard"
 	"idp-host/internal/mcpclient"
 	"idp-host/internal/model"
@@ -72,6 +73,11 @@ type Harness struct {
 	Router *model.Router
 	// A2A delegates to remote agents (D30); nil disables remote sub-agents.
 	A2A *a2a.Client
+	// CMI verifies (and, with a static key, refreshes) the run's context package at each step (CMI D24);
+	// nil disables. CMIKey is the HOST's own cmi-reader credential; without one a stale package can
+	// only be reported or fail the run, not refreshed.
+	CMI    *cmiclient.Client
+	CMIKey string
 
 	DeltaFlush      time.Duration // how often streamed text is persisted (default 50 ms)
 	ToolTimeout     time.Duration // per tool call (default 60 s)
@@ -104,22 +110,23 @@ func (h *Harness) defaults() {
 }
 
 type turn struct {
-	h         *Harness
-	ctx       context.Context
-	claim     *run.Claim
-	rc        *run.Context
-	def       agent.Definition
-	messages  []agui.Message
-	gateway   *Gateway
-	bearer    string
-	tools     []model.ToolSpec
-	frontend  map[string]bool
-	visible   map[string]bool
-	subagents map[string]agent.EmbeddedSubagent    // by tool name (D22)
-	resources map[string]map[string]agent.Resource // on-demand skill resources by skill and name (D23)
-	waiting   bool                                 // a delegated call's child run has not ended yet
-	output    *guard.Output                        // the tenant's and the release's output filter (D28)
-	flagged   map[string]bool                      // untrusted content already reported in this turn (D27)
+	contextVerified bool // the CMI package was checked (and found stale or unanswerable) once already (D24)
+	h               *Harness
+	ctx             context.Context
+	claim           *run.Claim
+	rc              *run.Context
+	def             agent.Definition
+	messages        []agui.Message
+	gateway         *Gateway
+	bearer          string
+	tools           []model.ToolSpec
+	frontend        map[string]bool
+	visible         map[string]bool
+	subagents       map[string]agent.EmbeddedSubagent    // by tool name (D22)
+	resources       map[string]map[string]agent.Resource // on-demand skill resources by skill and name (D23)
+	waiting         bool                                 // a delegated call's child run has not ended yet
+	output          *guard.Output                        // the tenant's and the release's output filter (D28)
+	flagged         map[string]bool                      // untrusted content already reported in this turn (D27)
 }
 
 // guardBlock ends a model call whose output the guard refused.
@@ -557,6 +564,11 @@ func (t *turn) loop() error {
 		if cancelRequested {
 			return t.canceled()
 		}
+		if step > 1 {
+			if failed, err := t.verifyContext(); err != nil || failed {
+				return err
+			}
+		}
 		resp, st, err := t.callModel(step)
 		if err != nil {
 			if errors.Is(err, run.ErrFenced) || t.ctx.Err() != nil {
@@ -890,4 +902,64 @@ func (t *turn) guardOutput(resp *model.Response) error {
 		return &guardBlock{rule: "classifier:" + og.Classifier, detail: strings.Join(verdict.Categories, ",")}
 	}
 	return nil
+}
+
+// verifyContext re-checks the run's CMI package before a later step (CMI ADR-0001 D24): a stale
+// package is reported (continue), replaced by a fresh resolve (refresh, static credential only) or
+// fails the run (fail), as the release's context.onStale says. A CMI that cannot answer is reported
+// and the step proceeds; the package it drew on was valid when the run started.
+func (t *turn) verifyContext() (bool, error) {
+	pkgID := t.rc.Run.ContextPackageID
+	if pkgID == "" || t.h.CMI == nil || t.h.CMIKey == "" || t.contextVerified {
+		return false, nil
+	}
+	v, err := t.h.CMI.Verify(t.ctx, t.h.CMIKey, pkgID)
+	if err != nil {
+		t.contextVerified = true // once per run; the CMI is not asked again
+		return false, t.h.Store.AppendEvents(t.ctx, t.claim, []agui.Event{agui.Custom(agui.CustomContextStale, map[string]any{"packageId": pkgID, "verified": false, "reason": sanitize(err)})})
+	}
+	if !v.Stale {
+		return false, nil
+	}
+	t.contextVerified = true
+	mode := t.def.Context.OnStale
+	if mode == "" {
+		mode = "continue"
+	}
+	event := map[string]any{"packageId": pkgID, "verified": true, "staleItems": v.StaleItems, "redacted": v.Redacted, "onStale": mode}
+	if mode == "fail" {
+		if err := t.h.Store.AppendEvents(t.ctx, t.claim, []agui.Event{agui.Custom(agui.CustomContextStale, event)}); err != nil {
+			return true, err
+		}
+		return true, t.h.fail(t.ctx, t.claim, run.FailContext, fmt.Sprintf("the context package %s went stale (%d items)", pkgID, len(v.StaleItems)))
+	}
+	if mode == "refresh" {
+		query := ""
+		for i := len(t.rc.Messages) - 1; i >= 0; i-- {
+			if m := t.rc.Messages[i]; m.Role == agui.RoleUser && m.Content != "" {
+				query = m.Content
+				break
+			}
+		}
+		if query != "" {
+			req := cmiclient.Request{Query: query, Purpose: t.def.Context.Purpose, Kinds: t.def.Context.Kinds, Sources: t.def.Context.Sources}
+			req.Scope = &struct {
+				Kind string `json:"kind"`
+				ID   string `json:"id,omitempty"`
+			}{Kind: "thread", ID: t.rc.Run.ThreadID}
+			if pkg, err := t.h.CMI.Resolve(t.ctx, t.h.CMIKey, req); err == nil {
+				kept := t.rc.Run.Input.Context[:0:0]
+				for _, c := range t.rc.Run.Input.Context {
+					if !strings.HasPrefix(c.Description, "CMI ") {
+						kept = append(kept, c)
+					}
+				}
+				t.rc.Run.Input.Context = append(kept, cmiclient.ContextOf(pkg)...)
+				event["refreshedPackageId"], event["refreshedItems"] = pkg.PackageID, len(pkg.Items)
+			} else {
+				event["refreshError"] = sanitize(err)
+			}
+		}
+	}
+	return false, t.h.Store.AppendEvents(t.ctx, t.claim, []agui.Event{agui.Custom(agui.CustomContextStale, event)})
 }

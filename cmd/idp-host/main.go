@@ -317,6 +317,31 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 		gatewayAuth[g.Name] = auth
 	}
 
+	var cmiClient *cmiclient.Client
+	var cmiKey string
+	var cmiAuth api.GatewayAuth
+	if c := cfg.CMI; c != nil { // ADR-0001 D32
+		endpoint, err := mcpclient.CheckEndpoint(c.Endpoint)
+		if err != nil {
+			return fmt.Errorf("cmi: %w", err)
+		}
+		hc, err := model.NewHTTPClient(10*time.Second, c.CAFile)
+		if err != nil {
+			return fmt.Errorf("cmi: %w", err)
+		}
+		cmiClient = &cmiclient.Client{Endpoint: endpoint, HTTP: hc}
+		switch c.Auth.Mode {
+		case "static":
+			cmiKey = c.Auth.APIKey
+		case "delegation":
+			tokenTLS, err := transport.ClientTLS(c.Auth.CAFile, "", "")
+			if err != nil {
+				return fmt.Errorf("cmi: %w", err)
+			}
+			cmiAuth = api.GatewayAuth{ActorToken: c.Auth.ActorToken, Exchanger: &credential.Exchanger{TokenEndpoint: c.Auth.TokenEndpoint, ClientID: c.Auth.ClientID, ClientSecret: c.Auth.ClientSecret, Audience: c.Auth.Audience,
+				HTTP: &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil, TLSClientConfig: tokenTLS}}}}
+		}
+	}
 	metrics := observability.NewMetrics()
 	if ms := observability.ServeMetrics(env("IDP_METRICS_LISTEN", ""), metrics, log); ms != nil {
 		defer ms.Close()
@@ -334,7 +359,7 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 	wctx, cancelWorkers := context.WithCancel(ctx)
 	defer cancelWorkers()
 	if workers > 0 {
-		h := &harness.Harness{Store: store, Providers: registry, Gateways: gateways, Classifiers: classifiers, A2A: a2aClient, Metrics: worker.NewMetrics(metrics), Log: log}
+		h := &harness.Harness{Store: store, Providers: registry, Gateways: gateways, Classifiers: classifiers, A2A: a2aClient, CMI: cmiClient, CMIKey: cmiKey, Metrics: worker.NewMetrics(metrics), Log: log}
 		w := &worker.Worker{ID: env("IDP_HOST_INSTANCE", hostname), Store: store, Harness: h, Concurrency: workers, Lease: lease, Log: log}
 		wg.Add(1)
 		go func() {
@@ -349,29 +374,7 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 		wg.Wait()
 		return nil
 	}
-	srvAPI := &api.API{Store: store, Auth: verifier, Gateways: gatewayAuth, Providers: registry.Names(), Log: log, Metrics: metrics, Version: version}
-	if c := cfg.CMI; c != nil { // ADR-0001 D32
-		endpoint, err := mcpclient.CheckEndpoint(c.Endpoint)
-		if err != nil {
-			return fmt.Errorf("cmi: %w", err)
-		}
-		hc, err := model.NewHTTPClient(10*time.Second, c.CAFile)
-		if err != nil {
-			return fmt.Errorf("cmi: %w", err)
-		}
-		srvAPI.CMI = &cmiclient.Client{Endpoint: endpoint, HTTP: hc}
-		switch c.Auth.Mode {
-		case "static":
-			srvAPI.CMIKey = c.Auth.APIKey
-		case "delegation":
-			tokenTLS, err := transport.ClientTLS(c.Auth.CAFile, "", "")
-			if err != nil {
-				return fmt.Errorf("cmi: %w", err)
-			}
-			srvAPI.CMIAuth = api.GatewayAuth{ActorToken: c.Auth.ActorToken, Exchanger: &credential.Exchanger{TokenEndpoint: c.Auth.TokenEndpoint, ClientID: c.Auth.ClientID, ClientSecret: c.Auth.ClientSecret, Audience: c.Auth.Audience,
-				HTTP: &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil, TLSClientConfig: tokenTLS}}}}
-		}
-	}
+	srvAPI := &api.API{Store: store, Auth: verifier, Gateways: gatewayAuth, Providers: registry.Names(), Log: log, Metrics: metrics, Version: version, CMI: cmiClient, CMIKey: cmiKey, CMIAuth: cmiAuth}
 	srv := &http.Server{Addr: env("IDP_HOST_LISTEN", "127.0.0.1:8450"), Handler: observability.HTTPMiddleware(tp, "idp-host/api", srvAPI.Handler()),
 		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 0, IdleTimeout: 120 * time.Second}
 	if cert := env("IDP_HOST_TLS_CERT_FILE", ""); cert != "" {

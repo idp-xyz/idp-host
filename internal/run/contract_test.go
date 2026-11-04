@@ -31,7 +31,7 @@ var update = flag.Bool("update", false, "regenerate api/contracts/examples.json 
 
 const (
 	contractDir = "../../api/contracts"
-	contractID  = "urn:idp:telos:host:1.6.0"
+	contractID  = "urn:idp:telos:host:1.7.0"
 )
 
 type noLoader struct{}
@@ -133,7 +133,7 @@ func exampleDocuments() (full, minimal *agent.Document) {
 			SkillMerge: agent.SkillMerge{Instructions: agent.MergeAppend, Tools: agent.MergeCeiling, Confirmation: agent.MergeStrictest},
 			Guards: agent.Guards{Input: agent.InputGuard{ToolResults: "block", Context: "wrap"},
 				Output: agent.OutputGuard{Patterns: []string{`(?i)internal use only`}, Redact: []string{"email", "card"}, Classifier: "moderation", OnError: "block", Strict: true}},
-			Context: agent.ContextPolicy{CMI: true, Purpose: "parcel operations assistant", MaxTokens: 3000, MaxItems: 12, Kinds: []string{"memory", "knowledge"}, Sources: []string{"ops-handbook"}, OnError: "skip"},
+			Context: agent.ContextPolicy{CMI: true, Purpose: "parcel operations assistant", MaxTokens: 3000, MaxItems: 12, Kinds: []string{"memory", "knowledge"}, Sources: []string{"ops-handbook"}, OnError: "skip", OnStale: "refresh"},
 			Evaluation: agent.Evaluation{Required: true, Cases: []agent.EvalCase{
 				{Name: "greets", Input: "hello", Expect: agent.Expectation{Contains: []string{"parcel"}, NoToolCall: true, MaxSteps: 1}},
 				{Name: "looks-up-shipment", Input: "where is shipment 42?", Expect: agent.Expectation{ToolCalled: "parcel__get_shipment", NotContains: []string{"I cannot"}, Matches: `(?i)shipment 42`}}}}},
@@ -221,7 +221,7 @@ func buildExamples(t *testing.T) []byte {
 		add("RunOptions", o)
 	}
 	b, err := json.MarshalIndent(examplesFile{
-		Description: "idp.telos.host 1.6.0 的示例：每一个都是 idp-host 实际产出或原样接受的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录，RunOptions 经 run.ParseOptions 解析后原样往返）。",
+		Description: "idp.telos.host 1.7.0 的示例：每一个都是 idp-host 实际产出或原样接受的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录，RunOptions 经 run.ParseOptions 解析后原样往返）。",
 		GeneratedBy: "go test ./internal/run -run TestContract -update",
 		Examples:    out,
 	}, "", "  ")
@@ -455,6 +455,7 @@ func TestContractRejectsWhatOpenRejects(t *testing.T) {
 		"candidate negative price":  {"definition.model.routing.candidates.1.costPer1kInput", -1},
 		"a2a card not a url":        {"definition.subagents.1.a2a.cardUrl", "carrier-desk"},
 		"context onError unknown":   {"definition.context.onError", "retry"},
+		"context onStale unknown":   {"definition.context.onStale", "ignore"},
 		"context kind unknown":      {"definition.context.kinds.0", "secrets"},
 		"context budget too high":   {"definition.context.maxTokens", 64000},
 		"context source not a name": {"definition.context.sources.0", "Ops Handbook"},

@@ -97,6 +97,7 @@ type ContextPolicy struct {
 	Kinds     []string `json:"kinds,omitempty"`     // memory | knowledge (empty = both)
 	Sources   []string `json:"sources,omitempty"`   // knowledge sources (empty = all visible)
 	OnError   string   `json:"onError,omitempty"`   // skip (default) | fail
+	OnStale   string   `json:"onStale,omitempty"`   // continue (default) | refresh | fail: what a stale package means at a later step (CMI D24)
 }
 
 // Guards are the release's content guards.
@@ -432,6 +433,9 @@ func (d *Definition) Validate() error {
 		}
 		if c.OnError != "" && c.OnError != "skip" && c.OnError != "fail" {
 			bad("context.onError must be skip or fail")
+		}
+		if c.OnStale != "" && c.OnStale != "continue" && c.OnStale != "refresh" && c.OnStale != "fail" {
+			bad("context.onStale must be continue, refresh or fail")
 		}
 	}
 	l := d.Limits

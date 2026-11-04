@@ -121,3 +121,41 @@ func ContextOf(p *Package) []agui.Context {
 	}
 	return out
 }
+
+// Verification is the CMI's answer to a delivery-time check of a package (idp.telos.cmi Verification).
+type Verification struct {
+	PackageID  string   `json:"packageId"`
+	Stale      bool     `json:"stale"`
+	StaleItems []string `json:"staleItems"`
+	Redacted   bool     `json:"redacted"`
+}
+
+// Verify asks the CMI whether a package's items are still usable (CMI ADR-0001 D24).
+func (c *Client) Verify(ctx context.Context, bearer, packageID string) (*Verification, error) {
+	timeout := c.Timeout
+	if timeout == 0 {
+		timeout = 10 * time.Second
+	}
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	hr, err := http.NewRequestWithContext(cctx, http.MethodPost, c.Endpoint+"/v1/context/packages/"+packageID+"/verify", nil)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrCMI, err)
+	}
+	hr.Header.Set("Accept", "application/json")
+	hr.Header.Set("Authorization", "Bearer "+bearer)
+	resp, err := c.HTTP.Do(hr)
+	if err != nil {
+		return nil, fmt.Errorf("%w unreachable: %v", ErrCMI, err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%w answered HTTP %d", ErrCMI, resp.StatusCode)
+	}
+	var out Verification
+	if err := json.Unmarshal(raw, &out); err != nil || out.PackageID == "" {
+		return nil, fmt.Errorf("%w answered no verification", ErrCMI)
+	}
+	return &out, nil
+}
