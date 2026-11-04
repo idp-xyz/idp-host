@@ -8,8 +8,10 @@
 #   MODEL=live            IDP_E2E_MODEL_URL (OpenAI-compatible, reachable from containers) and
 #                         IDP_E2E_MODEL_NAME; the assertions on exact wording are relaxed
 #   MODE=apikey (default) the HOST calls the gateway with a static API key; HS256 development tokens
-#   MODE=oidc             Keycloak: real users log in, the HOST verifies their tokens with the JWKS and
-#                         calls the gateway (jwt mode) with RFC 8693 delegated tokens (act = idp-host)
+#   MODE=oidc             Keycloak: real users log in (authorization code + PKCE through the public client
+#                         host-app), the HOST verifies their tokens with the JWKS and calls the gateway (jwt
+#                         mode) with RFC 8693 delegated tokens (act = idp-host); the EER Intelligence worker's
+#                         workload identity is the confidential client eer-intelligence (client credentials)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ENVF=.local/compose.env

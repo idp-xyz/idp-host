@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -38,6 +39,8 @@ type Message struct {
 
 // Script decides the answer from the conversation and the offered tool names.
 type Script func(messages []Message, tools []string) Turn
+
+var additionRE = regexp.MustCompile(`(\d+)\s*\+\s*(\d+)`)
 
 // Server is the fake.
 type Server struct {
@@ -112,6 +115,15 @@ func DefaultScript(messages []Message, tools []string) Turn {
 		}
 		if strings.Contains(strings.ToLower(last.Content), "echo") && has("echo") {
 			return Turn{ToolCalls: []Call{{Name: toolName("echo"), Args: `{"text":"hi"}`}}}
+		}
+		// an addition tool of any name (EER offers its capabilities as eer_calculator_add_<digest>):
+		// "calculate 19 + 23" -> {"a":19,"b":23}
+		if m := additionRE.FindStringSubmatch(last.Content); m != nil {
+			for _, t := range tools {
+				if strings.Contains(strings.ToLower(t), "add") {
+					return Turn{Reasoning: "need the tool", ToolCalls: []Call{{Name: t, Args: `{"a":` + m[1] + `,"b":` + m[2] + `}`}}}
+				}
+			}
 		}
 		return Turn{Text: "Echo: " + last.Content}
 	}

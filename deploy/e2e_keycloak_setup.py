@@ -1,4 +1,4 @@
-"""After the realm import: give user tokens issued through host-login a may_act claim naming the
+"""After the realm import: give user tokens issued through host-app a may_act claim naming the
 HOST's service account, which Keycloak's delegation profile requires before idp-host may act for
 the user (ADR-0001 D16). DEV ONLY, driven by deploy/e2e.sh.
 
@@ -37,7 +37,7 @@ _, clients = call('GET', '/admin/realms/idp/clients?clientId=idp-host', token=ad
 host_client = clients[0]['id']
 _, sa = call('GET', f'/admin/realms/idp/clients/{host_client}/service-account-user', token=admin)
 actor_sub = sa['id']
-_, clients = call('GET', '/admin/realms/idp/clients?clientId=host-login', token=admin)
+_, clients = call('GET', '/admin/realms/idp/clients?clientId=host-app', token=admin)
 login_client = clients[0]['id']
 status, _ = call('POST', f'/admin/realms/idp/clients/{login_client}/protocol-mappers/models', token=admin, body={
     'name': 'may_act', 'protocol': 'openid-connect', 'protocolMapper': 'oidc-hardcoded-claim-mapper',

@@ -5,13 +5,17 @@ package e2e
 
 import (
 	"bufio"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -47,9 +51,32 @@ func setup(t *testing.T) *env {
 var hostProfile = identity.Profile{Issuer: "idp-host-dev", Audience: "idp-host", TenantClaim: "tenant_id", RolesClaim: "roles"}
 var mcpProfile = identity.Profile{Issuer: "idp-mcp-dev", Audience: "idp-mcp-registry", TenantClaim: "tenant_id", RolesClaim: "roles"}
 
+// keycloakClients is what deploy/keycloak/realm.py wrote for the test: user passwords and client secrets.
+type keycloakClients struct {
+	Users map[string]string `json:"users"`
+	App   struct {
+		ClientID string `json:"clientId"`
+	} `json:"host-app"`
+	EER struct {
+		ClientID string `json:"clientId"`
+		Secret   string `json:"secret"`
+	} `json:"eer-intelligence"`
+}
+
+func (e *env) keycloak() (string, keycloakClients) {
+	raw, err := os.ReadFile(os.Getenv("IDP_E2E_KEYCLOAK_CLIENTS"))
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	var c keycloakClients
+	_ = json.Unmarshal(raw, &c)
+	return os.Getenv("IDP_E2E_KEYCLOAK"), c
+}
+
 // token returns a HOST credential for a test identity: an HS256 development token, or in MODE=oidc
-// a real Keycloak user's token obtained through the password grant (the users are defined in
-// deploy/keycloak/realm.py with the same roles).
+// a real Keycloak user's token obtained the way a front end obtains it - the authorization code
+// flow with PKCE through Keycloak's login form, as the public client host-app (the users are
+// defined in deploy/keycloak/realm.py with the same roles).
 func (e *env) token(sub string, roles ...string) string {
 	if os.Getenv("IDP_E2E_MODE") != "oidc" {
 		tok, err := identity.DevToken([]byte(e.hostSecret), hostProfile, sub, e.hostTenant, roles, time.Hour)
@@ -64,20 +91,53 @@ func (e *env) token(sub string, roles ...string) string {
 			user = "hostadmin"
 		}
 	}
-	raw, err := os.ReadFile(os.Getenv("IDP_E2E_KEYCLOAK_CLIENTS"))
+	issuer, clients := e.keycloak()
+	jar, _ := cookiejar.New(nil)
+	c := &http.Client{Transport: e.http.Transport, Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	vb := make([]byte, 48)
+	_, _ = rand.Read(vb)
+	verifier := base64.RawURLEncoding.EncodeToString(vb)
+	sum := sha256.Sum256([]byte(verifier))
+	const redirect = "http://127.0.0.1:18080/callback"
+	q := url.Values{"client_id": {clients.App.ClientID}, "response_type": {"code"}, "redirect_uri": {redirect}, "scope": {"openid"},
+		"state": {"s1"}, "code_challenge": {base64.RawURLEncoding.EncodeToString(sum[:])}, "code_challenge_method": {"S256"}}
+	resp, err := c.Get(issuer + "/protocol/openid-connect/auth?" + q.Encode())
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	var clients struct {
-		Users map[string]string `json:"users"`
-		Login struct {
-			ClientID string `json:"clientId"`
-			Secret   string `json:"secret"`
-		} `json:"host-login"`
+	page, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	m := regexp.MustCompile(`action="([^"]+login-actions/authenticate[^"]+)"`).FindSubmatch(page)
+	if m == nil {
+		e.t.Fatalf("no Keycloak login form (HTTP %d): %.300s", resp.StatusCode, page)
 	}
-	_ = json.Unmarshal(raw, &clients)
-	resp, err := e.http.PostForm(os.Getenv("IDP_E2E_KEYCLOAK")+"/protocol/openid-connect/token", url.Values{"grant_type": {"password"},
-		"client_id": {clients.Login.ClientID}, "client_secret": {clients.Login.Secret}, "username": {user}, "password": {clients.Users[user]}})
+	action := strings.ReplaceAll(string(m[1]), "&amp;", "&")
+	resp, err = c.PostForm(action, url.Values{"username": {user}, "password": {clients.Users[user]}, "credentialId": {""}})
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	resp.Body.Close()
+	loc, _ := url.Parse(resp.Header.Get("Location"))
+	code := ""
+	if loc != nil {
+		code = loc.Query().Get("code")
+	}
+	if resp.StatusCode != 302 || code == "" || !strings.HasPrefix(loc.String(), redirect) {
+		e.t.Fatalf("login of %s: HTTP %d Location %q", user, resp.StatusCode, resp.Header.Get("Location"))
+	}
+	return e.tokenEndpoint(c, issuer, url.Values{"grant_type": {"authorization_code"}, "code": {code}, "redirect_uri": {redirect},
+		"client_id": {clients.App.ClientID}, "code_verifier": {verifier}})
+}
+
+// workloadToken is the EER Intelligence worker's credential: OAuth client credentials of the
+// confidential client eer-intelligence (ADR-036 D21; D25) - a service account, no user.
+func (e *env) workloadToken() string {
+	issuer, clients := e.keycloak()
+	return e.tokenEndpoint(e.http, issuer, url.Values{"grant_type": {"client_credentials"}, "client_id": {clients.EER.ClientID}, "client_secret": {clients.EER.Secret}})
+}
+
+func (e *env) tokenEndpoint(c *http.Client, issuer string, form url.Values) string {
+	resp, err := c.PostForm(issuer+"/protocol/openid-connect/token", form)
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -88,9 +148,21 @@ func (e *env) token(sub string, roles ...string) string {
 	body, _ := io.ReadAll(resp.Body)
 	_ = json.Unmarshal(body, &out)
 	if out.AccessToken == "" {
-		e.t.Fatalf("keycloak login for %s failed: HTTP %d %s", user, resp.StatusCode, body)
+		e.t.Fatalf("keycloak token (%s) failed: HTTP %d %s", form.Get("grant_type"), resp.StatusCode, body)
 	}
 	return out.AccessToken
+}
+
+// claimsOf decodes a JWT's payload (no verification: test inspection only).
+func claimsOf(tok string) map[string]any {
+	parts := strings.Split(tok, ".")
+	if len(parts) != 3 {
+		return nil
+	}
+	raw, _ := base64.RawURLEncoding.DecodeString(parts[1])
+	var c map[string]any
+	_ = json.Unmarshal(raw, &c)
+	return c
 }
 
 // subjectOf decodes the sub claim of a JWT (no verification: test inspection only).
@@ -267,6 +339,24 @@ func TestComposeHost(t *testing.T) {
 		msgs = e.api(usr, "GET", "/v1/threads/e2e-2/messages", nil, 200)["messages"].([]any)
 		tool := msgs[2].(map[string]any)
 		check("confirmed-call-executed", dec["state"] == run.CallConfirmed && done["status"] == run.StatusCompleted && tool["role"] == "tool" && strings.Contains(fmt.Sprint(tool["content"]), "hi"), dec, done, tool)
+	}
+
+	// MODE=oidc: the EER worker's workload identity (client credentials, no user) is a host-user of the
+	// tenant and can run an agent turn in caller mode (ADR-036); the user's token came through PKCE
+	if os.Getenv("IDP_E2E_MODE") == "oidc" {
+		uc := claimsOf(usr)
+		roles := fmt.Sprint(uc["roles"])
+		check("user-login-authorization-code-pkce", uc["azp"] == "host-app" && uc["tenant_id"] == e.hostTenant && strings.Contains(roles, "host-user") && strings.Contains(roles, "operator"), uc["azp"], uc["tenant_id"], uc["roles"])
+		wt := e.workloadToken()
+		wc := claimsOf(wt)
+		check("workload-token-claims", wc["azp"] == "eer-intelligence" && wc["tenant_id"] == e.hostTenant && fmt.Sprint(wc["roles"]) == "[host-user]" && wc["preferred_username"] == "service-account-eer-intelligence", wc)
+		wr := e.api(wt, "POST", "/v1/agents/assistant/runs", map[string]any{"threadId": "e2e-eer-1", "messages": []map[string]any{{"id": "m1", "role": "user", "content": "hello from eer"}},
+			"tools": []map[string]any{{"name": "calculator_add", "description": "add", "parameters": map[string]any{"type": "object"}}}, "context": []any{},
+			"forwardedProps": map[string]any{"idp.host/toolExecution": "caller", "idp.host/releaseDigest": approved["digest"], "idp.host/executionRef": "execution:e2e"}}, 202, "Idempotency-Key", "e2e-eer-1")
+		wdone := e.waitRun(wt, wr["runId"].(string), run.StatusCompleted, run.StatusFailed)
+		check("workload-caller-mode-run", wdone["status"] == run.StatusCompleted && wdone["executionRef"] == "execution:e2e" && wdone["stepCount"] == 1.0 && wdone["owner"] == subjectOf(wt), wdone)
+		st, _, _ := e.do(e.host, wt, "GET", "/api/v1/agents", nil)
+		check("workload-is-not-admin", st == 403, st)
 	}
 
 	// the gateway audited the HOST's calls: under its service identity (static key), or - with
