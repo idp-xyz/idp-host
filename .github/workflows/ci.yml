@@ -1,0 +1,36 @@
+name: CI
+
+# The merge gate of idp-host: formatting and vet, unit and contract tests (race detector on), the
+# integration suite against a throwaway PostgreSQL (the Makefile starts it in Docker), and the
+# offline image builds. The compose end-to-end (deploy/e2e.sh) is not run here yet: it needs the
+# idp-mcp fixture image, which is built from local SDK checkouts (idp-mcp/deploy/fixtures/build.sh).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: vet, unit, contract, integration, images
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Formatting, vet, unit and contract tests
+        run: make test
+      - name: Integration tests (PostgreSQL in Docker)
+        run: make test-integration
+      - name: Image builds (static binaries, docker build --network none)
+        run: |
+          bash deploy/build.sh idp-host:ci
+          bash deploy/fixtures/build-fakemodel.sh idp-host-fakemodel:ci
+      - name: Reference harness worker is executable
+        run: python3 -I deploy/harness-worker/worker.py --help > /dev/null
