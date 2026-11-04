@@ -170,3 +170,25 @@
 | D31 | **外部 harness 协议**（M5）：`Harness` 成为接口，进程内 Go 循环是实现之一；增加 `external` 实现：按 release 的 `harness.kind = external` 与 `harness.worker` 把一步的"推理"交给 HOST 配置里登记的 harness worker（HTTP：HOST POST 该步的上下文——指令、消息、可用工具、限制；worker 以 SSE 流回文本增量、工具调用与结束原因）。持久化、门控、确认、工具执行（经网关）、配额全部仍在 HOST；worker 只做模型调用，可以用任何 SDK（OpenAI Agents SDK、Claude Agent SDK）实现，但它的工具调用必须回到 HOST 执行，SDK 自带的工具与远程连接器不可用。随 HOST 提供一个 Python 参考 worker（不依赖厂商 SDK）与测试替身 | 第 4 节"要做先定 HOST↔worker 协议"；把边界放在"一步的推理"上，SDK 的循环就不再隐藏任何该落库与门控的东西 |
 
 **契约**：D22–D24 是 `idp.telos.host` 1.3.0（AgentRun 增 `parentRunId`、`depth`、`purpose`，status 增 `AWAITING_SUBAGENT`；Definition 增 `subagents`、`skillMerge`、`limits.maxSubagentDepth`；SkillDefinition 增 `resources`；AgentRelease 增 `subagents`）；D26–D31 进入 1.4.0 / 1.5.0，均只做新增。实施结果记在第 12 节。
+
+## 12. M3、M4 实施结果（2026-11-04，WSL 实测）
+
+**M3（D22–D25）**
+- 子 agent（D22）：`subagents` 引用在编译时解析为被引用 agent 当时发布件的摘要并嵌入；模型以 `agent__<name>` 工具委派；子 Run 有自己的线程、继承所有者、context、`executionRef`、追踪 id 与同网关的委派凭据；父 Run 进入 `AWAITING_SUBAGENT`（不可认领、计入并发、流不中断），子 Run 终止时在同一事务里唤醒父 Run；子 Run 等待确认时父流收到 `idp.host/subagent.awaiting_input`；取消父 Run 级联取消子 Run；子 Run 被直接取消时父 Run 得到工具错误并继续；租户并发把等待中的父 Run 与子 Run都算在内，配额不足时委派被拒绝为工具错误；深度由 `limits.maxSubagentDepth` 限制，caller 模式不提供子 agent 工具；`GET /v1/runs/{id}/subruns`。迁移 0004。
+- Skill 资源（D23）：内联资源附在 skill 指令之后，按需资源经 HOST 内部工具 `resource__read` 读取，不经网关。
+- Skill 合并规则（D24）：`skillMerge` 的 append / prepend / placeholder、union / ceiling（越界的 skill 工具在编译时 422）、strictest / agent。
+- 补齐 M2 局限（D25）：(a) EER 的 Intelligence worker 以 OAuth 客户端凭据（Keycloak 机密客户端 `eer-intelligence`，服务账号，租户与角色为硬编码声明）调 HOST，`make intelligence-host-integration` 对 MODE=oidc 的 compose 栈 2/2 通过（工具调用往返、重放不重调模型、未批准发布件 → `provider_identity_mismatch`）；(b) e2e 的用户登录改为授权码 + PKCE（公共客户端 `host-app`），compose 端到端 18/18 通过（含 PKCE 声明、工作负载令牌声明、工作负载身份的 caller 模式运行、工作负载不是管理员）；(c) EER 侧的 Ollama 回合适配器已删除（EER PR #19，ADR-036 转为 Accepted；没有 `EER_HOST_*` 的 worker 只服务 Decision，拒绝 Agent Turn）；(d) 真实 Gemini 端点门禁仍未运行（无端点）。
+- 契约 `idp.telos.host` 1.3.0 发布（SubagentRef、EmbeddedSubagent、SkillMerge、Resource；AgentRun 的 parentRunId、depth、AWAITING_SUBAGENT），对 1.2.0、1.1.0、1.0.0 只做新增。
+
+**M4（D26–D28）**
+- 评估门禁（D26）：`evaluation` 随发布件；`POST /api/v1/releases/{id}/evaluate` 把每条用例作为候选发布件的普通 Run 执行（`purpose = evaluation`，临时密封的候选信封，所有者为评估人，不计入租户并发），Run 终止时在同一事务里判定并记录；`required` 的发布件在最近一次评估 PASSED 前批准返回 409 `EVALUATION_REQUIRED`。迁移 0006。
+- 输入护栏（D27）：工具结果与调用方 context 以 `<untrusted source=…>` 定界交给模型，并在消息前附一条说明；确定性规则检测指令覆盖、角色伪装、人格切换、嵌入的工具调用 JSON、泄露提示词请求、不可见字符、超长重复，命中发 `idp.host/guard.flagged`（每轮一次）；`block` 把命中内容替换为说明；线程里保存的工具消息不变；缺省 wrap。
+- 输出过滤（D28）：租户策略的 `blockedPatterns`（迁移 0005）与发布件的 `patterns` 在流式输出中逐段检查，命中即取消模型调用、Run 以 `GUARD_BLOCKED` 失败并发 `idp.host/guard.blocked`；内置 email / phone / card（Luhn）脱敏作用于流式分段与最终消息；外部分类器在 HOST 配置的 `classifiers` 登记，`onError` 决定失败时放行或拦截；`strict` 先缓冲再放行。指标 `idp_host_guard_events_total`。
+- 契约 1.4.0 发布（Guards、InputGuard、OutputGuard、Evaluation、EvalCase、Expectation；AgentRun 的 purpose）。
+
+**验证**：单元（agent、guard、harness 共 13 个新用例）、契约（1.4.0：示例往返、字段一一对应、22 种新拒绝用例与 11 条交叉规则）、集成（真实 PostgreSQL：subagents、skill-resources-and-merge、guards、evaluation-gate 四个新场景，全部通过）、compose 端到端 MODE=oidc 18/18、idp-contracts 校验 148/148 用例、20/20 不变量，发布副本与生产者逐字节相同。
+
+**局限（不标 PASS）**
+- 输入护栏是规则，不是模型：改写措辞的注入不会被识别；定界与说明只是基线。
+- 非 strict 的输出过滤在命中前已落库的增量不会撤回；脱敏按合并后的分段进行，跨分段的模式可能漏脱敏（strict 模式无此问题）。
+- 评估运行用的是候选发布件的临时信封（无审批人），摘要与批准后的不同；评估结果绑定发布件 id。
