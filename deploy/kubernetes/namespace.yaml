@@ -5,3 +5,4 @@ metadata:
   labels:
     pod-security.kubernetes.io/enforce: restricted
     pod-security.kubernetes.io/enforce-version: latest
+    idp-mcp/mcp-clients: "true"           # the MCP gateway admits this namespace (tool calls)

@@ -78,6 +78,12 @@ spec:
       ports:
         - {protocol: TCP, port: 3220}
     - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: idp-cmi
+      ports:
+        - {protocol: TCP, port: 8550}   # context packages (ADR-0001 D32)
+    - to:
         - ipBlock:
             cidr: 203.0.113.10/32       # the IdP (JWKS, token endpoint)
       ports:
