@@ -63,3 +63,7 @@ gateways:
     auth: {mode: delegation, tokenEndpoint: https://idp.example.com/realms/idp/protocol/openid-connect/token,
            clientId: idp-host, clientSecretFile: /run/secrets/host-client, audience: https://mcp.example.com/mcp, actorToken: true}
 ```
+
+## 许可证
+
+本仓库采用 [PolyForm Noncommercial License 1.0.0](LICENSE)：允许非商业用途，禁止任何商业使用。
