@@ -31,7 +31,7 @@ var update = flag.Bool("update", false, "regenerate api/contracts/examples.json 
 
 const (
 	contractDir = "../../api/contracts"
-	contractID  = "urn:idp:telos:host:1.4.0"
+	contractID  = "urn:idp:telos:host:1.5.0"
 )
 
 type noLoader struct{}
@@ -120,20 +120,25 @@ func exampleDocuments() (full, minimal *agent.Document) {
 	full = &agent.Document{SchemaVersion: agent.SchemaVersion, ReleaseID: "7f3c1a2e-5b6d-4c8e-9f01-23456789abcd", TenantID: "1a2b3c4d-0000-4000-8000-000000000001",
 		AgentID: "9e8d7c6b-0000-4000-8000-000000000002", AgentName: "parcel-assistant", Version: 3, CreatedAt: "2026-11-03T12:00:00Z", CreatedBy: "alice", ApprovedBy: "bob",
 		Definition: agent.Definition{Instructions: "You help operators with parcels. Use tools for facts; never invent shipment data.",
-			Model:        agent.ModelProfile{Provider: "local", Model: "qwen3.8-flash", Temperature: &temp, MaxOutputTokens: 2048, Fallbacks: []agent.ModelRef{{Provider: "cloud", Model: "claude-sonnet-5-5"}}},
+			Model: agent.ModelProfile{Provider: "local", Model: "qwen3.8-flash", Temperature: &temp, MaxOutputTokens: 2048, Fallbacks: []agent.ModelRef{{Provider: "cloud", Model: "claude-sonnet-5-5"}},
+				Routing: &agent.Routing{Strategy: agent.RouteCost, Candidates: []agent.Candidate{
+					{Provider: "local", Model: "qwen3.8-flash", CostPer1kInput: 0, CostPer1kOutput: 0, Capabilities: []string{"tools", "reasoning"}, MaxContextTokens: 131072},
+					{Provider: "cloud", Model: "claude-sonnet-5-5", CostPer1kInput: 3, CostPer1kOutput: 15, Capabilities: []string{"tools", "reasoning", "vision", "longContext"}, MaxContextTokens: 1000000}}}},
 			Tools:        agent.ToolPolicy{Gateway: "edge", Allow: []string{"parcel__create_shipment", "parcel__file_declaration", "parcel__get_shipment", "parcel__get_tariff"}},
 			Confirmation: agent.ConfirmationPolicy{Default: agent.ConfirmAuto, Tools: map[string]string{"parcel__create_shipment": agent.ConfirmConfirm}},
 			Limits:       agent.Limits{MaxSteps: 12, MaxToolCallsPerStep: 4, RunTimeoutSeconds: 600, ConfirmationTimeoutSeconds: 1800, MaxTokensPerRun: 200000, MaxSubagentDepth: 2},
 			Skills:       []agent.SkillRef{{Name: "customs-declaration", Version: 2}},
-			Subagents:    []agent.SubagentRef{{Name: "tariff-expert", Version: 4, Description: "Delegate tariff classification questions (HS codes, duty rates) to the tariff expert."}},
-			SkillMerge:   agent.SkillMerge{Instructions: agent.MergeAppend, Tools: agent.MergeCeiling, Confirmation: agent.MergeStrictest},
+			Subagents: []agent.SubagentRef{{Name: "tariff-expert", Version: 4, Description: "Delegate tariff classification questions (HS codes, duty rates) to the tariff expert."},
+				{Name: "carrier-desk", Description: "Ask the carrier's own agent about pickup slots and surcharges.", A2A: &agent.A2ARef{CardURL: "https://agents.carrier.example/a2a/agents/desk/.well-known/agent-card.json"}}},
+			SkillMerge: agent.SkillMerge{Instructions: agent.MergeAppend, Tools: agent.MergeCeiling, Confirmation: agent.MergeStrictest},
 			Guards: agent.Guards{Input: agent.InputGuard{ToolResults: "block", Context: "wrap"},
 				Output: agent.OutputGuard{Patterns: []string{`(?i)internal use only`}, Redact: []string{"email", "card"}, Classifier: "moderation", OnError: "block", Strict: true}},
 			Evaluation: agent.Evaluation{Required: true, Cases: []agent.EvalCase{
 				{Name: "greets", Input: "hello", Expect: agent.Expectation{Contains: []string{"parcel"}, NoToolCall: true, MaxSteps: 1}},
 				{Name: "looks-up-shipment", Input: "where is shipment 42?", Expect: agent.Expectation{ToolCalled: "parcel__get_shipment", NotContains: []string{"I cannot"}, Matches: `(?i)shipment 42`}}}}},
-		Skills:    []agent.EmbeddedSkill{{Name: "customs-declaration", Version: 2, Digest: skillEnv.Digest, Definition: skill.Definition}},
-		Subagents: []agent.EmbeddedSubagent{{Name: "tariff-expert", AgentID: "5a6b7c8d-0000-4000-8000-000000000005", Version: 4, Digest: "sha256:" + strings.Repeat("7e", 32)}}}
+		Skills: []agent.EmbeddedSkill{{Name: "customs-declaration", Version: 2, Digest: skillEnv.Digest, Definition: skill.Definition}},
+		Subagents: []agent.EmbeddedSubagent{{Name: "tariff-expert", AgentID: "5a6b7c8d-0000-4000-8000-000000000005", Version: 4, Digest: "sha256:" + strings.Repeat("7e", 32)},
+			{Name: "carrier-desk", A2A: &agent.A2ARef{CardURL: "https://agents.carrier.example/a2a/agents/desk/.well-known/agent-card.json"}}}}
 	minimal = &agent.Document{SchemaVersion: agent.SchemaVersion, ReleaseID: "0b1c2d3e-5b6d-4c8e-9f01-23456789abce", TenantID: "1a2b3c4d-0000-4000-8000-000000000001",
 		AgentID: "4f5e6d7c-0000-4000-8000-000000000003", AgentName: "faq", Version: 1, CreatedAt: "2026-11-03T12:30:00Z", CreatedBy: "alice",
 		Definition: agent.Definition{Instructions: "Answer questions about the handbook.", Model: agent.ModelProfile{Provider: "local", Model: "qwen3.8-flash"}}}
@@ -214,7 +219,7 @@ func buildExamples(t *testing.T) []byte {
 		add("RunOptions", o)
 	}
 	b, err := json.MarshalIndent(examplesFile{
-		Description: "idp.telos.host 1.4.0 的示例：每一个都是 idp-host 实际产出或原样接受的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录，RunOptions 经 run.ParseOptions 解析后原样往返）。",
+		Description: "idp.telos.host 1.5.0 的示例：每一个都是 idp-host 实际产出或原样接受的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录，RunOptions 经 run.ParseOptions 解析后原样往返）。",
 		GeneratedBy: "go test ./internal/run -run TestContract -update",
 		Examples:    out,
 	}, "", "  ")
@@ -327,7 +332,8 @@ func TestContractFieldsMatchGo(t *testing.T) {
 		"ToolPolicy": agent.ToolPolicy{}, "ConfirmationPolicy": agent.ConfirmationPolicy{}, "Limits": agent.Limits{}, "Envelope": agent.Envelope{}, "AgentRun": run.Run{},
 		"SkillRef": agent.SkillRef{}, "SkillDefinition": agent.SkillDefinition{}, "EmbeddedSkill": agent.EmbeddedSkill{}, "SkillRelease": agent.SkillDocument{},
 		"RunOptions": run.Options{}, "SubagentRef": agent.SubagentRef{}, "EmbeddedSubagent": agent.EmbeddedSubagent{}, "SkillMerge": agent.SkillMerge{}, "Resource": agent.Resource{},
-		"Guards": agent.Guards{}, "InputGuard": agent.InputGuard{}, "OutputGuard": agent.OutputGuard{}, "Evaluation": agent.Evaluation{}, "EvalCase": agent.EvalCase{}, "Expectation": agent.Expectation{}}
+		"Guards": agent.Guards{}, "InputGuard": agent.InputGuard{}, "OutputGuard": agent.OutputGuard{}, "Evaluation": agent.Evaluation{}, "EvalCase": agent.EvalCase{}, "Expectation": agent.Expectation{},
+		"Routing": agent.Routing{}, "Candidate": agent.Candidate{}, "A2ARef": agent.A2ARef{}}
 	for def, zero := range closed {
 		d, ok := defs[def].(map[string]any)
 		if !ok {
@@ -441,6 +447,12 @@ func TestContractRejectsWhatOpenRejects(t *testing.T) {
 		"eval max steps too high":   {"definition.evaluation.cases.0.expect.maxSteps", 1000},
 		"eval tool not a name":      {"definition.evaluation.cases.1.expect.toolCalled", "bad name"},
 		"unknown evaluation field":  {"definition.evaluation.extra", true},
+		"routing strategy unknown":  {"definition.model.routing.strategy", "random"},
+		"routing no candidates":     {"definition.model.routing.candidates", []any{}},
+		"candidate bad capability":  {"definition.model.routing.candidates.0.capabilities.0", "telepathy"},
+		"candidate negative price":  {"definition.model.routing.candidates.1.costPer1kInput", -1},
+		"a2a card not a url":        {"definition.subagents.1.a2a.cardUrl", "carrier-desk"},
+		"a2a embedded not a url":    {"subagents.1.a2a.cardUrl", "nope"},
 	}
 	// cross-reference rules only the implementation can check (a schema cannot relate two arrays)
 	implOnly := map[string]struct {
@@ -460,6 +472,10 @@ func TestContractRejectsWhatOpenRejects(t *testing.T) {
 		"eval empty expectation":      {"definition.evaluation.cases.0.expect", map[string]any{}},
 		"eval contradiction":          {"definition.evaluation.cases.1.expect", map[string]any{"toolCalled": "x", "noToolCall": true}},
 		"eval required no cases":      {"definition.evaluation", map[string]any{"required": true, "cases": []any{}}},
+		"candidate duplicated":        {"definition.model.routing.candidates.1", map[string]any{"provider": "local", "model": "qwen3.8-flash"}},
+		"a2a ref pinned version":      {"definition.subagents.1.version", 2},
+		"a2a embedded with digest":    {"subagents.1.digest", "sha256:" + strings.Repeat("ab", 32)},
+		"local embedded as remote":    {"subagents.0.a2a", map[string]any{"cardUrl": "https://x.example/card.json"}},
 	}
 	for name, c := range implOnly {
 		var m map[string]any

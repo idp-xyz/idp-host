@@ -50,8 +50,10 @@ import (
 	"idp-host/adapters/identity"
 	"idp-host/adapters/providers/anthropic"
 	"idp-host/adapters/providers/gemini"
+	"idp-host/adapters/providers/harnessworker"
 	"idp-host/adapters/providers/openai"
 	"idp-host/adapters/store/postgres"
+	"idp-host/internal/a2a"
 	"idp-host/internal/api"
 	"idp-host/internal/config"
 	"idp-host/internal/credential"
@@ -236,6 +238,12 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 				return err
 			}
 			providers = append(providers, prov)
+		case "harness-worker": // ADR-0001 D31: an external harness behind the HOST's step protocol
+			prov, err := harnessworker.New(harnessworker.Config{Name: p.Name, Endpoint: p.BaseURL, APIKey: p.APIKey, HTTP: hc, AllowPlainHTTP: p.Insecure})
+			if err != nil {
+				return err
+			}
+			providers = append(providers, prov)
 		}
 	}
 	registry := model.NewRegistry(providers...)
@@ -253,6 +261,28 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 			return fmt.Errorf("classifier %s: %w", c.Name, err)
 		}
 		classifiers[c.Name] = &guard.HTTPClassifier{Name: c.Name, Endpoint: endpoint, APIKey: c.APIKey, HTTP: hc, Timeout: time.Duration(c.TimeoutSeconds) * time.Second}
+	}
+	var a2aClient *a2a.Client
+	if len(cfg.A2APeers) > 0 {
+		peers := cfg.A2APeers
+		caFile := ""
+		for _, p := range peers {
+			if p.CAFile != "" {
+				caFile = p.CAFile
+			}
+		}
+		hc, err := model.NewHTTPClient(30*time.Second, caFile)
+		if err != nil {
+			return fmt.Errorf("a2aPeers: %w", err)
+		}
+		a2aClient = &a2a.Client{HTTP: hc, Bearer: func(cardURL string) string {
+			for _, p := range peers {
+				if strings.HasPrefix(cardURL, p.URLPrefix) {
+					return p.APIKey
+				}
+			}
+			return ""
+		}}
 	}
 	gateways := map[string]*harness.Gateway{}
 	gatewayAuth := map[string]api.GatewayAuth{}
@@ -303,7 +333,7 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 	wctx, cancelWorkers := context.WithCancel(ctx)
 	defer cancelWorkers()
 	if workers > 0 {
-		h := &harness.Harness{Store: store, Providers: registry, Gateways: gateways, Classifiers: classifiers, Metrics: worker.NewMetrics(metrics), Log: log}
+		h := &harness.Harness{Store: store, Providers: registry, Gateways: gateways, Classifiers: classifiers, A2A: a2aClient, Metrics: worker.NewMetrics(metrics), Log: log}
 		w := &worker.Worker{ID: env("IDP_HOST_INSTANCE", hostname), Store: store, Harness: h, Concurrency: workers, Lease: lease, Log: log}
 		wg.Add(1)
 		go func() {

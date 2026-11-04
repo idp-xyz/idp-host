@@ -884,3 +884,55 @@ func TestOutputClassifierDenyAndFailurePolicy(t *testing.T) {
 		t.Fatalf("unknown classifier: %v %s", err, m.failCode)
 	}
 }
+
+// ---- model routing (ADR-0001 D29) ----
+
+func TestRoutingPrefersTheCheapCandidateAndLearnsFromFailures(t *testing.T) {
+	e := setup(t)
+	d := def()
+	// "down" always answers 503; cost routing puts it first because it is cheaper, latency routing learns to avoid it
+	d.Model = agent.ModelProfile{Provider: "fake", Model: "fake-1", Routing: &agent.Routing{Strategy: agent.RouteCost, Candidates: []agent.Candidate{
+		{Provider: "fake", Model: "fake-1", CostPer1kInput: 1, CostPer1kOutput: 1, Capabilities: []string{"tools"}},
+		{Provider: "down", Model: "cheap", CostPer1kInput: 0.01, CostPer1kOutput: 0.01, Capabilities: []string{"tools"}},
+	}}}
+	m := newMem(d, user("hello"), run.Input{})
+	e.h.Store = m
+	if err := e.h.Run(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	if m.status != run.StatusCompleted || m.steps[0].Provider != "fake" {
+		t.Fatalf("%s %+v", m.status, m.steps)
+	}
+	var routed map[string]any
+	for _, ev := range m.events {
+		if ev.Type() == agui.EventCustom && ev["name"] == agui.CustomModelRouted {
+			routed = ev["value"].(map[string]any)
+		}
+	}
+	order := routed["order"].([]model.Decision)
+	if routed["strategy"] != "cost" || order[0].Provider != "down" || order[1].Provider != "fake" {
+		t.Fatalf("%v", routed)
+	}
+	// latency strategy on the same harness: the router observed the failure and now tries fake first
+	d.Model.Routing.Strategy = agent.RouteLatency
+	m = newMem(d, user("hello"), run.Input{})
+	e.h.Store = m
+	if err := e.h.Run(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	for _, ev := range m.events {
+		if ev.Type() == agui.EventCustom && ev["name"] == agui.CustomModelRouted {
+			routed = ev["value"].(map[string]any)
+		}
+	}
+	if order := routed["order"].([]model.Decision); order[0].Provider != "fake" || order[1].Provider != "down" {
+		t.Fatalf("%v", routed)
+	}
+	// a candidate without the tools capability is never tried when tools are offered
+	d.Model.Routing = &agent.Routing{Strategy: agent.RouteCost, Candidates: []agent.Candidate{{Provider: "down", Model: "chat", Capabilities: []string{"json"}}}}
+	m = newMem(d, user("hello"), run.Input{})
+	e.h.Store = m
+	if err := e.h.Run(context.Background(), claim); err != nil || m.status != run.StatusCompleted {
+		t.Fatalf("%v %s", err, m.status)
+	}
+}

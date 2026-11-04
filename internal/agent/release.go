@@ -65,6 +65,7 @@ var (
 	gatewayRE  = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$`)
 	providerRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$`)
 	digestRE   = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+	a2aURLRE   = regexp.MustCompile(`^https?://[^\s"'<>]{1,500}$`)
 )
 
 // ValidName reports whether s may name an agent.
@@ -113,18 +114,28 @@ type OutputGuard struct {
 // agent's current release at compile time. Description is what the model reads to decide when to
 // delegate.
 type SubagentRef struct {
-	Name        string `json:"name"`
-	Version     int    `json:"version,omitempty"`
-	Description string `json:"description"`
+	Name        string  `json:"name"`
+	Version     int     `json:"version,omitempty"`
+	Description string  `json:"description"`
+	A2A         *A2ARef `json:"a2a,omitempty"` // a remote agent reached through its A2A agent card (D30)
+}
+
+// A2ARef points at a remote A2A agent. Delegation sends a blocking message/send to the card's
+// URL with the credential the HOST configuration holds for that peer; a remote task that ends
+// anywhere but completed is a tool error.
+type A2ARef struct {
+	CardURL string `json:"cardUrl"`
 }
 
 // EmbeddedSubagent is a resolved sub-agent reference inside an agent release: which release of
-// the other agent a delegation runs. Only its identity is embedded, never its content.
+// the other agent a delegation runs. Only its identity is embedded, never its content. A remote
+// agent carries its card URL instead of an agent id and digest.
 type EmbeddedSubagent struct {
-	Name    string `json:"name"`
-	AgentID string `json:"agentId"`
-	Version int    `json:"version"`
-	Digest  string `json:"digest"`
+	Name    string  `json:"name"`
+	AgentID string  `json:"agentId,omitempty"`
+	Version int     `json:"version,omitempty"`
+	Digest  string  `json:"digest,omitempty"`
+	A2A     *A2ARef `json:"a2a,omitempty"`
 }
 
 // SkillMerge fixes how embedded skills combine with the agent's own definition.
@@ -135,13 +146,50 @@ type SkillMerge struct {
 }
 
 // ModelProfile selects the model and its parameters; Fallbacks are tried in order when the
-// primary provider fails.
+// primary provider fails. Routing (D29) widens the pool with described candidates and chooses the
+// attempt order by strategy.
 type ModelProfile struct {
 	Provider        string     `json:"provider"`
 	Model           string     `json:"model"`
 	Temperature     *float64   `json:"temperature,omitempty"`
 	MaxOutputTokens int        `json:"maxOutputTokens,omitempty"`
 	Fallbacks       []ModelRef `json:"fallbacks,omitempty"`
+	Routing         *Routing   `json:"routing,omitempty"`
+}
+
+// Routing strategies (D29).
+const (
+	RouteOrdered    = "ordered"    // the primary, then the fallbacks, then the candidates (default)
+	RouteCost       = "cost"       // cheapest first, from the declared prices and the call's size
+	RouteLatency    = "latency"    // fastest first, from what this process observed (errors count as slow)
+	RouteCapability = "capability" // the candidate declaring the most capabilities first
+)
+
+// Capabilities a candidate may declare.
+const (
+	CapabilityTools       = "tools"
+	CapabilityJSON        = "json"
+	CapabilityReasoning   = "reasoning"
+	CapabilityVision      = "vision"
+	CapabilityLongContext = "longContext"
+)
+
+// Routing describes the candidates and the strategy.
+type Routing struct {
+	Strategy   string      `json:"strategy"`
+	Candidates []Candidate `json:"candidates"`
+}
+
+// Candidate is a model with what the router needs to know about it. Prices are per 1k tokens in the
+// tenant's unit of account; capabilities, when declared, must include "tools" for a call that
+// offers tools; a call larger than MaxContextTokens skips the candidate.
+type Candidate struct {
+	Provider         string   `json:"provider"`
+	Model            string   `json:"model"`
+	CostPer1kInput   float64  `json:"costPer1kInput,omitempty"`
+	CostPer1kOutput  float64  `json:"costPer1kOutput,omitempty"`
+	Capabilities     []string `json:"capabilities,omitempty"`
+	MaxContextTokens int      `json:"maxContextTokens,omitempty"`
 }
 
 // ModelRef names a provider and model.
@@ -254,6 +302,29 @@ func (d *Definition) Validate() error {
 			bad("model.fallbacks[%d]: provider and model are required", i)
 		}
 	}
+	if r := d.Model.Routing; r != nil {
+		if r.Strategy != RouteOrdered && r.Strategy != RouteCost && r.Strategy != RouteLatency && r.Strategy != RouteCapability {
+			bad("model.routing.strategy must be ordered, cost, latency or capability")
+		}
+		if len(r.Candidates) == 0 || len(r.Candidates) > 16 {
+			bad("model.routing.candidates must have 1-16 entries")
+		}
+		seenC := map[string]bool{}
+		for i, c := range r.Candidates {
+			if !providerRE.MatchString(c.Provider) || c.Model == "" || len(c.Model) > 256 || seenC[c.Provider+"/"+c.Model] {
+				bad("model.routing.candidates[%d]: invalid or duplicated", i)
+			}
+			seenC[c.Provider+"/"+c.Model] = true
+			if c.CostPer1kInput < 0 || c.CostPer1kOutput < 0 || c.MaxContextTokens < 0 || c.MaxContextTokens > 100_000_000 {
+				bad("model.routing.candidates[%d]: prices and context size must be >= 0", i)
+			}
+			for _, cap := range c.Capabilities {
+				if cap != CapabilityTools && cap != CapabilityJSON && cap != CapabilityReasoning && cap != CapabilityVision && cap != CapabilityLongContext {
+					bad("model.routing.candidates[%d]: unknown capability %q", i, cap)
+				}
+			}
+		}
+	}
 	seen := map[string]bool{}
 	for _, t := range d.Tools.Allow {
 		if t != AllowAll && !toolNameRE.MatchString(t) || seen[t] || Reserved(t) {
@@ -290,6 +361,14 @@ func (d *Definition) Validate() error {
 		}
 		if strings.TrimSpace(s.Description) == "" || len(s.Description) > 1024 {
 			bad("subagents[%d]: description is required (at most 1024 characters)", i)
+		}
+		if s.A2A != nil {
+			if s.Version != 0 {
+				bad("subagents[%d]: a remote agent has no pinned version", i)
+			}
+			if !a2aURLRE.MatchString(s.A2A.CardURL) {
+				bad("subagents[%d]: a2a.cardUrl must be an http(s) URL (at most 512 characters)", i)
+			}
 		}
 		subs[s.Name] = true
 	}
@@ -398,7 +477,16 @@ func (d *Document) Validate() error {
 	}
 	for i, s := range d.Subagents {
 		ref := d.Definition.Subagents[i]
-		if s.Name != ref.Name || s.AgentID == "" || s.Version < 1 || (ref.Version != 0 && s.Version != ref.Version) || !digestRE.MatchString(s.Digest) {
+		if s.Name != ref.Name {
+			return fmt.Errorf("subagents[%d]: does not match reference %s", i, ref.Name)
+		}
+		if ref.A2A != nil { // remote: the card URL is the identity
+			if s.A2A == nil || s.A2A.CardURL != ref.A2A.CardURL || s.AgentID != "" || s.Digest != "" || s.Version != 0 {
+				return fmt.Errorf("subagents[%d]: remote reference %s must embed its card URL and nothing else", i, ref.Name)
+			}
+			continue
+		}
+		if s.A2A != nil || s.AgentID == "" || s.Version < 1 || (ref.Version != 0 && s.Version != ref.Version) || !digestRE.MatchString(s.Digest) {
 			return fmt.Errorf("subagents[%d]: does not match reference %s", i, ref.Name)
 		}
 		if s.Name == d.AgentName || s.AgentID == d.AgentID {
@@ -591,3 +679,6 @@ func (x Expectation) Judge(o Outcome) (bool, string) {
 	}
 	return true, ""
 }
+
+// Ref is the candidate's provider and model.
+func (c Candidate) Ref() ModelRef { return ModelRef{Provider: c.Provider, Model: c.Model} }

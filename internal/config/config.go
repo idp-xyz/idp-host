@@ -18,6 +18,16 @@ type File struct {
 	Providers   []Provider   `yaml:"providers"`
 	Gateways    []Gateway    `yaml:"gateways"`
 	Classifiers []Classifier `yaml:"classifiers"` // external output classifiers (ADR-0001 D28)
+	A2APeers    []A2APeer    `yaml:"a2aPeers"`    // remote A2A agents this HOST may delegate to (ADR-0001 D30)
+}
+
+// A2APeer is the credential for remote agent cards under a URL prefix.
+type A2APeer struct {
+	Name       string `yaml:"name"`
+	URLPrefix  string `yaml:"urlPrefix"` // every card URL starting with it uses this credential
+	APIKey     string `yaml:"apiKey"`
+	APIKeyFile string `yaml:"apiKeyFile"`
+	CAFile     string `yaml:"caFile"`
 }
 
 // Classifier is an external content classifier a release's guards.output.classifier may name:
@@ -35,7 +45,7 @@ type Classifier struct {
 // Provider is one model endpoint.
 type Provider struct {
 	Name           string `yaml:"name"`
-	Kind           string `yaml:"kind"` // openai | anthropic
+	Kind           string `yaml:"kind"` // openai | anthropic | gemini | harness-worker (ADR-0001 D31)
 	BaseURL        string `yaml:"baseUrl"`
 	APIKey         string `yaml:"apiKey"`     // development only
 	APIKeyFile     string `yaml:"apiKeyFile"` // production
@@ -89,14 +99,27 @@ func Load(path string) (*File, error) {
 			return nil, fmt.Errorf("providers[%d]: name %q invalid or duplicated", i, p.Name)
 		}
 		seen["p:"+p.Name] = true
-		if p.Kind != "openai" && p.Kind != "anthropic" && p.Kind != "gemini" {
-			return nil, fmt.Errorf("provider %s: kind must be openai, anthropic or gemini", p.Name)
+		if p.Kind != "openai" && p.Kind != "anthropic" && p.Kind != "gemini" && p.Kind != "harness-worker" {
+			return nil, fmt.Errorf("provider %s: kind must be openai, anthropic, gemini or harness-worker", p.Name)
 		}
 		if p.BaseURL == "" {
 			return nil, fmt.Errorf("provider %s: baseUrl is required", p.Name)
 		}
 		if p.APIKey, err = secret(p.APIKey, p.APIKeyFile); err != nil {
 			return nil, fmt.Errorf("provider %s: %w", p.Name, err)
+		}
+	}
+	for i := range f.A2APeers {
+		p := &f.A2APeers[i]
+		if !nameRE.MatchString(p.Name) || seen["a:"+p.Name] {
+			return nil, fmt.Errorf("a2aPeers[%d]: name %q invalid or duplicated", i, p.Name)
+		}
+		seen["a:"+p.Name] = true
+		if !strings.HasPrefix(p.URLPrefix, "https://") && !strings.HasPrefix(p.URLPrefix, "http://") {
+			return nil, fmt.Errorf("a2a peer %s: urlPrefix must be an http(s) URL", p.Name)
+		}
+		if p.APIKey, err = secret(p.APIKey, p.APIKeyFile); err != nil {
+			return nil, fmt.Errorf("a2a peer %s: %w", p.Name, err)
 		}
 	}
 	for i := range f.Classifiers {

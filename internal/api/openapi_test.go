@@ -13,14 +13,16 @@ import (
 // TestOpenAPIMatchesRouter: every route the router registers is documented and nothing documented
 // is unrouted.
 func TestOpenAPIMatchesRouter(t *testing.T) {
-	src, err := os.ReadFile("api.go")
-	if err != nil {
-		t.Fatal(err)
-	}
 	re := regexp.MustCompile(`mux\.Handle(?:Func)?\("([A-Z]+ /[^"]*)"`)
 	var routed []string
-	for _, m := range re.FindAllStringSubmatch(string(src), -1) {
-		routed = append(routed, m[1])
+	for _, file := range []string{"api.go", "a2a.go"} {
+		src, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range re.FindAllStringSubmatch(string(src), -1) {
+			routed = append(routed, m[1])
+		}
 	}
 	sort.Strings(routed)
 

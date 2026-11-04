@@ -507,7 +507,7 @@ func (a *API) Handler() http.Handler {
 		}
 		key := in.RunID
 		if key == "" {
-			key = "agui-" + strings.ReplaceAll(postgres.NewUUID(), "-", "")
+			key = "agui-" + strings.ReplaceAll(newUUID(), "-", "")
 		}
 		out, _, err := a.createRun(r, p, r.PathValue("ref"), key, in)
 		if err != nil {
@@ -517,6 +517,7 @@ func (a *API) Handler() http.Handler {
 		w.Header().Set("X-Run-Id", out.ID)
 		a.stream(w, r, p.Tenant, ownerScope(p), out.ID, 0)
 	}))
+	a.a2aRoutes(mux)
 	var h http.Handler = a.authenticate(mux)
 	if a.Metrics != nil {
 		h = observability.HTTPMetrics(a.Metrics, "idp_host", h)
@@ -665,3 +666,5 @@ func (a *API) stream(w http.ResponseWriter, r *http.Request, tenant, owner, runI
 		}
 	}
 }
+
+func newUUID() string { return postgres.NewUUID() }

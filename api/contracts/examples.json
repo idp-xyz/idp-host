@@ -1,5 +1,5 @@
 {
-  "description": "idp.telos.host 1.4.0 的示例：每一个都是 idp-host 实际产出或原样接受的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录，RunOptions 经 run.ParseOptions 解析后原样往返）。",
+  "description": "idp.telos.host 1.5.0 的示例：每一个都是 idp-host 实际产出或原样接受的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录，RunOptions 经 run.ParseOptions 解析后原样往返）。",
   "generatedBy": "go test ./internal/run -run TestContract -update",
   "examples": [
     {
@@ -81,6 +81,33 @@
             "maxOutputTokens": 2048,
             "model": "qwen3.8-flash",
             "provider": "local",
+            "routing": {
+              "candidates": [
+                {
+                  "capabilities": [
+                    "tools",
+                    "reasoning"
+                  ],
+                  "maxContextTokens": 131072,
+                  "model": "qwen3.8-flash",
+                  "provider": "local"
+                },
+                {
+                  "capabilities": [
+                    "tools",
+                    "reasoning",
+                    "vision",
+                    "longContext"
+                  ],
+                  "costPer1kInput": 3,
+                  "costPer1kOutput": 15,
+                  "maxContextTokens": 1000000,
+                  "model": "claude-sonnet-5-5",
+                  "provider": "cloud"
+                }
+              ],
+              "strategy": "cost"
+            },
             "temperature": 0.2
           },
           "skillMerge": {
@@ -99,6 +126,13 @@
               "description": "Delegate tariff classification questions (HS codes, duty rates) to the tariff expert.",
               "name": "tariff-expert",
               "version": 4
+            },
+            {
+              "a2a": {
+                "cardUrl": "https://agents.carrier.example/a2a/agents/desk/.well-known/agent-card.json"
+              },
+              "description": "Ask the carrier's own agent about pickup slots and surcharges.",
+              "name": "carrier-desk"
             }
           ],
           "tools": {
@@ -149,6 +183,12 @@
             "digest": "sha256:7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e",
             "name": "tariff-expert",
             "version": 4
+          },
+          {
+            "a2a": {
+              "cardUrl": "https://agents.carrier.example/a2a/agents/desk/.well-known/agent-card.json"
+            },
+            "name": "carrier-desk"
           }
         ],
         "tenantId": "1a2b3c4d-0000-4000-8000-000000000001",
@@ -239,7 +279,7 @@
     {
       "definition": "Envelope",
       "value": {
-        "digest": "sha256:eaeeeaa965a7dae8c587d0350cfe4dc69208dec82c7b58eccca5085157275b88",
+        "digest": "sha256:1c965ca14fe12a3312a79319e4c4ddfd41c3fe7b5989ef0a5487c5f5d47f548b",
         "document": {
           "agentId": "9e8d7c6b-0000-4000-8000-000000000002",
           "agentName": "parcel-assistant",
@@ -317,6 +357,33 @@
               "maxOutputTokens": 2048,
               "model": "qwen3.8-flash",
               "provider": "local",
+              "routing": {
+                "candidates": [
+                  {
+                    "capabilities": [
+                      "tools",
+                      "reasoning"
+                    ],
+                    "maxContextTokens": 131072,
+                    "model": "qwen3.8-flash",
+                    "provider": "local"
+                  },
+                  {
+                    "capabilities": [
+                      "tools",
+                      "reasoning",
+                      "vision",
+                      "longContext"
+                    ],
+                    "costPer1kInput": 3,
+                    "costPer1kOutput": 15,
+                    "maxContextTokens": 1000000,
+                    "model": "claude-sonnet-5-5",
+                    "provider": "cloud"
+                  }
+                ],
+                "strategy": "cost"
+              },
               "temperature": 0.2
             },
             "skillMerge": {
@@ -335,6 +402,13 @@
                 "description": "Delegate tariff classification questions (HS codes, duty rates) to the tariff expert.",
                 "name": "tariff-expert",
                 "version": 4
+              },
+              {
+                "a2a": {
+                  "cardUrl": "https://agents.carrier.example/a2a/agents/desk/.well-known/agent-card.json"
+                },
+                "description": "Ask the carrier's own agent about pickup slots and surcharges.",
+                "name": "carrier-desk"
               }
             ],
             "tools": {
@@ -385,6 +459,12 @@
               "digest": "sha256:7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e",
               "name": "tariff-expert",
               "version": 4
+            },
+            {
+              "a2a": {
+                "cardUrl": "https://agents.carrier.example/a2a/agents/desk/.well-known/agent-card.json"
+              },
+              "name": "carrier-desk"
             }
           ],
           "tenantId": "1a2b3c4d-0000-4000-8000-000000000001",
@@ -441,7 +521,7 @@
         "deadlineAt": "2026-11-03T13:10:00Z",
         "finishedAt": "2026-11-03T13:00:09Z",
         "owner": "carol",
-        "releaseDigest": "sha256:eaeeeaa965a7dae8c587d0350cfe4dc69208dec82c7b58eccca5085157275b88",
+        "releaseDigest": "sha256:1c965ca14fe12a3312a79319e4c4ddfd41c3fe7b5989ef0a5487c5f5d47f548b",
         "releaseId": "7f3c1a2e-5b6d-4c8e-9f01-23456789abcd",
         "runId": "run_01JD7Q3Z8M8T0G3C6N4V9S2A1B",
         "startedAt": "2026-11-03T13:00:01Z",
@@ -459,7 +539,7 @@
         "createdAt": "2026-11-03T13:10:00Z",
         "deadlineAt": "2026-11-03T13:20:00Z",
         "owner": "carol",
-        "releaseDigest": "sha256:eaeeeaa965a7dae8c587d0350cfe4dc69208dec82c7b58eccca5085157275b88",
+        "releaseDigest": "sha256:1c965ca14fe12a3312a79319e4c4ddfd41c3fe7b5989ef0a5487c5f5d47f548b",
         "releaseId": "7f3c1a2e-5b6d-4c8e-9f01-23456789abcd",
         "runId": "run_01JD7Q3Z8M8T0G3C6N4V9S2A1C",
         "startedAt": "2026-11-03T13:10:01Z",
@@ -476,7 +556,7 @@
         "createdAt": "2026-11-03T13:20:00Z",
         "deadlineAt": "2026-11-03T13:30:00Z",
         "owner": "carol",
-        "releaseDigest": "sha256:eaeeeaa965a7dae8c587d0350cfe4dc69208dec82c7b58eccca5085157275b88",
+        "releaseDigest": "sha256:1c965ca14fe12a3312a79319e4c4ddfd41c3fe7b5989ef0a5487c5f5d47f548b",
         "releaseId": "7f3c1a2e-5b6d-4c8e-9f01-23456789abcd",
         "runId": "run_01JD7Q3Z8M8T0G3C6N4V9S2A1E",
         "startedAt": "2026-11-03T13:20:01Z",
@@ -514,7 +594,7 @@
         "finishedAt": "2026-11-03T13:30:04Z",
         "owner": "alice",
         "purpose": "evaluation",
-        "releaseDigest": "sha256:eaeeeaa965a7dae8c587d0350cfe4dc69208dec82c7b58eccca5085157275b88",
+        "releaseDigest": "sha256:1c965ca14fe12a3312a79319e4c4ddfd41c3fe7b5989ef0a5487c5f5d47f548b",
         "releaseId": "7f3c1a2e-5b6d-4c8e-9f01-23456789abcd",
         "runId": "eval_7f3c1a2e5b6d4c8e9f0123456789abcd_0",
         "startedAt": "2026-11-03T13:30:01Z",
@@ -535,7 +615,7 @@
         "failureMessage": "the run reached its limit of 12 steps",
         "finishedAt": "2026-11-03T13:25:00Z",
         "owner": "carol",
-        "releaseDigest": "sha256:eaeeeaa965a7dae8c587d0350cfe4dc69208dec82c7b58eccca5085157275b88",
+        "releaseDigest": "sha256:1c965ca14fe12a3312a79319e4c4ddfd41c3fe7b5989ef0a5487c5f5d47f548b",
         "releaseId": "7f3c1a2e-5b6d-4c8e-9f01-23456789abcd",
         "runId": "run_01JD7Q3Z8M8T0G3C6N4V9S2A1D",
         "startedAt": "2026-11-03T13:20:01Z",
@@ -549,14 +629,14 @@
       "value": {
         "idp.host/executionRef": "execution:shipment-7f3a",
         "idp.host/maxOutputTokens": 1024,
-        "idp.host/releaseDigest": "sha256:eaeeeaa965a7dae8c587d0350cfe4dc69208dec82c7b58eccca5085157275b88",
+        "idp.host/releaseDigest": "sha256:1c965ca14fe12a3312a79319e4c4ddfd41c3fe7b5989ef0a5487c5f5d47f548b",
         "idp.host/toolExecution": "caller"
       }
     },
     {
       "definition": "RunOptions",
       "value": {
-        "idp.host/releaseDigest": "sha256:eaeeeaa965a7dae8c587d0350cfe4dc69208dec82c7b58eccca5085157275b88"
+        "idp.host/releaseDigest": "sha256:1c965ca14fe12a3312a79319e4c4ddfd41c3fe7b5989ef0a5487c5f5d47f548b"
       }
     }
   ]

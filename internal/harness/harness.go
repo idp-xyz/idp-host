@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"idp-host/internal/a2a"
 	"idp-host/internal/agent"
 	"idp-host/internal/agui"
 	"idp-host/internal/canonical"
@@ -67,6 +68,10 @@ type Harness struct {
 	Now       func() time.Time
 	// Classifiers are the external output classifiers of the HOST configuration, by name (D28).
 	Classifiers map[string]guard.Classifier
+	// Router orders model candidates (D29); nil means a fresh router per harness.
+	Router *model.Router
+	// A2A delegates to remote agents (D30); nil disables remote sub-agents.
+	A2A *a2a.Client
 
 	DeltaFlush      time.Duration // how often streamed text is persisted (default 50 ms)
 	ToolTimeout     time.Duration // per tool call (default 60 s)
@@ -92,6 +97,9 @@ func (h *Harness) defaults() {
 	}
 	if h.Log == nil {
 		h.Log = slog.Default()
+	}
+	if h.Router == nil {
+		h.Router = model.NewRouter()
 	}
 }
 
@@ -332,7 +340,8 @@ func (t *turn) collect(tc run.ToolCall) error {
 }
 
 // delegate creates the child run of a sub-agent call. The call rests as DELEGATED; a store refusal
-// (quota, missing release) becomes the tool's error result and the model continues.
+// (quota, missing release) becomes the tool's error result and the model continues. A remote
+// (A2A) agent is called synchronously instead: the answer is the tool result.
 func (t *turn) delegate(tc run.ToolCall) error {
 	sub := t.subagents[tc.Tool]
 	var args struct {
@@ -340,6 +349,32 @@ func (t *turn) delegate(tc run.ToolCall) error {
 	}
 	if err := json.Unmarshal([]byte(tc.Arguments), &args); err != nil || strings.TrimSpace(args.Input) == "" {
 		return t.answer(tc, run.CallFailed, "", "the input argument is required")
+	}
+	if sub.A2A != nil {
+		if t.h.A2A == nil {
+			return t.answer(tc, run.CallFailed, "", "remote agents are not enabled on this host")
+		}
+		if err := t.h.Store.UpdateToolCall(t.ctx, t.claim, tc.ID, run.CallExecuting, "", false, []agui.Event{agui.Custom(agui.CustomSubagentStarted, map[string]any{"toolCallId": tc.ID, "agent": sub.Name, "remote": sub.A2A.CardURL})}); err != nil {
+			return err
+		}
+		cctx, cancel := context.WithTimeout(t.ctx, a2a.Deadline(t.h.Now(), t.rc.Run.DeadlineAt))
+		start := t.h.Now()
+		res, err := t.h.A2A.Send(cctx, sub.A2A.CardURL, run.ChildRunID(t.rc.Run.ID, tc.ID), "m_"+tc.ID, args.Input)
+		cancel()
+		if t.h.Metrics != nil {
+			outcome := "ok"
+			if err != nil {
+				outcome = "error"
+			}
+			t.h.Metrics.ToolCall("a2a:"+sub.Name, outcome, t.h.Now().Sub(start))
+		}
+		if err != nil {
+			if t.ctx.Err() != nil {
+				return run.ErrFenced
+			}
+			return t.answer(tc, run.CallFailed, "", "remote agent "+sub.Name+": "+sanitize(err))
+		}
+		return t.answer(tc, run.CallDone, res.Text, "")
 	}
 	if _, err := t.h.Store.CreateChildRun(t.ctx, t.claim, run.ChildRunInput{ToolCallID: tc.ID, Agent: sub, Input: args.Input, Gateway: t.def.Tools.Gateway}); err != nil {
 		if errors.Is(err, run.ErrFenced) || t.ctx.Err() != nil {
@@ -592,12 +627,32 @@ func (t *turn) canceled() error {
 // callModel runs one model call with fallbacks, streaming text into the event log.
 func (t *turn) callModel(step int) (*model.Response, run.Step, error) {
 	h := t.h
-	refs := append([]agent.ModelRef{{Provider: t.def.Model.Provider, Model: t.def.Model.Model}}, t.def.Model.Fallbacks...)
-	st := run.Step{Step: step, Provider: refs[0].Provider, Model: refs[0].Model}
+	st := run.Step{Step: step, Provider: t.def.Model.Provider, Model: t.def.Model.Model}
 	msgs, err := t.guardedMessages()
 	if err != nil {
 		return nil, st, err
 	}
+	// D29: the router decides the attempt order from the call's needs and what it observed
+	parts := []string{t.def.Instructions}
+	for _, m := range msgs {
+		parts = append(parts, m.Content)
+	}
+	for _, tool := range t.tools {
+		parts = append(parts, tool.Description, string(tool.Parameters))
+	}
+	needs := model.Needs{Tools: len(t.tools) > 0, EstimatedInput: model.EstimateTokens(parts...), MaxOutputTokens: t.def.Model.MaxOutputTokens}
+	refs, decisions := h.Router.Order(t.def.Model, needs)
+	if len(refs) == 0 {
+		st.ErrorCode = "no_candidate"
+		return nil, st, &model.Error{Code: "no_candidate"}
+	}
+	if model.StrategyName(t.def.Model) != agent.RouteOrdered {
+		if err := h.Store.AppendEvents(t.ctx, t.claim, []agui.Event{agui.Custom(agui.CustomModelRouted, map[string]any{"step": step, "strategy": model.StrategyName(t.def.Model),
+			"estimatedInputTokens": needs.EstimatedInput, "order": decisions})}); err != nil {
+			return nil, st, err
+		}
+	}
+	st.Provider, st.Model = refs[0].Provider, refs[0].Model
 	var lastErr error
 	for i, ref := range refs {
 		p, ok := h.Providers.Get(ref.Provider)
@@ -614,6 +669,7 @@ func (t *turn) callModel(step int) (*model.Response, run.Step, error) {
 			Temperature: t.def.Model.Temperature, MaxOutputTokens: t.def.Model.MaxOutputTokens}, s.delta)
 		cancel()
 		st.Latency = h.Now().Sub(start)
+		h.Router.Observe(ref, st.Latency, err != nil && s.blocked == "")
 		if ferr := s.finish(); ferr != nil {
 			return nil, st, ferr // fenced while streaming
 		}

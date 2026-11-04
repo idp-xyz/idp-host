@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:idp:telos:host:1.4.0",
-  "title": "idp.telos.host 1.4.0",
-  "description": "idp-host（Agent Hosting & Coordination）对外发布的契约：AgentRelease（agent 行为的不可变发布件，ADR-0001 D2；1.1.0 起可嵌入 Skill，D17）、SkillRelease（skill 的不可变发布件）、Envelope（发布件加内容摘要）、AgentRun（一次运行的记录，API 返回的形态；1.3.0 起可为子 agent 运行，D22）和 RunOptions（1.2.0 起：创建运行时的调用方选项，D19）。1.3.0 新增：Definition 的 subagents 与 skillMerge（D22、D24）、Limits 的 maxSubagentDepth、SkillDefinition 的 resources（D23）、AgentRelease 的 subagents、AgentRun 的 parentRunId / depth 与状态 AWAITING_SUBAGENT。1.4.0 新增：Definition 的 guards（输入护栏与输出过滤，D27、D28）与 evaluation（评估集，D26），AgentRun 的 purpose。生产者是 idp-host，权威副本在 idp-host/api/contracts/，由 go test ./internal/run -run TestContract 保证与实现一致；idp-contracts 中的副本只能与之逐字节相同。JSON Schema 只描述形状与可本地判定的规则；摘要是否匹配由 agent.Open / agent.OpenSkill 判定，运行时不变量由 HOST 的状态机判定。",
+  "$id": "urn:idp:telos:host:1.5.0",
+  "title": "idp.telos.host 1.5.0",
+  "description": "idp-host（Agent Hosting & Coordination）对外发布的契约：AgentRelease（agent 行为的不可变发布件，ADR-0001 D2；1.1.0 起可嵌入 Skill，D17）、SkillRelease（skill 的不可变发布件）、Envelope（发布件加内容摘要）、AgentRun（一次运行的记录，API 返回的形态；1.3.0 起可为子 agent 运行，D22）和 RunOptions（1.2.0 起：创建运行时的调用方选项，D19）。1.3.0 新增：Definition 的 subagents 与 skillMerge（D22、D24）、Limits 的 maxSubagentDepth、SkillDefinition 的 resources（D23）、AgentRelease 的 subagents、AgentRun 的 parentRunId / depth 与状态 AWAITING_SUBAGENT。1.4.0 新增：Definition 的 guards（输入护栏与输出过滤，D27、D28）与 evaluation（评估集，D26），AgentRun 的 purpose。1.5.0 新增：ModelProfile 的 routing（模型路由，D29）、SubagentRef / EmbeddedSubagent 的 a2a（远端 A2A agent，D30）。生产者是 idp-host，权威副本在 idp-host/api/contracts/，由 go test ./internal/run -run TestContract 保证与实现一致；idp-contracts 中的副本只能与之逐字节相同。JSON Schema 只描述形状与可本地判定的规则；摘要是否匹配由 agent.Open / agent.OpenSkill 判定，运行时不变量由 HOST 的状态机判定。",
   "oneOf": [
     {"$ref": "#/$defs/AgentRelease"},
     {"$ref": "#/$defs/SkillRelease"},
@@ -143,21 +143,34 @@
       "properties": {
         "name": {"type": "string", "pattern": "^[a-z0-9]([a-z0-9-]{0,55}[a-z0-9])?$"},
         "version": {"type": "integer", "minimum": 1},
-        "description": {"type": "string", "minLength": 1, "maxLength": 1024}
+        "description": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "a2a": {"$ref": "#/$defs/A2ARef"}
+      }
+    },
+    "A2ARef": {
+      "title": "A2ARef",
+      "description": "远端 A2A agent（D30）：其 agent card 的 URL。委派时 HOST 以配置中该对端的凭据发起阻塞的 message/send，远端任务非 completed 结束即为工具错误。远端引用没有钉住的版本、agentId 或摘要。",
+      "x-idp-telos-owner": "idp.telos.host",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cardUrl"],
+      "properties": {
+        "cardUrl": {"type": "string", "pattern": "^https?://[^\\s\"'<>]{1,500}$"}
       }
     },
     "EmbeddedSubagent": {
       "title": "EmbeddedSubagent",
-      "description": "编译 AgentRelease 时解析出的子 agent 身份：名字、agentId、版本与该 AgentRelease 的摘要。只嵌入身份，不嵌入内容；委派时运行的就是这一份发布件。",
+      "description": "编译 AgentRelease 时解析出的子 agent 身份：本地 agent 为名字、agentId、版本与该 AgentRelease 的摘要（只嵌入身份，不嵌入内容；委派时运行的就是这一份发布件）；远端 agent（1.5.0）为名字与 a2a.cardUrl。",
       "x-idp-telos-owner": "idp.telos.host",
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "agentId", "version", "digest"],
+      "required": ["name"],
       "properties": {
         "name": {"type": "string", "pattern": "^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$"},
         "agentId": {"type": "string", "minLength": 1},
         "version": {"type": "integer", "minimum": 1},
-        "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+        "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "a2a": {"$ref": "#/$defs/A2ARef"}
       }
     },
     "SkillMerge": {
@@ -259,7 +272,36 @@
         "model": {"type": "string", "minLength": 1, "maxLength": 256},
         "temperature": {"type": "number", "minimum": 0, "maximum": 2},
         "maxOutputTokens": {"type": "integer", "minimum": 0},
-        "fallbacks": {"type": "array", "items": {"$ref": "#/$defs/ModelRef"}}
+        "fallbacks": {"type": "array", "items": {"$ref": "#/$defs/ModelRef"}},
+        "routing": {"$ref": "#/$defs/Routing"}
+      }
+    },
+    "Routing": {
+      "title": "Routing",
+      "description": "模型路由（D29）：candidates 是带元数据的候选（与主模型、回退一起构成候选池，去重），strategy 决定每一步的尝试顺序：ordered（主、回退、候选按声明顺序）、cost（按声明单价与本次调用规模估算）、latency（按本进程观察到的时延 EWMA，错误率高者视为慢）、capability（声明能力最多者优先）。提供工具时只保留声明了 tools 能力（或未声明能力）的候选；估算输入超过 maxContextTokens 的候选被跳过。决定记录为 idp.host/model.routed 事件。路由器不学习、不调用外部服务。",
+      "x-idp-telos-owner": "idp.telos.host",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strategy", "candidates"],
+      "properties": {
+        "strategy": {"enum": ["ordered", "cost", "latency", "capability"]},
+        "candidates": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"$ref": "#/$defs/Candidate"}}
+      }
+    },
+    "Candidate": {
+      "title": "Candidate",
+      "description": "一个候选模型及路由需要知道的元数据：每千 token 的输入 / 输出单价（租户的记账单位）、声明的能力（tools、json、reasoning、vision、longContext）、上下文窗口大小。",
+      "x-idp-telos-owner": "idp.telos.host",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "model"],
+      "properties": {
+        "provider": {"type": "string", "pattern": "^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$"},
+        "model": {"type": "string", "minLength": 1, "maxLength": 256},
+        "costPer1kInput": {"type": "number", "minimum": 0},
+        "costPer1kOutput": {"type": "number", "minimum": 0},
+        "capabilities": {"type": "array", "items": {"enum": ["tools", "json", "reasoning", "vision", "longContext"]}},
+        "maxContextTokens": {"type": "integer", "minimum": 0, "maximum": 100000000}
       }
     },
     "ModelRef": {

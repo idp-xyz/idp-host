@@ -243,6 +243,10 @@ func (s *Store) CreateRelease(ctx context.Context, tenant, ref, by string) (*Rel
 func resolveSubagents(ctx context.Context, tx pgx.Tx, selfID string, refs []agent.SubagentRef) ([]agent.EmbeddedSubagent, error) {
 	var out []agent.EmbeddedSubagent
 	for _, ref := range refs {
+		if ref.A2A != nil { // a remote agent: nothing to resolve here, the card is read at delegation time
+			out = append(out, agent.EmbeddedSubagent{Name: ref.Name, A2A: &agent.A2ARef{CardURL: ref.A2A.CardURL}})
+			continue
+		}
 		other, err := getAgent(ctx, tx, ref.Name, false)
 		if err != nil {
 			return nil, fail("CONFLICT", "sub-agent %s does not exist", ref.Name)

@@ -2,7 +2,7 @@
 
 IDP TELOS 的 Agent Hosting & Coordination：`idp-host` 一个二进制，同时是 API 与 Worker。设计决策见 [`docs/adr/ADR-0001-host-design.md`](docs/adr/ADR-0001-host-design.md)。
 
-状态：**M1（PATH A 全链路）与 M2（可对外服务）已完成并实测**：Agent 定义与不可变发布（四眼）、Skill 注册与发布（嵌入 agent release）、Session / Thread / Run、持久化 Run 状态机与事件日志、租约 + fencing 的 Worker（可独立扩缩）、Go 自研 harness、OpenAI 兼容 / Anthropic / Gemini 三个模型适配器、经 idp-mcp 网关的工具调用（静态凭据或 RFC 8693 委派，与真实 Keycloak 联调通过）、用户确认、租户级配额与预算、AG-UI 流式接口、RLS、审计、指标、追踪、TLS、Kubernetes 清单；契约 `idp.telos.host` 1.4.0 已发布。**M3、M4 完成**（ADR 第 11、12 节）：子 agent（父 Run 委派出的子 Run，`AWAITING_SUBAGENT`，D22）、Skill 资源（内联与按需 `resource__read`，D23）、可配置的 Skill 合并规则（D24）、授权码 + PKCE 登录与 EER 工作负载客户端的 OIDC 端到端（D25）、评估门禁（`POST /api/v1/releases/{id}/evaluate`，`EVALUATION_REQUIRED`，D26）、输入护栏（不可信内容定界与注入检测，D27）、输出过滤（租户与发布件的禁用模式、PII 脱敏、外部分类器，`GUARD_BLOCKED`，D28）。真实模型门禁在本地 Qwen（OpenAI 与 Anthropic 两种线上格式）上通过。
+状态：**M1（PATH A 全链路）与 M2（可对外服务）已完成并实测**：Agent 定义与不可变发布（四眼）、Skill 注册与发布（嵌入 agent release）、Session / Thread / Run、持久化 Run 状态机与事件日志、租约 + fencing 的 Worker（可独立扩缩）、Go 自研 harness、OpenAI 兼容 / Anthropic / Gemini 三个模型适配器、经 idp-mcp 网关的工具调用（静态凭据或 RFC 8693 委派，与真实 Keycloak 联调通过）、用户确认、租户级配额与预算、AG-UI 流式接口、RLS、审计、指标、追踪、TLS、Kubernetes 清单；契约 `idp.telos.host` 1.5.0 已发布。**M3、M4、M5 完成**（ADR 第 11–13 节）：子 agent（父 Run 委派出的子 Run，`AWAITING_SUBAGENT`，D22）、Skill 资源（内联与按需 `resource__read`，D23）、可配置的 Skill 合并规则（D24）、授权码 + PKCE 登录与 EER 工作负载客户端的 OIDC 端到端（D25）、评估门禁（`POST /api/v1/releases/{id}/evaluate`，`EVALUATION_REQUIRED`，D26）、输入护栏（不可信内容定界与注入检测，D27）、输出过滤（租户与发布件的禁用模式、PII 脱敏、外部分类器，`GUARD_BLOCKED`，D28）、模型路由（cost / latency / capability，D29）、A2A 服务端与客户端（`/a2a/agents/{ref}`，远端子 agent，D30）、外部 harness worker（provider 种类 `harness-worker`，`deploy/harness-worker/worker.py`，D31）。真实模型门禁在本地 Qwen（OpenAI 与 Anthropic 两种线上格式）上通过。
 
 ## 组成
 

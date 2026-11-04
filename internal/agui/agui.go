@@ -333,6 +333,8 @@ const (
 	CustomSubagentStarted       = "idp.host/subagent.started"
 	CustomSubagentAwaitingInput = "idp.host/subagent.awaiting_input"
 	CustomSubagentFinished      = "idp.host/subagent.finished"
+	// model routing (ADR-0001 D29)
+	CustomModelRouted = "idp.host/model.routed"
 	// content guards (ADR-0001 D27, D28)
 	CustomGuardFlagged = "idp.host/guard.flagged"
 	CustomGuardBlocked = "idp.host/guard.blocked"

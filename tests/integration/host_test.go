@@ -27,6 +27,7 @@ import (
 	"idp-host/adapters/identity"
 	"idp-host/adapters/providers/openai"
 	"idp-host/adapters/store/postgres"
+	"idp-host/internal/a2a"
 	"idp-host/internal/agent"
 	"idp-host/internal/agui"
 	"idp-host/internal/api"
@@ -276,7 +277,8 @@ func (e *env) sse(method, path, who string, body any) ([]string, []map[string]an
 		if err := json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(line, "data:"))), &ev); err != nil {
 			e.t.Fatalf("bad event line %q", line)
 		}
-		types = append(types, ev["type"].(string))
+		kind, _ := ev["type"].(string) // AG-UI events carry a type; A2A streams carry JSON-RPC responses
+		types = append(types, kind)
 		events = append(events, ev)
 	}
 	return types, events, resp.Header
@@ -1185,6 +1187,159 @@ func TestHostEndToEnd(t *testing.T) {
 			t.Fatalf("%d %v", st, out)
 		}
 		e.must(404, "GET", "/api/v1/evaluations/"+ev["evaluationId"].(string), "dave", nil)
+	})
+
+	t.Run("a2a", func(t *testing.T) {
+		// ADR-0001 D30: every published agent is an A2A agent; a task is a run, the contextId its thread
+		rpc := func(who, agent string, method string, params any, id string) map[string]any {
+			return e.must(200, "POST", "/a2a/agents/"+agent, who, map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+		}
+		card := e.must(200, "GET", "/a2a/agents/assistant/.well-known/agent-card.json", "carol", nil)
+		if card["name"] != "assistant" || !strings.HasSuffix(card["url"].(string), "/a2a/agents/assistant") || card["protocolVersion"] != "0.3.0" || len(card["skills"].([]any)) < 1 {
+			t.Fatalf("%v", card)
+		}
+		e.must(404, "GET", "/a2a/agents/assistant/.well-known/agent-card.json", "dave", nil)
+		// message/send (non-blocking): submitted, then completed with the answer as an artifact
+		msg := func(text, ctx string) map[string]any {
+			m := map[string]any{"kind": "message", "role": "user", "messageId": "a2a-" + hex.EncodeToString([]byte(text)) + ctx, "parts": []map[string]any{{"kind": "text", "text": text}}}
+			if ctx != "" {
+				m["contextId"] = ctx
+			}
+			return m
+		}
+		res := rpc("carol", "assistant", "message/send", map[string]any{"message": msg("hi there", "a2a-ctx-1")}, "1")
+		task := res["result"].(map[string]any)
+		if task["kind"] != "task" || task["status"].(map[string]any)["state"] != "submitted" || task["contextId"] != "a2a-ctx-1" {
+			t.Fatalf("%v", res)
+		}
+		e.drive()
+		got := rpc("carol", "assistant", "tasks/get", map[string]any{"id": task["id"]}, "2")["result"].(map[string]any)
+		if got["status"].(map[string]any)["state"] != "completed" || got["artifacts"].([]any)[0].(map[string]any)["parts"].([]any)[0].(map[string]any)["text"] != "Echo: hi there" || len(got["history"].([]any)) != 2 {
+			t.Fatalf("%v", got)
+		}
+		// blocking send with a worker running alongside
+		go func() {
+			for i := 0; i < 20; i++ {
+				time.Sleep(100 * time.Millisecond)
+				_, _ = e.worker.Once(context.Background())
+			}
+		}()
+		res = rpc("carol", "assistant", "message/send", map[string]any{"message": msg("second", "a2a-ctx-1"), "configuration": map[string]any{"blocking": true, "historyLength": 1}}, "3")
+		task = res["result"].(map[string]any)
+		if task["status"].(map[string]any)["state"] != "completed" || len(task["history"].([]any)) != 1 || task["artifacts"].([]any)[0].(map[string]any)["parts"].([]any)[0].(map[string]any)["text"] != "Echo: second" {
+			t.Fatalf("%v", res)
+		}
+		// message/stream: a task, then artifact chunks, then a final status
+		go func() {
+			for i := 0; i < 20; i++ {
+				time.Sleep(100 * time.Millisecond)
+				_, _ = e.worker.Once(context.Background())
+			}
+		}()
+		_, events, _ := e.sse("POST", "/a2a/agents/assistant", "carol", map[string]any{"jsonrpc": "2.0", "id": "4", "method": "message/stream", "params": map[string]any{"message": msg("stream me", "a2a-ctx-2")}})
+		kinds := []string{}
+		for _, ev := range events {
+			kinds = append(kinds, fmt.Sprint(ev["result"].(map[string]any)["kind"]))
+		}
+		last := events[len(events)-1]["result"].(map[string]any)
+		if kinds[0] != "task" || !strings.Contains(strings.Join(kinds, ","), "artifact-update") || last["kind"] != "status-update" || last["final"] != true || last["status"].(map[string]any)["state"] != "completed" {
+			t.Fatalf("%v %v", kinds, last)
+		}
+		// a task waiting for the owner is input-required; cancel ends it; a second cancel is refused
+		res = rpc("carol", "assistant", "message/send", map[string]any{"message": msg("echo this", "a2a-ctx-3")}, "5")
+		waiting := res["result"].(map[string]any)["id"].(string)
+		e.drive()
+		if st := rpc("carol", "assistant", "tasks/get", map[string]any{"id": waiting}, "6")["result"].(map[string]any)["status"].(map[string]any)["state"]; st != "input-required" {
+			t.Fatalf("%v", st)
+		}
+		if res := rpc("carol", "assistant", "message/send", map[string]any{"message": map[string]any{"kind": "message", "role": "user", "messageId": "follow-up-1", "taskId": waiting, "parts": []map[string]any{{"kind": "text", "text": "go on"}}}}, "7"); res["error"] == nil || res["error"].(map[string]any)["code"] != -32004.0 {
+			t.Fatalf("%v", res)
+		}
+		canceled := rpc("carol", "assistant", "tasks/cancel", map[string]any{"id": waiting}, "8")["result"].(map[string]any)
+		if canceled["status"].(map[string]any)["state"] != "canceled" {
+			t.Fatalf("%v", canceled)
+		}
+		if res := rpc("carol", "assistant", "tasks/cancel", map[string]any{"id": waiting}, "9"); res["error"].(map[string]any)["code"] != -32002.0 {
+			t.Fatalf("%v", res)
+		}
+		if res := rpc("carol", "assistant", "tasks/get", map[string]any{"id": "nope"}, "10"); res["error"].(map[string]any)["code"] != -32001.0 {
+			t.Fatalf("%v", res)
+		}
+		if res := rpc("carol", "assistant", "tasks/resubscribe", map[string]any{"id": waiting}, "11"); res["error"].(map[string]any)["code"] != -32004.0 {
+			t.Fatalf("%v", res)
+		}
+		if res := rpc("carol", "assistant", "nope/method", map[string]any{}, "12"); res["error"].(map[string]any)["code"] != -32601.0 {
+			t.Fatalf("%v", res)
+		}
+		// run options travel in the message metadata: a pinned release
+		rels := e.must(200, "GET", "/api/v1/agents/assistant/releases", "alice", nil)["releases"].([]any)
+		digest := rels[len(rels)-1].(map[string]any)["digest"].(string)
+		m := msg("pinned", "a2a-ctx-4")
+		m["metadata"] = map[string]any{"idp.host/releaseDigest": digest, "app/theme": "dark"}
+		pinned := rpc("carol", "assistant", "message/send", map[string]any{"message": m}, "13")["result"].(map[string]any)
+		if r := e.must(200, "GET", "/v1/runs/"+pinned["id"].(string), "carol", nil); r["releaseDigest"] != digest {
+			t.Fatalf("%v", r)
+		}
+		e.drive()
+
+		// the HOST as an A2A client: a lead agent delegates to the helper through its agent card
+		e.worker.Harness.A2A = &a2a.Client{HTTP: e.api.Client(), Bearer: func(string) string { return e.tokens["carol"] }}
+		defer func() { e.worker.Harness.A2A = nil }()
+		e.model.Script = func(msgs []fakemodel.Message, tools []string) fakemodel.Turn {
+			last := msgs[len(msgs)-1]
+			if last.Role == "tool" {
+				return fakemodel.Turn{Text: "Result: " + last.Content}
+			}
+			for _, tl := range tools {
+				if tl == "agent__helper-remote" && strings.Contains(last.Content, "delegate") {
+					return fakemodel.Turn{ToolCalls: []fakemodel.Call{{Name: tl, Args: `{"input":"please sum"}`}}}
+				}
+			}
+			if strings.Contains(last.Content, "sum") {
+				for _, tl := range tools {
+					if tl == "sum" {
+						return fakemodel.Turn{ToolCalls: []fakemodel.Call{{Name: "sum", Args: `{"a":1,"b":2}`}}}
+					}
+				}
+			}
+			return fakemodel.Turn{Text: "Echo: " + last.Content}
+		}
+		defer func() { e.model.Script = fakemodel.DefaultScript }()
+		lead := definition("edge", []string{"sum"}, nil)
+		lead.Subagents = []agent.SubagentRef{{Name: "helper-remote", Description: "A remote helper.", A2A: &agent.A2ARef{CardURL: e.api.URL + "/a2a/agents/helper/.well-known/agent-card.json"}}}
+		e.publish("remote-lead", lead)
+		rel := e.must(200, "GET", "/api/v1/agents/remote-lead/releases", "alice", nil)["releases"].([]any)[0].(map[string]any)
+		if sub := rel["document"].(map[string]any)["subagents"].([]any)[0].(map[string]any); sub["a2a"] == nil || sub["digest"] != nil {
+			t.Fatalf("%v", sub)
+		}
+		r := e.must(202, "POST", "/v1/agents/remote-lead/runs", "carol", runBody("remote-1", "please delegate"), "Idempotency-Key", "rm1")
+		// the lead's turn blocks on the remote task while a second worker serves it
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for i := 0; i < 40; i++ {
+				time.Sleep(100 * time.Millisecond)
+				_, _ = e.worker.Once(context.Background())
+			}
+		}()
+		e.drive()
+		<-done
+		got = e.must(200, "GET", "/v1/runs/"+r["runId"].(string), "carol", nil)
+		msgs := e.must(200, "GET", "/v1/threads/remote-1/messages", "carol", nil)["messages"].([]any)
+		if got["status"] != run.StatusCompleted || msgs[len(msgs)-1].(map[string]any)["content"] != "Result: Result: 3" {
+			t.Fatalf("%v %v", got, msgs[len(msgs)-1])
+		}
+		calls := e.must(200, "GET", "/v1/runs/"+r["runId"].(string)+"/tool-calls", "carol", nil)["toolCalls"].([]any)
+		if calls[0].(map[string]any)["state"] != run.CallDone || calls[0].(map[string]any)["childRunId"] != nil {
+			t.Fatalf("%v", calls)
+		}
+		if subs := e.must(200, "GET", "/v1/runs/"+r["runId"].(string)+"/subruns", "carol", nil)["runs"].([]any); len(subs) != 0 {
+			t.Fatalf("remote delegation created a local child: %v", subs)
+		}
+		remote := e.must(200, "GET", "/v1/threads/"+run.ChildRunID(r["runId"].(string), calls[0].(map[string]any)["toolCallId"].(string))+"/runs", "carol", nil)["runs"].([]any)
+		if len(remote) != 1 || remote[0].(map[string]any)["status"] != run.StatusCompleted {
+			t.Fatalf("%v", remote)
+		}
 	})
 
 	t.Run("tenant-isolation", func(t *testing.T) {

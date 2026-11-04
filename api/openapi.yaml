@@ -202,6 +202,17 @@ paths:
     get:
       summary: The run's AG-UI events, as a JSON page or, with Accept text/event-stream, as a resumable stream that ends at RUN_FINISHED / RUN_ERROR
       responses: {'200': {description: events (JSON or SSE)}, '404': {$ref: '#/components/responses/Problem'}}
+  /a2a/agents/{ref}/.well-known/agent-card.json:
+    parameters: [{$ref: '#/components/parameters/ref'}]
+    get:
+      summary: The agent's A2A agent card (ADR-0001 D30; A2A 0.3)
+      responses: {'200': {description: agent card}, '404': {$ref: '#/components/responses/Problem'}, '409': {$ref: '#/components/responses/Problem'}}
+  /a2a/agents/{ref}:
+    parameters: [{$ref: '#/components/parameters/ref'}]
+    post:
+      summary: A2A JSON-RPC endpoint (message/send, message/stream, tasks/get, tasks/cancel); a task is a run, its contextId the thread; message/stream answers text/event-stream of JSON-RPC responses
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [jsonrpc, method], properties: {jsonrpc: {type: string, enum: ['2.0']}, id: {}, method: {type: string}, params: {type: object}}}}}}
+      responses: {'200': {description: JSON-RPC response (result or error)}}
   /ag-ui/agents/{ref}:
     parameters: [{$ref: '#/components/parameters/ref'}]
     post:

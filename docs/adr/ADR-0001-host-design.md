@@ -192,3 +192,17 @@
 - 输入护栏是规则，不是模型：改写措辞的注入不会被识别；定界与说明只是基线。
 - 非 strict 的输出过滤在命中前已落库的增量不会撤回；脱敏按合并后的分段进行，跨分段的模式可能漏脱敏（strict 模式无此问题）。
 - 评估运行用的是候选发布件的临时信封（无审批人），摘要与批准后的不同；评估结果绑定发布件 id。
+
+## 13. M5 实施结果（2026-11-04，WSL 实测）
+
+- 模型路由（D29）：`model.routing` 的 ordered / cost / latency / capability 四种策略；候选池 = 主模型 + 回退 + 候选（去重，候选元数据生效）；提供工具时只保留声明 `tools`（或未声明能力）的候选，估算输入超过 `maxContextTokens` 的候选被跳过；latency 用进程内 EWMA 与近 20 次错误率（失败视为慢），每次调用后观察；决定与原因记为 `idp.host/model.routed`；无 routing 时行为与 M1 相同。
+- A2A（D30）：服务端 `GET /a2a/agents/{ref}/.well-known/agent-card.json`、`POST /a2a/agents/{ref}`（JSON-RPC 2.0：message/send 含 blocking 与 historyLength、message/stream 以 SSE 流出 JSON-RPC 响应、tasks/get、tasks/cancel；push 通知与 resubscribe 返回 UnsupportedOperation）；task = Run，contextId = 线程，状态映射 submitted / working / input-required / completed / failed / canceled，最终助手消息为 artifact，消息 metadata 里的 `idp.host/` 键作为 RunOptions（可钉发布件）；对等待中的任务再发消息返回 UnsupportedOperation 并指向确认接口。客户端：`subagents[].a2a.cardUrl` 指向远端 agent card，委派为阻塞的 message/send（超时 = 剩余运行时限，至多 10 分钟），结果直接作为工具结果（不建本地子 Run），凭据按 HOST 配置 `a2aPeers` 的 URL 前缀选取。集成测试以 HOST 自己为对端验证了全部方法与远端委派。
+- 外部 harness（D31，实现上的调整）：没有给发布件加 `harness` 字段，而是把外部 harness worker 做成 provider 种类 `harness-worker`——发布件通过 `model.provider` 选择它，路由、回退、护栏、确认、工具执行、配额全部不变。协议：`POST /v1/turn`（指令、消息、工具、限制）→ SSE 事件 text / reasoning / tool_call / done / error。随仓库提供 `deploy/harness-worker/worker.py`（仅标准库，前接任意 OpenAI 兼容端点），其测试在 Go 里启动真实的 Python worker 对假模型完成一次工具调用与一次文本回合。
+- 契约 1.5.0 发布（Routing、Candidate、A2ARef；EmbeddedSubagent 的 agentId / version / digest 对远端 agent 不再必填）。
+
+**验证**：单元（model 路由器、harness 路由、harnessworker 协议与 Python 参考 worker）、契约（1.5.0：示例带路由与远端 agent，10 种新拒绝用例与交叉规则）、集成（新增 a2a 场景：card、send、阻塞 send、stream、input-required 与取消、错误码、metadata 选项、远端委派）全部通过。
+
+**局限（不标 PASS）**
+- 远端委派期间父 Run 的 Worker goroutine 阻塞在 HTTP 上（本地子 Run 不占 Worker）；远端任务进入 input-required 视为失败。
+- A2A 只实现文本 part；没有 push 通知；agent card 需要承载方的 bearer（不是公开端点）。
+- 路由器的 latency 统计只在本进程内，副本之间不共享。
