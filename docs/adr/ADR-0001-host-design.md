@@ -222,6 +222,6 @@ idp-cmi（Context, Memory & Knowledge Infrastructure）M1 完成并发布契约 
 **验证**：单元与契约（1.6.0：示例发布件带 context 策略、示例运行带 contextPackageId，5 种新拒绝用例）、集成（新增 cmi-context 场景：假 CMI 收到 bearer、查询、线程 scope 与预算；模型看到两条 CMI developer 消息；运行记录 packageId 与 resolved 事件；同一请求重放同一运行；CMI 503 时 skip 并记 skipped 事件；onError = fail 时 502 CONTEXT_UNAVAILABLE；未配置 CMI 时 skip）全部通过。
 
 **局限（不标 PASS）**
-- 与真实 idp-cmi 进程的 compose 联调未做（集成测试用的是按 idp.telos.cmi 1.0.0 形状的假 CMI）；委派模式对真实 Keycloak 未验证（static 模式已测）。
+- 与真实 idp-cmi 进程的 compose 联调已在 idp-cmi 仓库完成（`HOST=1 bash deploy/e2e.sh`，idp-cmi ADR-0001 第 6 节，2026-11-04）：真实 HOST 运行的 `contextPackageId` 与事件摘要与 CMI 保存的包一致。委派模式对真实 Keycloak 未验证（static 模式已测）。
 - 只在创建时取一次；后续用户在同一线程追问要再创建运行才会取新上下文。
 - CMI 条目按 ContextPackage 的 excerpt 原样交给模型，HOST 不再按 sensitivity 过滤——这由 CMI 的 sensitivityCeiling 与策略负责。
