@@ -78,6 +78,10 @@ type Harness struct {
 	// only be reported or fail the run, not refreshed.
 	CMI    *cmiclient.Client
 	CMIKey string
+	// Remember appends an episodic memory to the CMI when a run of a CMI-context agent completes
+	// (D33); nil disables. The write happens after the terminal transition and never affects the run.
+	Remember *cmiclient.Remember
+	memWG    sync.WaitGroup
 
 	DeltaFlush      time.Duration // how often streamed text is persisted (default 50 ms)
 	ToolTimeout     time.Duration // per tool call (default 60 s)
@@ -626,8 +630,71 @@ func (t *turn) complete() error {
 	if t.h.Metrics != nil {
 		t.h.Metrics.RunFinished(run.StatusCompleted)
 	}
-	return t.h.Store.Finish(t.ctx, t.claim, run.StatusCompleted, "", "", []agui.Event{agui.RunFinished(t.rc.Run.ThreadID, t.rc.Run.ID, agui.OutcomeSuccess, nil)})
+	x, remember := t.exchange()
+	subject := ""
+	if remember && t.h.Remember.Exchanger != nil {
+		// delegation needs the owner's stored token, which is only readable while the claim is live
+		subject, _ = t.h.Store.Credential(t.ctx, t.claim)
+	}
+	if err := t.h.Store.Finish(t.ctx, t.claim, run.StatusCompleted, "", "", []agui.Event{agui.RunFinished(t.rc.Run.ThreadID, t.rc.Run.ID, agui.OutcomeSuccess, nil)}); err != nil {
+		return err
+	}
+	if remember {
+		t.h.remember(x, subject)
+	}
+	return nil
 }
+
+// exchange says whether this turn's run is to be remembered (D33) and what was said: a caller's run
+// of an agent with context.cmi, owned by a subject, ending in a final answer (no tool calls) to a
+// non-empty last user message. Sub-agent and evaluation runs are not remembered.
+func (t *turn) exchange() (cmiclient.Exchange, bool) {
+	r := t.h.Remember
+	run := t.rc.Run
+	if r == nil || !t.def.Context.CMI || run.Owner == "" || run.ParentRunID != "" || run.Purpose != "" || len(t.messages) == 0 {
+		return cmiclient.Exchange{}, false
+	}
+	last := t.messages[len(t.messages)-1]
+	if last.Role != agui.RoleAssistant || len(last.ToolCalls) > 0 || strings.TrimSpace(last.Content) == "" {
+		return cmiclient.Exchange{}, false
+	}
+	user := ""
+	for i := len(t.messages) - 1; i >= 0; i-- {
+		if t.messages[i].Role == agui.RoleUser && strings.TrimSpace(t.messages[i].Content) != "" {
+			user = t.messages[i].Content
+			break
+		}
+	}
+	if user == "" {
+		return cmiclient.Exchange{}, false
+	}
+	now := time.Now
+	if t.h.Now != nil {
+		now = t.h.Now
+	}
+	return cmiclient.Exchange{RunID: run.ID, ThreadID: run.ThreadID, Agent: t.rc.Release.AgentName, Subject: run.Owner, Message: user, Answer: last.Content, At: now()}, true
+}
+
+// remember writes the memory off the run's path: a goroutine with its own deadline, so the stream's
+// end is not delayed and a failure is only logged (without content) and counted.
+func (h *Harness) remember(x cmiclient.Exchange, subject string) {
+	h.memWG.Add(1)
+	go func() {
+		defer h.memWG.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		outcome, err := h.Remember.Write(ctx, x, func(context.Context) (string, error) { return subject, nil })
+		if m, ok := h.Metrics.(interface{ MemoryWrite(outcome string) }); ok {
+			m.MemoryWrite(outcome)
+		}
+		if err != nil {
+			h.Log.Warn("memory not written", "run", x.RunID, "outcome", outcome, "error", sanitize(err))
+		}
+	}()
+}
+
+// WaitMemory waits for the memory writes in flight (shutdown and tests).
+func (h *Harness) WaitMemory() { h.memWG.Wait() }
 
 func (t *turn) canceled() error {
 	if t.h.Metrics != nil {

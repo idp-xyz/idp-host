@@ -342,6 +342,30 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 				HTTP: &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil, TLSClientConfig: tokenTLS}}}}
 		}
 	}
+	var remember *cmiclient.Remember
+	if c := cfg.CMI; c != nil && c.Remember != nil && c.Remember.Enabled { // ADR-0001 D33
+		r := c.Remember
+		remember = &cmiclient.Remember{Client: cmiClient, Source: r.Source, Sensitivity: r.Sensitivity, TTL: time.Duration(r.TTLDays) * 24 * time.Hour, MaxChars: r.MaxChars}
+		switch r.Auth.Mode {
+		case "static":
+			key, keyFile := r.Auth.APIKey, r.Auth.APIKeyFile
+			remember.Key = func() (string, error) { // the file is read per write: a refreshed token is picked up
+				if keyFile == "" {
+					return key, nil
+				}
+				b, err := os.ReadFile(keyFile)
+				return strings.TrimSpace(string(b)), err
+			}
+		case "delegation":
+			tokenTLS, err := transport.ClientTLS(r.Auth.CAFile, "", "")
+			if err != nil {
+				return fmt.Errorf("cmi.remember: %w", err)
+			}
+			remember.ActorToken = r.Auth.ActorToken
+			remember.Exchanger = &credential.Exchanger{TokenEndpoint: r.Auth.TokenEndpoint, ClientID: r.Auth.ClientID, ClientSecret: r.Auth.ClientSecret, Audience: r.Auth.Audience,
+				HTTP: &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil, TLSClientConfig: tokenTLS}}}
+		}
+	}
 	metrics := observability.NewMetrics()
 	if ms := observability.ServeMetrics(env("IDP_METRICS_LISTEN", ""), metrics, log); ms != nil {
 		defer ms.Close()
@@ -359,7 +383,7 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 	wctx, cancelWorkers := context.WithCancel(ctx)
 	defer cancelWorkers()
 	if workers > 0 {
-		h := &harness.Harness{Store: store, Providers: registry, Gateways: gateways, Classifiers: classifiers, A2A: a2aClient, CMI: cmiClient, CMIKey: cmiKey, Metrics: worker.NewMetrics(metrics), Log: log}
+		h := &harness.Harness{Store: store, Providers: registry, Gateways: gateways, Classifiers: classifiers, A2A: a2aClient, CMI: cmiClient, CMIKey: cmiKey, Remember: remember, Metrics: worker.NewMetrics(metrics), Log: log}
 		w := &worker.Worker{ID: env("IDP_HOST_INSTANCE", hostname), Store: store, Harness: h, Concurrency: workers, Lease: lease, Log: log}
 		wg.Add(1)
 		go func() {

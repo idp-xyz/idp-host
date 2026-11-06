@@ -29,6 +29,21 @@ type CMI struct {
 	Endpoint string      `yaml:"endpoint"`
 	CAFile   string      `yaml:"caFile"`
 	Auth     GatewayAuth `yaml:"auth"`
+	// Remember makes the HOST append an episodic memory to the CMI when a run of an agent that uses
+	// CMI context completes (ADR-0001 D33). Optional; off unless enabled.
+	Remember *Remember `yaml:"remember"`
+}
+
+// Remember configures the memory the HOST writes after a completed run (D33). Auth is the WRITER
+// identity (the CMI role cmi-writer), distinct from the reader identity in cmi.auth; with static
+// auth the key file is read again on every write so a refreshed token is picked up.
+type Remember struct {
+	Enabled     bool        `yaml:"enabled"`
+	Source      string      `yaml:"source"`      // the registered CMI source; default idp-host
+	TTLDays     int         `yaml:"ttlDays"`     // validUntil = completion + ttl; default 30, 1..3650
+	Sensitivity string      `yaml:"sensitivity"` // public | internal | confidential | restricted; default internal
+	MaxChars    int         `yaml:"maxChars"`    // runes kept of the user message and of the answer, each; default 1500, 1..8000
+	Auth        GatewayAuth `yaml:"auth"`
 }
 
 // A2APeer is the credential for remote agent cards under a URL prefix.
@@ -172,6 +187,60 @@ func Load(path string) (*File, error) {
 			}
 		default:
 			return nil, errors.New("cmi: auth.mode must be delegation or static")
+		}
+		if r := c.Remember; r != nil {
+			if r.Source == "" {
+				r.Source = "idp-host"
+			}
+			if !nameRE.MatchString(r.Source) {
+				return nil, errors.New("cmi.remember: source must be a CMI source name (lower-case letters, digits, hyphens)")
+			}
+			if r.TTLDays == 0 {
+				r.TTLDays = 30
+			}
+			if r.TTLDays < 1 || r.TTLDays > 3650 {
+				return nil, errors.New("cmi.remember: ttlDays must be within [1, 3650]")
+			}
+			if r.Sensitivity == "" {
+				r.Sensitivity = "internal"
+			}
+			switch r.Sensitivity {
+			case "public", "internal", "confidential", "restricted":
+			default:
+				return nil, errors.New("cmi.remember: sensitivity must be public, internal, confidential or restricted")
+			}
+			if r.MaxChars == 0 {
+				r.MaxChars = 1500
+			}
+			if r.MaxChars < 1 || r.MaxChars > 8000 {
+				return nil, errors.New("cmi.remember: maxChars must be within [1, 8000]")
+			}
+			if r.Enabled {
+				a := &r.Auth
+				switch a.Mode {
+				case "":
+					return nil, errors.New("cmi.remember: auth (the writer identity) is required when enabled")
+				case "delegation":
+					if a.TokenEndpoint == "" || a.ClientID == "" {
+						return nil, errors.New("cmi.remember: delegation needs tokenEndpoint and clientId")
+					}
+					if a.ClientSecret, err = secret(a.ClientSecret, a.ClientSecretFile); err != nil {
+						return nil, fmt.Errorf("cmi.remember: %w", err)
+					}
+					if a.ClientSecret == "" {
+						return nil, errors.New("cmi.remember: delegation needs clientSecret[File]")
+					}
+				case "static":
+					if a.APIKey, err = secret(a.APIKey, a.APIKeyFile); err != nil {
+						return nil, fmt.Errorf("cmi.remember: %w", err)
+					}
+					if a.APIKey == "" {
+						return nil, errors.New("cmi.remember: static auth needs apiKey[File]")
+					}
+				default:
+					return nil, errors.New("cmi.remember: auth.mode must be delegation or static")
+				}
+			}
 		}
 	}
 	for i := range f.Gateways {

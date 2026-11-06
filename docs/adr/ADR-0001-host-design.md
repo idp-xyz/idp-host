@@ -227,3 +227,27 @@ idp-cmi（Context, Memory & Knowledge Infrastructure）M1 完成并发布契约 
 - 与真实 idp-cmi 进程的 compose 联调已在 idp-cmi 仓库完成（`HOST=1 bash deploy/e2e.sh`，idp-cmi ADR-0001 第 6 节，2026-11-04）：真实 HOST 运行的 `contextPackageId` 与事件摘要与 CMI 保存的包一致。委派模式对真实 Keycloak 未验证（static 模式已测）。
 - 只在创建时取一次；后续用户在同一线程追问要再创建运行才会取新上下文。
 - CMI 条目按 ContextPackage 的 excerpt 原样交给模型，HOST 不再按 sensitivity 过滤——这由 CMI 的 sensitivityCeiling 与策略负责。
+
+## 15. D33：运行结束后写回 CMI 的情景记忆（2026-11-06 决策与实施）
+
+D32 让运行"读"CMI；没有"写"，线程之外的后续运行就记不住这次对话。D33 补上写回：CMI 的上下文包里本来就有 `memory` 条目，HOST 只需在合适的时刻追加一条 episodic 记录（CMI ADR-0001 D3）。
+
+| # | 决策 | 理由 |
+|---|---|---|
+| D33 | **COMPLETED 之后追加一条情景记忆**。配置 `cmi.remember`（可选，缺省关闭）：`enabled`、`source`（CMI 已登记的来源名，缺省 `idp-host`）、`ttlDays`（缺省 30，1..3650）、`sensitivity`（缺省 internal）、`maxChars`（缺省 1500，1..8000，用户消息与回答各自按 rune 截断）、`auth`（**写入者**身份，需要 CMI 角色 `cmi-writer`，形态同 `cmi.auth`：static 或 delegation，启用时必填；static 的密钥文件每次写入重新读取，轮换后的令牌即时生效）。条件：运行所属发布件 `context.cmi = true`、运行以 COMPLETED 结束、有非空的最终助手文本（最后一条助手消息且不带工具调用）与非空的最后一条用户消息、运行有所有者 subject；子 agent 运行与评估运行不写。记录：`scope {subject, <运行所有者的 sub>}`、`kind episodic`、`content "User: …\nAssistant: …"`、标签 `conversation` 与 `agent-<名>`、`structured {runId, agent, threadId}`、`provenance {source, ref "run:<runId>", observedAt = 完成时间, recordedBy "idp-host"}`、`validity {validFrom, validUntil = 完成 + ttl}`、`sensitivity` 取自配置、status 省略（active）。`Idempotency-Key: host-run-<runId>`：重试与重放不会重复。写入在 `Store.Finish` 成功之后由独立 goroutine 完成（每次尝试 5 秒、最多 4 次、500 ms 起指数退避），不在运行的事务里，也不延后流的结束。5xx、429 与网络错误重试；其余 4xx（缺来源或角色的 403、422 等）不重试；200 重放与 409 视为成功。失败只记日志（运行号与结果，不含内容）并计入 `idp_host_memory_writes_total{outcome}`，**永远不改变运行**。 | 记忆的写入者是 HOST 这个有名有姓的、被登记的来源（可追溯、可按 `ref` 撤销、可被 CMI 的写入扫描与敏感度上限约束），而不是模型自己决定记什么：内容是不可信的用户文本与模型输出，由 CMI 在写入时扫描（D12），带注入标记的记录默认不进上下文包。写入者凭据与读取者凭据分开，读者不需要写权限，写者不需要读权限。放在终态之后是因为记忆是运行的副产品，不应成为运行成功的条件；幂等键以运行号为准，使租约丢失后的重放安全。 |
+
+**取舍与边界**
+- 这是**配置**，不是契约：运营方启用后，任何 `context.cmi = true` 的 agent 都会被记住。要让单个 agent 退出（或指定它自己的 TTL、敏感度），需要在 ContextPolicy 增字段，即改 `idp.telos.host` 契约，本决策不做。
+- 摘要而非全文：只记最后一轮的问与答，各截到 `maxChars`；不记工具调用与中间步骤。对话内容会进入 CMI，保留期与可见性由 `ttlDays`、`sensitivity` 与 CMI 的策略决定；运营方应把它当作个人数据处理（CMI 的 subject 作用域只对该成员可见，可按 `ref run:<id>` 撤销与擦除）。
+- 标签用 `agent-<名>` 而不是 `agent:<名>`：CMI 的标签语法是 `[a-z0-9][a-z0-9_.-]{0,63}`，不允许冒号，带冒号的标签会被 422 拒绝（对固定契约副本 1.4.0 的 MemoryRecord 校验已证实）。名字过长（超出 64 个字符）时不写这个标签，`structured.agent` 仍在。
+- delegation 的写入者身份：Worker 里没有成员的原始令牌，只有创建时为网关换来的、封存在运行上的凭据。delegation 模式因此用该存储凭据作为 `subject_token` 换取写入者受众的令牌；运行没有网关凭据时（无网关工具）无法交换，计为 `no_credential` 而不写。生产上建议用 static 写入者（专用的 cmi-writer 服务账号）。
+- 进程退出时仍在途的写入会丢失（计数不到）；下一次对同一运行的重放不会发生（运行已终态），所以这是有界的记忆缺口，不是一致性问题。
+
+**实施**：`internal/config`（`cmi.remember` 校验与缺省）、`internal/cmiclient/remember.go`（Build、Cut、Write：重试、结果分类）、`internal/harness`（`complete` 之后的 `remember`、`exchange` 判定条件）、`internal/worker` 指标 `idp_host_memory_writes_total{outcome}`、`cmd/idp-host` 装配。
+
+**验证**：单元——请求体对固定的 `idp.telos.cmi` 1.4.0 MemoryRecord 模式校验通过（并证明该模式会拒绝冒号标签、未知字段、空内容）；作用域、provenance、幂等键、validity、中文按 rune 截断；201/200/409 成功，5xx 重试 4 次后放弃，403/422/401 不重试，429 重试；static 密钥每次尝试重新读取；delegation 的 grant_type、subject_token、audience、actor_token；harness 层：失败、取消、无 `context.cmi`、关闭、无所有者、子 agent、评估、空回答或仅工具调用均不写，CMI 5xx/403 不改变 COMPLETED，写入不延后终态。配置校验：缺 auth、非法 ttl、非法 sensitivity、maxChars、source、未知键。
+
+**局限（不标 PASS）**
+- 未对真实 idp-cmi 进程与真实 Keycloak 做联调，也未扩展依赖 Docker/PostgreSQL 的集成场景；CMI 一侧的行为（角色、来源登记、标签语法）由其源码与固定契约副本核对。
+- 没有为同一线程的回合做合并或摘要；每个完成的运行一条记录，合并由 CMI 的整理（consolidation）负责。
+

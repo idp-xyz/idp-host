@@ -18,6 +18,7 @@ type Metrics struct {
 	runs     *observability.CounterVec
 	guards   *observability.CounterVec
 	Claims   *observability.CounterVec
+	memory   *observability.CounterVec
 }
 
 // NewMetrics registers the worker's instruments.
@@ -31,6 +32,7 @@ func NewMetrics(m *observability.Metrics) *Metrics {
 		runs:     m.Counter("idp_host_runs_finished_total", "Run turns by resulting status.", "status"),
 		guards:   m.Counter("idp_host_guard_events_total", "Content guard decisions by kind (input, output) and outcome.", "kind", "outcome"),
 		Claims:   m.Counter("idp_host_claims_total", "Claims by result (served, fenced).", "result"),
+		memory:   m.Counter("idp_host_memory_writes_total", "Memory records written to the CMI after completed runs, by outcome (written, replayed, rejected, failed, auth_failed, no_credential).", "outcome"),
 	}
 }
 
@@ -57,3 +59,6 @@ func (m *Metrics) RunFinished(status string) { m.runs.Inc(status) }
 
 // Guard implements harness.Metrics.
 func (m *Metrics) Guard(kind, outcome string) { m.guards.Inc(kind, outcome) }
+
+// MemoryWrite counts one remember attempt by outcome (ADR-0001 D33).
+func (m *Metrics) MemoryWrite(outcome string) { m.memory.Inc(outcome) }

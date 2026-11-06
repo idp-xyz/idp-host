@@ -66,7 +66,17 @@ cmi:   # optional (ADR-0001 D32): releases with context.cmi = true resolve a Con
   endpoint: https://cmi.example.com
   auth: {mode: delegation, tokenEndpoint: https://idp.example.com/realms/idp/protocol/openid-connect/token,
          clientId: idp-host, clientSecretFile: /run/secrets/host-client, audience: idp-cmi}
+  remember:   # optional (ADR-0001 D33): after a COMPLETED run of an agent with context.cmi = true, append one episodic memory to the CMI
+    enabled: true
+    source: idp-host        # the CMI source name, registered in the CMI first (default idp-host)
+    ttlDays: 30             # validUntil = completion + ttlDays (default 30, 1..3650)
+    sensitivity: internal   # public | internal | confidential | restricted (default internal)
+    maxChars: 1500          # the user message and the answer are each cut to this many characters (default 1500, 1..8000)
+    auth: {mode: static, apiKeyFile: /etc/idp/cmi-writer.key}   # the WRITER identity (CMI role cmi-writer); required when enabled; static | delegation, same shape as cmi.auth;
+                                                                # a static key file is read on every write, so a refreshed token is picked up
 ```
+
+`cmi.remember` 是纯配置：运营方打开后，**所有** `context.cmi = true` 的 agent 都会被记住（契约不变；按 agent 退出需要改契约，见 ADR D33）。写入在运行终态之后异步进行，失败只记日志并计入 `idp_host_memory_writes_total{outcome}`（written / replayed / rejected / failed / auth_failed / no_credential），绝不影响运行。
 
 ## 许可证
 
