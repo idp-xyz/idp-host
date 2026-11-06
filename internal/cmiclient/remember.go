@@ -105,7 +105,7 @@ func (r *Remember) Build(x Exchange) Record {
 	rec := Record{
 		Scope:       recScope{Kind: "subject", ID: x.Subject},
 		Kind:        "episodic",
-		Content:     "User: " + Cut(x.Message, n) + "\nAssistant: " + Cut(x.Answer, n),
+		Content:     "The user said: " + Cut(x.Message, n) + "\nThe assistant answered: " + Cut(x.Answer, n),
 		Structured:  map[string]string{"runId": x.RunID, "agent": x.Agent, "threadId": x.ThreadID},
 		Tags:        []string{"conversation"},
 		Provenance:  recProvenance{Source: r.Source, Ref: "run:" + x.RunID, ObservedAt: at.Format(time.RFC3339), RecordedBy: "idp-host"},

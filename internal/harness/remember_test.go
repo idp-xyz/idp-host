@@ -92,7 +92,7 @@ func TestRememberAfterACompletedRun(t *testing.T) {
 	if len(spy.bodies) != 1 || spy.auths[0] != "Bearer writer-key" || spy.idems[0] != "host-run-run_1" {
 		t.Fatalf("%+v", spy)
 	}
-	for _, want := range []string{`"scope":{"kind":"subject","id":"alice"}`, `"kind":"episodic"`, `User: 你好，世界\nAssistant: Echo: 你好，世界`, `"agent":"support"`, `"threadId":"thr_1"`, `"ref":"run:run_1"`, `"recordedBy":"idp-host"`} {
+	for _, want := range []string{`"scope":{"kind":"subject","id":"alice"}`, `"kind":"episodic"`, `The user said: 你好，世界\nThe assistant answered: Echo: 你好，世界`, `"agent":"support"`, `"threadId":"thr_1"`, `"ref":"run:run_1"`, `"recordedBy":"idp-host"`} {
 		if !strings.Contains(spy.bodies[0], want) {
 			t.Errorf("missing %s in %s", want, spy.bodies[0])
 		}

@@ -145,7 +145,7 @@ func TestRememberWritesTheRecord(t *testing.T) {
 	if got.Scope.Kind != "subject" || got.Scope.ID != "alice" || got.Kind != "episodic" || got.Sensitivity != "internal" || got.Status != nil {
 		t.Fatalf("%+v", got)
 	}
-	if got.Content != "User: what is the returns policy?\nAssistant: 30 days." {
+	if got.Content != "The user said: what is the returns policy?\nThe assistant answered: 30 days." {
 		t.Fatalf("content %q", got.Content)
 	}
 	if strings.Join(got.Tags, ",") != "conversation,agent-support" {
@@ -174,7 +174,7 @@ func TestRememberCutsOnRuneBoundaries(t *testing.T) {
 	}
 	var got struct{ Content string }
 	_ = json.Unmarshal(f.writes[0].body, &got)
-	if got.Content != "User: 你好世界和\nAssistant: 答案是四十" {
+	if got.Content != "The user said: 你好世界和\nThe assistant answered: 答案是四十" {
 		t.Fatalf("%q", got.Content)
 	}
 	validAsMemoryRecord(t, f.writes[0].body)
