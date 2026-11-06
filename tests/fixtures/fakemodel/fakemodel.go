@@ -40,6 +40,10 @@ type Message struct {
 // Script decides the answer from the conversation and the offered tool names.
 type Script func(messages []Message, tools []string) Turn
 
+// the workspace id idp-sandbox's sandbox_create answers with, and the code of a "run python:" request
+var workspaceRE = regexp.MustCompile(`workspace ([0-9a-f]{32}) created`)
+var sandboxCodeRE = regexp.MustCompile(`(?s)^run python:\s*(.+)$`)
+
 var additionRE = regexp.MustCompile(`(\d+)\s*\+\s*(\d+)`)
 
 // Server is the fake.
@@ -105,10 +109,23 @@ func DefaultScript(messages []Message, tools []string) Turn {
 	}
 	switch last.Role {
 	case "tool":
+		// the sandbox flow: after sandbox_create answers with a workspace id, run the user's code in it
+		if m := workspaceRE.FindStringSubmatch(last.Content); m != nil && has("sandbox_run") {
+			for i := len(messages) - 1; i >= 0; i-- {
+				if c := sandboxCodeRE.FindStringSubmatch(messages[i].Content); messages[i].Role == "user" && c != nil {
+					args, _ := json.Marshal(map[string]any{"workspaceId": m[1], "language": "python", "code": strings.TrimSpace(c[1])})
+					return Turn{Reasoning: "run it in the workspace", ToolCalls: []Call{{Name: toolName("sandbox_run"), Args: string(args)}}}
+				}
+			}
+		}
 		return Turn{Text: "Result: " + last.Content}
 	case "user":
 		if strings.HasPrefix(last.Content, "fail:") {
 			return Turn{Status: 500}
+		}
+		// "run python: <code>" with a sandbox offered: create a workspace first (answered by the case above)
+		if sandboxCodeRE.MatchString(last.Content) && has("sandbox_create") && has("sandbox_run") {
+			return Turn{Reasoning: "need a workspace", ToolCalls: []Call{{Name: toolName("sandbox_create"), Args: `{}`}}}
 		}
 		if strings.Contains(strings.ToLower(last.Content), "sum") && has("sum") {
 			return Turn{Reasoning: "need the tool", ToolCalls: []Call{{Name: toolName("sum"), Args: `{"a":1,"b":2}`}}}
