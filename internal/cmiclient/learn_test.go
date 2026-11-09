@@ -78,6 +78,7 @@ func TestLearnWritesFactsAndNeverShowsTheModelTheAnswer(t *testing.T) {
 	r := newLearner(t, p, f)
 	x := exchange()
 	x.Message, x.Answer = "我现在最喜欢红色，住在成都", "SECRET-ANSWER-TEXT"
+	x.At = time.Date(2026, 11, 6, 10, 0, 0, 123456000, time.UTC)
 	outs, err := r.Learn(context.Background(), x, nil)
 	if err != nil || strings.Join(outs, ",") != "fact_updated,fact_unchanged" {
 		t.Fatalf("%v %v", outs, err)
@@ -101,7 +102,7 @@ func TestLearnWritesFactsAndNeverShowsTheModelTheAnswer(t *testing.T) {
 	}
 	_ = json.Unmarshal(f.posts[0].body, &got)
 	if got.Key != "favourite_colour" || got.Value != "红色" || got.Kind != "semantic" || got.Scope.Kind != "subject" || got.Scope.ID != "alice" || got.Provenance["ref"] != "run:run_abc/fact/favourite_colour" ||
-		got.Validity["validFrom"] != "2026-11-06T10:00:00Z" || got.Validity["validUntil"] != "" || got.Sensitivity != "internal" {
+		got.Validity["validFrom"] != "2026-11-06T10:00:00.123456Z" || got.Validity["validUntil"] != "" || got.Sensitivity != "internal" {
 		t.Fatalf("%+v", got)
 	}
 	// the record part of the body is a valid MemoryRecord once key and value (the endpoint's own fields) are taken out

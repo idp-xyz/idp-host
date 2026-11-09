@@ -343,12 +343,13 @@ func (r *Remember) Learn(ctx context.Context, x Exchange, subjectToken func(cont
 		return []string{OutcomeNoFacts}, nil
 	}
 	at := x.At.UTC().Format(time.RFC3339)
+	from := x.At.UTC().Format(time.RFC3339Nano) // a fact's timeline is ordered by this: two statements in one second must not share it
 	var outcomes []string
 	var lastErr error
 	for _, f := range facts {
 		b := factBody{Key: f.Key, Value: f.Value, Scope: recScope{Kind: "subject", ID: x.Subject}, Kind: "semantic", Content: f.Statement,
 			Tags: []string{"fact", "conversation"}, Provenance: recProvenance{Source: r.Source, Ref: "run:" + x.RunID + "/fact/" + f.Key, ObservedAt: at, RecordedBy: "idp-host"}, Sensitivity: r.Sensitivity}
-		b.Validity.ValidFrom = at
+		b.Validity.ValidFrom = from
 		body, err := json.Marshal(b)
 		if err != nil {
 			outcomes = append(outcomes, OutcomeRejected)
