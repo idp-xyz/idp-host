@@ -347,7 +347,7 @@ func (r *Remember) Learn(ctx context.Context, x Exchange, subjectToken func(cont
 	var lastErr error
 	for _, f := range facts {
 		b := factBody{Key: f.Key, Value: f.Value, Scope: recScope{Kind: "subject", ID: x.Subject}, Kind: "semantic", Content: f.Statement,
-			Tags: []string{"fact", "conversation"}, Provenance: recProvenance{Source: r.Source, Ref: "run:" + x.RunID, ObservedAt: at, RecordedBy: "idp-host"}, Sensitivity: r.Sensitivity}
+			Tags: []string{"fact", "conversation"}, Provenance: recProvenance{Source: r.Source, Ref: "run:" + x.RunID + "/fact/" + f.Key, ObservedAt: at, RecordedBy: "idp-host"}, Sensitivity: r.Sensitivity}
 		b.Validity.ValidFrom = at
 		body, err := json.Marshal(b)
 		if err != nil {

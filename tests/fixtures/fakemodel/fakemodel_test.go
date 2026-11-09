@@ -28,3 +28,15 @@ func TestSandboxFlow(t *testing.T) {
 		t.Fatalf("%+v", got)
 	}
 }
+
+func TestDefaultScriptExtractsFactsFromTheUsersMessageOnly(t *testing.T) {
+	prompt := "KNOWN FACTS (key = value):\nfavourite_colour = red\n\nAt most 5 facts.\n\nUSER MESSAGE:\nActually my favourite colour is now Teal. I live in Chengdu."
+	turn := DefaultScript([]Message{{Role: "user", Content: prompt}}, nil)
+	want := `{"facts":[{"key":"favourite_colour","value":"teal","statement":"The user's favourite colour is teal"},{"key":"city","value":"chengdu","statement":"The user's city is chengdu"}]}`
+	if turn.Text != want {
+		t.Fatalf("%s", turn.Text)
+	}
+	if got := DefaultScript([]Message{{Role: "user", Content: "KNOWN FACTS (key = value):\nfavourite_colour = red\n\nUSER MESSAGE:\nhello"}}, nil).Text; got != `{"facts":[]}` {
+		t.Fatalf("%s", got)
+	}
+}

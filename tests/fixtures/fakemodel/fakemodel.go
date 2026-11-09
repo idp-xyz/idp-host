@@ -123,6 +123,10 @@ func DefaultScript(messages []Message, tools []string) Turn {
 		if strings.HasPrefix(last.Content, "fail:") {
 			return Turn{Status: 500}
 		}
+		// the HOST's fact extraction (D34): "KNOWN FACTS ...\n\nUSER MESSAGE:\n<text>" -> {"facts":[...]}
+		if strings.HasPrefix(last.Content, "KNOWN FACTS (key = value):") {
+			return Turn{Text: extractFacts(last.Content)}
+		}
 		// "run python: <code>" with a sandbox offered: create a workspace first (answered by the case above)
 		if sandboxCodeRE.MatchString(last.Content) && has("sandbox_create") && has("sandbox_run") {
 			return Turn{Reasoning: "need a workspace", ToolCalls: []Call{{Name: toolName("sandbox_create"), Args: `{}`}}}
@@ -557,4 +561,32 @@ func split(s string, n int) []string {
 		out = append(out, string(r[i:j]))
 	}
 	return out
+}
+
+var factPatterns = []struct {
+	re         *regexp.Regexp
+	key, label string
+}{
+	{regexp.MustCompile(`(?i)favou?rite colou?r (?:is|to) (?:now )?([A-Za-z]+)`), "favourite_colour", "favourite colour"},
+	{regexp.MustCompile(`(?i)favou?rite fruit is (?:now )?([A-Za-z]+)`), "favourite_fruit", "favourite fruit"},
+	{regexp.MustCompile(`(?i)\bI live in ([A-Za-z]+)`), "city", "city"},
+}
+
+// extractFacts is the double's fact extractor: the same JSON the HOST asks a real model for, read off a few English patterns in
+// the user's message (never from the known facts or the rest of the prompt).
+func extractFacts(prompt string) string {
+	_, msg, _ := strings.Cut(prompt, "USER MESSAGE:\n")
+	type fact struct {
+		Key       string `json:"key"`
+		Value     string `json:"value"`
+		Statement string `json:"statement"`
+	}
+	facts := []fact{}
+	for _, p := range factPatterns {
+		if m := p.re.FindStringSubmatch(msg); m != nil {
+			facts = append(facts, fact{p.key, strings.ToLower(m[1]), "The user's " + p.label + " is " + strings.ToLower(m[1])})
+		}
+	}
+	b, _ := json.Marshal(map[string]any{"facts": facts})
+	return string(b)
 }

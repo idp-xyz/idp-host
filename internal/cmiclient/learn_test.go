@@ -100,7 +100,7 @@ func TestLearnWritesFactsAndNeverShowsTheModelTheAnswer(t *testing.T) {
 		Sensitivity               string
 	}
 	_ = json.Unmarshal(f.posts[0].body, &got)
-	if got.Key != "favourite_colour" || got.Value != "红色" || got.Kind != "semantic" || got.Scope.Kind != "subject" || got.Scope.ID != "alice" || got.Provenance["ref"] != "run:run_abc" ||
+	if got.Key != "favourite_colour" || got.Value != "红色" || got.Kind != "semantic" || got.Scope.Kind != "subject" || got.Scope.ID != "alice" || got.Provenance["ref"] != "run:run_abc/fact/favourite_colour" ||
 		got.Validity["validFrom"] != "2026-11-06T10:00:00Z" || got.Validity["validUntil"] != "" || got.Sensitivity != "internal" {
 		t.Fatalf("%+v", got)
 	}
