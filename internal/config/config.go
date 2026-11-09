@@ -9,6 +9,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -44,6 +45,19 @@ type Remember struct {
 	Sensitivity string      `yaml:"sensitivity"` // public | internal | confidential | restricted; default internal
 	MaxChars    int         `yaml:"maxChars"`    // runes kept of the user message and of the answer, each; default 1500, 1..8000
 	Auth        GatewayAuth `yaml:"auth"`
+	// Mode is what a finished run writes (ADR D34): turns (default) = one episodic record per run; facts = the facts the
+	// user stated, extracted by a model and written through POST /v1/memory/facts (the assistant's answer is not stored);
+	// both = the two.
+	Mode  string         `yaml:"mode"`
+	Facts *RememberFacts `yaml:"facts"` // required for facts and both
+}
+
+// RememberFacts names the model that extracts facts from the user's message: a provider of this configuration.
+type RememberFacts struct {
+	Provider string        `yaml:"provider"`
+	Model    string        `yaml:"model"`
+	MaxFacts int           `yaml:"maxFacts"` // per message; default 5, 1..20
+	Timeout  time.Duration `yaml:"timeout"`  // default 20s
 }
 
 // A2APeer is the credential for remote agent cards under a URL prefix.
@@ -214,6 +228,26 @@ func Load(path string) (*File, error) {
 			}
 			if r.MaxChars < 1 || r.MaxChars > 8000 {
 				return nil, errors.New("cmi.remember: maxChars must be within [1, 8000]")
+			}
+			switch r.Mode {
+			case "", "turns":
+				r.Mode = "turns"
+			case "facts", "both":
+				f := r.Facts
+				if f == nil || f.Provider == "" || f.Model == "" {
+					return nil, errors.New("cmi.remember: mode " + r.Mode + " needs facts.provider and facts.model")
+				}
+				if f.MaxFacts == 0 {
+					f.MaxFacts = 5
+				}
+				if f.MaxFacts < 1 || f.MaxFacts > 20 {
+					return nil, errors.New("cmi.remember: facts.maxFacts must be within [1, 20]")
+				}
+				if f.Timeout == 0 {
+					f.Timeout = 20 * time.Second
+				}
+			default:
+				return nil, errors.New("cmi.remember: mode must be turns, facts or both")
 			}
 			if r.Enabled {
 				a := &r.Auth

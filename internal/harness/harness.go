@@ -683,12 +683,27 @@ func (h *Harness) remember(x cmiclient.Exchange, subject string) {
 		defer h.memWG.Done()
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		outcome, err := h.Remember.Write(ctx, x, func(context.Context) (string, error) { return subject, nil })
-		if m, ok := h.Metrics.(interface{ MemoryWrite(outcome string) }); ok {
-			m.MemoryWrite(outcome)
+		count := func(outcome string) {
+			if m, ok := h.Metrics.(interface{ MemoryWrite(outcome string) }); ok {
+				m.MemoryWrite(outcome)
+			}
 		}
-		if err != nil {
-			h.Log.Warn("memory not written", "run", x.RunID, "outcome", outcome, "error", sanitize(err))
+		token := func(context.Context) (string, error) { return subject, nil }
+		if h.Remember.Mode != "facts" { // turns (default) and both: the episodic record of the run (D33)
+			outcome, err := h.Remember.Write(ctx, x, token)
+			count(outcome)
+			if err != nil {
+				h.Log.Warn("memory not written", "run", x.RunID, "outcome", outcome, "error", sanitize(err))
+			}
+		}
+		if h.Remember.Mode == "facts" || h.Remember.Mode == "both" { // the facts the user stated (D34)
+			outcomes, err := h.Remember.Learn(ctx, x, token)
+			for _, o := range outcomes {
+				count(o)
+			}
+			if err != nil {
+				h.Log.Warn("facts not learned", "run", x.RunID, "outcomes", outcomes, "error", sanitize(err))
+			}
 		}
 	}()
 }

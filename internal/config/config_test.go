@@ -91,3 +91,31 @@ func TestRememberRejected(t *testing.T) {
 		})
 	}
 }
+
+func TestRememberMode(t *testing.T) {
+	base := cmiHead + "  remember:\n    enabled: true\n    auth: {mode: static, apiKey: w}\n"
+	for name, tc := range map[string]struct {
+		extra string
+		ok    bool
+	}{
+		"default":        {"", true},
+		"turns":          {"    mode: turns\n", true},
+		"facts":          {"    mode: facts\n    facts: {provider: local, model: m}\n", true},
+		"both":           {"    mode: both\n    facts: {provider: local, model: m, maxFacts: 3, timeout: 10s}\n", true},
+		"facts-no-model": {"    mode: facts\n", false},
+		"facts-no-name":  {"    mode: facts\n    facts: {provider: local}\n", false},
+		"too-many":       {"    mode: facts\n    facts: {provider: local, model: m, maxFacts: 99}\n", false},
+		"unknown":        {"    mode: all\n", false},
+	} {
+		f, err := load(t, base+tc.extra)
+		if (err == nil) != tc.ok {
+			t.Errorf("%s: %v", name, err)
+		}
+		if err == nil && name == "default" && f.CMI.Remember.Mode != "turns" {
+			t.Errorf("the default mode is turns: %q", f.CMI.Remember.Mode)
+		}
+		if err == nil && name == "both" && (f.CMI.Remember.Facts.MaxFacts != 3 || f.CMI.Remember.Facts.Timeout.Seconds() != 10) {
+			t.Errorf("%+v", f.CMI.Remember.Facts)
+		}
+	}
+}

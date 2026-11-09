@@ -14,6 +14,7 @@ import (
 	"idp-host/internal/agui"
 	"idp-host/internal/cmiclient"
 	"idp-host/internal/credential"
+	"idp-host/internal/memfacts"
 	"idp-host/internal/model"
 	"idp-host/internal/run"
 )
@@ -237,5 +238,71 @@ func TestRememberDelegationWithoutAStoredCredentialWritesNothing(t *testing.T) {
 	m := runRemembered(t, e, cmiAgent(), user("hello"), func(m *memStore) { m.cred = "" })
 	if m.status != run.StatusCompleted || len(spy.bodies) != 0 || len(mm.outcomes) != 1 || mm.outcomes[0] != cmiclient.OutcomeNoToken {
 		t.Fatalf("%s %v %v", m.status, spy.bodies, mm.outcomes)
+	}
+}
+
+type factModel struct{ answer string }
+
+func (factModel) Name() string { return "facts" }
+func (f factModel) Complete(context.Context, model.Request, func(model.Delta)) (*model.Response, error) {
+	r := &model.Response{}
+	r.Message.Content = f.answer
+	return r, nil
+}
+
+func factRememberer(c *cmiclient.Client, mode string) *cmiclient.Remember {
+	r := rememberer(c)
+	r.Mode = mode
+	r.Extractor = &memfacts.Extractor{Provider: factModel{`{"facts":[{"key":"favourite_colour","value":"青色","statement":"用户最喜欢的颜色是青色"}]}`}, Model: "m"}
+	return r
+}
+
+func TestRememberFactsModeStoresTheFactNotTheTurn(t *testing.T) {
+	e := setup(t)
+	spy, c := newCMISpy(t, 201)
+	mt := &countMetrics{}
+	e.h.Metrics = mt
+	e.h.Remember = factRememberer(c, "facts")
+	runRemembered(t, e, cmiAgent(), user("我最喜欢青色"), nil)
+	var posts []string
+	for _, b := range spy.bodies {
+		if b != "" {
+			posts = append(posts, b)
+		}
+	}
+	if len(posts) != 1 || !strings.Contains(posts[0], `"key":"favourite_colour"`) || strings.Contains(posts[0], "The assistant answered") || strings.Contains(posts[0], "Echo:") {
+		t.Fatalf("one fact, no turn and no answer: %v", posts)
+	}
+	if spy.idems[len(spy.idems)-1] != "host-fact-run_1-favourite_colour" || len(mt.outcomes) != 1 || mt.outcomes[0] != "fact_created" {
+		t.Fatalf("%v %v", spy.idems, mt.outcomes)
+	}
+}
+
+func TestRememberBothModeWritesTheTurnAndTheFact(t *testing.T) {
+	e := setup(t)
+	spy, c := newCMISpy(t, 201)
+	mt := &countMetrics{}
+	e.h.Metrics = mt
+	e.h.Remember = factRememberer(c, "both")
+	runRemembered(t, e, cmiAgent(), user("我最喜欢青色"), nil)
+	turn, fact := false, false
+	for _, b := range spy.bodies {
+		turn = turn || strings.Contains(b, "The user said:")
+		fact = fact || strings.Contains(b, `"key":"favourite_colour"`)
+	}
+	if !turn || !fact || len(mt.outcomes) != 2 {
+		t.Fatalf("turn %v fact %v outcomes %v", turn, fact, mt.outcomes)
+	}
+}
+
+func TestRememberFactsExtractionFailureNeverChangesTheRun(t *testing.T) {
+	e := setup(t)
+	_, c := newCMISpy(t, 201)
+	r := factRememberer(c, "facts")
+	r.Extractor = &memfacts.Extractor{Provider: factModel{"not json"}, Model: "m"}
+	e.h.Remember = r
+	m := runRemembered(t, e, cmiAgent(), user("hi"), nil)
+	if m.status != run.StatusCompleted {
+		t.Fatal(m.status)
 	}
 }

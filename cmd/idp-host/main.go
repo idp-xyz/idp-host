@@ -61,6 +61,7 @@ import (
 	"idp-host/internal/guard"
 	"idp-host/internal/harness"
 	"idp-host/internal/mcpclient"
+	"idp-host/internal/memfacts"
 	"idp-host/internal/model"
 	"idp-host/internal/observability"
 	"idp-host/internal/transport"
@@ -345,7 +346,14 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 	var remember *cmiclient.Remember
 	if c := cfg.CMI; c != nil && c.Remember != nil && c.Remember.Enabled { // ADR-0001 D33
 		r := c.Remember
-		remember = &cmiclient.Remember{Client: cmiClient, Source: r.Source, Sensitivity: r.Sensitivity, TTL: time.Duration(r.TTLDays) * 24 * time.Hour, MaxChars: r.MaxChars}
+		remember = &cmiclient.Remember{Client: cmiClient, Source: r.Source, Sensitivity: r.Sensitivity, TTL: time.Duration(r.TTLDays) * 24 * time.Hour, MaxChars: r.MaxChars, Mode: r.Mode}
+		if f := r.Facts; f != nil && (r.Mode == "facts" || r.Mode == "both") { // HOST ADR D34
+			p, ok := registry.Get(f.Provider)
+			if !ok {
+				return fmt.Errorf("cmi.remember.facts: provider %q is not a configured provider", f.Provider)
+			}
+			remember.Extractor = &memfacts.Extractor{Provider: p, Model: f.Model, MaxFacts: f.MaxFacts, Timeout: f.Timeout}
+		}
 		switch r.Auth.Mode {
 		case "static":
 			key, keyFile := r.Auth.APIKey, r.Auth.APIKeyFile

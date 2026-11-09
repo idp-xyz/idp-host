@@ -71,6 +71,18 @@ func validAsMemoryRecord(t *testing.T, body []byte) {
 	}
 }
 
+// validAsMemoryRecordMap validates an already decoded body (see validAsMemoryRecord).
+func validAsMemoryRecordMap(t *testing.T, m map[string]any) {
+	t.Helper()
+	inst, err := jsonschema.UnmarshalJSON(bytes.NewReader(mustJSON(m)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := memoryRecordSchema(t).Validate(inst); err != nil {
+		t.Fatalf("not a valid MemoryRecord: %v\n%s", err, mustJSON(m))
+	}
+}
+
 func mustJSON(v any) []byte { b, _ := json.Marshal(v); return b }
 
 type seenWrite struct {
