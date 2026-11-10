@@ -34,7 +34,7 @@ jobs:
         run: |
           bash deploy/build.sh idp-host:ci
           bash deploy/fixtures/build-fakemodel.sh idp-host-fakemodel:ci
-      - name: Image vulnerabilities (trivy; report only until the first results are reviewed)
-        run: docker run --rm -v /var/run/docker.sock:/var/run/docker.sock ghcr.io/aquasecurity/trivy:0.76.2 image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 0 idp-host:ci
+      - name: Image vulnerabilities (trivy, HIGH and CRITICAL with a fix fail the build)
+        run: docker run --rm -v /var/run/docker.sock:/var/run/docker.sock ghcr.io/aquasecurity/trivy:0.76.2 image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 idp-host:ci
       - name: Reference harness worker is executable
         run: python3 -I deploy/harness-worker/worker.py --help > /dev/null
