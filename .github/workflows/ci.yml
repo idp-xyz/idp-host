@@ -24,6 +24,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Known vulnerabilities in the dependencies and the standard library (govulncheck)
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest && "$(go env GOPATH)/bin/govulncheck" ./...
       - name: Formatting, vet, unit and contract tests
         run: make test
       - name: Integration tests (PostgreSQL in Docker)
