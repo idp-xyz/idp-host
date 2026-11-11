@@ -49,7 +49,12 @@ type Store struct {
 
 // Open connects as the service role and verifies that RLS applies to it.
 func Open(ctx context.Context, url string, box *credential.Box) (*Store, error) {
-	pool, err := pgxpool.New(ctx, url)
+	cfg, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		return nil, err
+	}
+	guardDial(&cfg.ConnConfig.Config) // a peer that vanished is noticed in seconds, not when TCP gives up
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
