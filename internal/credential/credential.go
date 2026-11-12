@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -91,10 +92,15 @@ func (e *Exchanger) Exchange(ctx context.Context, subjectToken, actorToken strin
 	return e.post(ctx, form)
 }
 
-// ClientCredentials obtains the HOST's own token (used as actor_token when the server requires it).
+// ClientCredentials obtains the HOST's own token: the actor_token of a delegation when the server
+// requires one, and the HOST's own credential for a downstream audience (D36). The audience is sent
+// for servers that take it there; Keycloak puts it in from the client's own mapper and ignores it.
 func (e *Exchanger) ClientCredentials(ctx context.Context) (*Token, error) {
 	form := url.Values{}
 	form.Set("grant_type", "client_credentials")
+	if e.Audience != "" {
+		form.Set("audience", e.Audience)
+	}
 	return e.post(ctx, form)
 }
 
@@ -140,4 +146,39 @@ func suffix(code string) string {
 		return ""
 	}
 	return ", " + code
+}
+
+// Service is the HOST's own credential for a downstream audience (ADR-0001 D36): a token of its client
+// identity, minted on first use and again before it expires. A credential configured once therefore does
+// not stop working - unlike a token handed to the HOST at deployment time, which outlives nothing but its
+// own lifetime. Safe for concurrent use.
+type Service struct {
+	Exchanger *Exchanger
+	// Leeway is how long before expiry a token is replaced; default 30s.
+	Leeway time.Duration
+	mu     sync.Mutex
+	tok    *Token
+}
+
+// Token returns a token that is valid now, minting one when there is none or the one held is close to
+// its expiry. A failure leaves the held token in place: the next call tries again.
+func (s *Service) Token(ctx context.Context) (string, error) {
+	if s == nil || s.Exchanger == nil {
+		return "", errors.New("no service credential configured")
+	}
+	leeway := s.Leeway
+	if leeway <= 0 {
+		leeway = 30 * time.Second
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.tok != nil && time.Until(s.tok.ExpiresAt) > leeway {
+		return s.tok.AccessToken, nil
+	}
+	tok, err := s.Exchanger.ClientCredentials(ctx)
+	if err != nil {
+		return "", err
+	}
+	s.tok = tok
+	return tok.AccessToken, nil
 }

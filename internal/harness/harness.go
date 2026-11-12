@@ -78,6 +78,9 @@ type Harness struct {
 	// only be reported or fail the run, not refreshed.
 	CMI    *cmiclient.Client
 	CMIKey string
+	// CMIToken is the HOST's own credential for the CMI, minted and refreshed by itself (D36); set
+	// instead of CMIKey, which is a token that stops working when it expires.
+	CMIToken func(context.Context) (string, error)
 	// Remember appends an episodic memory to the CMI when a run of a CMI-context agent completes
 	// (D33); nil disables. The write happens after the terminal transition and never affects the run.
 	Remember *cmiclient.Remember
@@ -997,12 +1000,29 @@ func (t *turn) guardOutput(resp *model.Response) error {
 // package is reported (continue), replaced by a fresh resolve (refresh, static credential only) or
 // fails the run (fail), as the release's context.onStale says. A CMI that cannot answer is reported
 // and the step proceeds; the package it drew on was valid when the run started.
+// cmiKey is the HOST's own CMI credential: minted on demand when it is configured that way (D36), the
+// static key otherwise, and "" when it cannot be obtained (the caller then skips what needs it).
+func (h *Harness) cmiKey(ctx context.Context) string {
+	if h.CMIToken == nil {
+		return h.CMIKey
+	}
+	tok, err := h.CMIToken(ctx)
+	if err != nil {
+		return ""
+	}
+	return tok
+}
+
 func (t *turn) verifyContext() (bool, error) {
 	pkgID := t.rc.Run.ContextPackageID
-	if pkgID == "" || t.h.CMI == nil || t.h.CMIKey == "" || t.contextVerified {
+	if pkgID == "" || t.h.CMI == nil || t.contextVerified {
 		return false, nil
 	}
-	v, err := t.h.CMI.Verify(t.ctx, t.h.CMIKey, pkgID)
+	key := t.h.cmiKey(t.ctx)
+	if key == "" {
+		return false, nil
+	}
+	v, err := t.h.CMI.Verify(t.ctx, key, pkgID)
 	if err != nil {
 		t.contextVerified = true // once per run; the CMI is not asked again
 		return false, t.h.Store.AppendEvents(t.ctx, t.claim, []agui.Event{agui.Custom(agui.CustomContextStale, map[string]any{"packageId": pkgID, "verified": false, "reason": sanitize(err)})})
@@ -1036,7 +1056,7 @@ func (t *turn) verifyContext() (bool, error) {
 				Kind string `json:"kind"`
 				ID   string `json:"id,omitempty"`
 			}{Kind: "thread", ID: t.rc.Run.ThreadID}
-			if pkg, err := t.h.CMI.Resolve(t.ctx, t.h.CMIKey, req); err == nil {
+			if pkg, err := t.h.CMI.Resolve(t.ctx, key, req); err == nil {
 				kept := t.rc.Run.Input.Context[:0:0]
 				for _, c := range t.rc.Run.Input.Context {
 					if !strings.HasPrefix(c.Description, "CMI ") {

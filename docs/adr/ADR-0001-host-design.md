@@ -279,3 +279,17 @@ D32 让运行"读"CMI；没有"写"，线程之外的后续运行就记不住这
 **验证**：单元（`make test`，-race）新增两项：缺省确认时限下过期时间等于运行期限、中断的 `expiresAt` 相同，确认时限短于剩余时间时保留自己的过期时间；期限前已确认、期限后才认领的运行以 `RUN_TIMEOUT` 失败，工具没有被调用，调用保持 CONFIRMED。集成（真实 PostgreSQL 17，`make test-integration`，21/21）新增 confirmation-and-deadline：工具调用的 `confirmationExpiresAt` 等于运行的 `deadlineAt`，中断的 `expiresAt` 相同；期限之后确认得到 409 `the run exceeded its time limit`，调用仍待确认；清理过期请求、运行以 `RUN_TIMEOUT` 失败，echo 没有被调用；期限前确认、期限后认领同样失败且不调用。把三个生产文件恢复为修改前的版本，这三项测试都失败：过期时间是请求时刻加 900 秒；期限后才认领的运行先调用了 echo（结果 hi）再以 `RUN_TIMEOUT` 失败。
 
 **局限（不标 PASS）**：没有在 compose 或 kind 的整平台上重放 idp-workspace 的两个复现场景。
+
+## 18. D36：HOST 自己签发并续签对下游的凭据（2026-11-12 决策与实施）
+
+起因（平台实测发现）：kind 上的平台部署满一小时后，助手就不再记住用户说过的话——界面一切正常（模型照常回答"好的，我记住了"），只有 HOST 的日志里一行 `memory not written … cmi answered HTTP 401`。原因是 `cmi.remember.auth` 只有 `delegation`（换调用者的令牌，但成员没有 `cmi-writer`）和 `static`（从文件读一个固定值）两种模式，于是部署脚本只能**在部署时取一个访问令牌塞进 Secret**；Keycloak 给它一小时寿命，过期后记忆静默失效。平台验收在部署后几分钟内跑完，永远在有效期内，所以从未暴露。
+
+| # | 决策 | 理由 |
+|---|---|---|
+| D36 | **`auth.mode` 增加 `client_credentials`**：HOST 用自己的客户端身份（`tokenEndpoint`、`clientId`、`clientSecret[File]`、`audience`）向授权服务器取面向下游受众的令牌，首次使用时签发，并在过期前（缺省 30 秒）自动换新；`credential.Service` 持有它，并发安全，签发失败时保留手上的令牌、下次再试。`cmi.auth` 与 `cmi.remember.auth` 都接受这种模式 | 服务自己的身份就该由服务自己去取：配置一次（一个客户端密钥）之后不再过期。机制本就存在——调用 idp-mcp 网关时作为 `actor_token` 的那一份就是这么签发和缓存的，只是 CMI 这条路没接上。`ClientCredentials` 同时带上 `audience`（Keycloak 由客户端映射器决定受众并忽略该参数，其他授权服务器需要它） |
+
+**实施**：`internal/credential`（`Service`，以及 `ClientCredentials` 带上 `audience`）、`internal/config`（两处校验与错误文案）、`cmd/idp-host`（`serviceCredential`，写入路径接 `remember.Key`，读取路径接新增的 `CMIToken`）、`internal/api` 与 `internal/harness`（`CMIToken` 优先于 `CMIKey`，取不到令牌时按"没有凭据"处理而不是用一个空值去调）。
+
+**验证**：单元（`internal/credential`：有效期内只签发一次、临近过期自动换新、寿命 1 秒的令牌连续三次调用都拿到可用的、20 个并发调用只签发一次、被拒绝后下次仍能恢复、没有配置时报错；`internal/config`：读写两处的合法写法与四种缺字段的拒绝）；整平台（idp-telos-go `deploy/compose/e2e.sh`，PATH A–I 全过，其中 PATH E 写入记忆、PATH G 抽取事实都走这条新凭据）。
+
+**局限（不标 PASS）**：没有在验收里跑满一小时去证明"过期后仍然工作"——那一点由单元测试（1 秒寿命的令牌）保证，验收只保证新路径本身可用；另外读取路径在 kind 上仍用 `delegation`（有意：按成员身份读，取回的才是他自己的记忆），`client_credentials` 的读取只在单元测试覆盖。

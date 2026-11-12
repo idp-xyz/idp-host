@@ -55,6 +55,53 @@ func TestRememberExplicitAndDelegation(t *testing.T) {
 	}
 }
 
+// D36: the HOST's own credential for the CMI, which it mints and refreshes - so that a credential
+// configured once keeps working, unlike a token handed over at deployment time.
+func TestClientCredentialsForTheCMIAndTheWriter(t *testing.T) {
+	secretFile := filepath.Join(t.TempDir(), "svc.secret")
+	if err := os.WriteFile(secretFile, []byte("svc-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := load(t, `
+cmi:
+  endpoint: http://cmi:8550
+  auth: {mode: client_credentials, tokenEndpoint: "https://kc/token", clientId: idp-host-svc, clientSecretFile: `+secretFile+`, audience: idp-cmi}
+  remember:
+    enabled: true
+    auth: {mode: client_credentials, tokenEndpoint: "https://kc/token", clientId: idp-host-svc, clientSecret: s, audience: idp-cmi}
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.CMI.Auth.Mode != "client_credentials" || f.CMI.Auth.ClientSecret != "svc-secret" || f.CMI.Auth.Audience != "idp-cmi" {
+		t.Fatalf("%+v", f.CMI.Auth)
+	}
+	if r := f.CMI.Remember.Auth; r.Mode != "client_credentials" || r.ClientID != "idp-host-svc" || r.ClientSecret != "s" || r.Audience != "idp-cmi" {
+		t.Fatalf("%+v", r)
+	}
+}
+
+func TestClientCredentialsRejected(t *testing.T) {
+	head := "\ncmi:\n  endpoint: http://cmi:8550\n  auth: "
+	cases := map[string]struct{ body, want string }{
+		"no endpoint": {"{mode: client_credentials, clientId: c, clientSecret: s, audience: a}", "tokenEndpoint"},
+		"no clientId": {"{mode: client_credentials, tokenEndpoint: \"https://kc\", clientSecret: s, audience: a}", "clientId"},
+		"no audience": {"{mode: client_credentials, tokenEndpoint: \"https://kc\", clientId: c, clientSecret: s}", "audience"},
+		"no secret":   {"{mode: client_credentials, tokenEndpoint: \"https://kc\", clientId: c, audience: a}", "clientSecret"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := load(t, head+c.body+"\n"); err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("got %v, want %q", err, c.want)
+			}
+		})
+	}
+	// and the same for the writer
+	if _, err := load(t, cmiHead+"  remember:\n    enabled: true\n    auth: {mode: client_credentials, clientId: c, clientSecret: s, audience: a}\n"); err == nil || !strings.Contains(err.Error(), "tokenEndpoint") {
+		t.Fatalf("writer: %v", err)
+	}
+}
+
 func TestRememberAbsentOrDisabledNeedsNoAuth(t *testing.T) {
 	if f, err := load(t, cmiHead); err != nil || f.CMI.Remember != nil {
 		t.Fatal(err)

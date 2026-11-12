@@ -154,6 +154,18 @@ func profile() identity.Profile {
 }
 
 // serve runs the process: the API with a worker pool (apiEnabled), or the worker pool alone.
+// serviceCredential is the HOST's own credential for a downstream audience, minted and refreshed by
+// itself (ADR-0001 D36): a credential configured once keeps working, unlike a token handed over at
+// deployment time, which stops working when that token expires.
+func serviceCredential(a config.GatewayAuth) (*credential.Service, error) {
+	tokenTLS, err := transport.ClientTLS(a.CAFile, "", "")
+	if err != nil {
+		return nil, err
+	}
+	return &credential.Service{Exchanger: &credential.Exchanger{TokenEndpoint: a.TokenEndpoint, ClientID: a.ClientID, ClientSecret: a.ClientSecret, Audience: a.Audience,
+		HTTP: &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil, TLSClientConfig: tokenTLS}}}}, nil
+}
+
 func serve(log *slog.Logger, apiEnabled bool) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -320,6 +332,7 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 
 	var cmiClient *cmiclient.Client
 	var cmiKey string
+	var cmiToken func(context.Context) (string, error)
 	var cmiAuth api.GatewayAuth
 	if c := cfg.CMI; c != nil { // ADR-0001 D32
 		endpoint, err := mcpclient.CheckEndpoint(c.Endpoint)
@@ -334,6 +347,12 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 		switch c.Auth.Mode {
 		case "static":
 			cmiKey = c.Auth.APIKey
+		case "client_credentials":
+			svc, err := serviceCredential(c.Auth)
+			if err != nil {
+				return fmt.Errorf("cmi: %w", err)
+			}
+			cmiToken = svc.Token
 		case "delegation":
 			tokenTLS, err := transport.ClientTLS(c.Auth.CAFile, "", "")
 			if err != nil {
@@ -355,6 +374,12 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 			remember.Extractor = &memfacts.Extractor{Provider: p, Model: f.Model, MaxFacts: f.MaxFacts, Timeout: f.Timeout}
 		}
 		switch r.Auth.Mode {
+		case "client_credentials":
+			svc, err := serviceCredential(r.Auth)
+			if err != nil {
+				return fmt.Errorf("cmi.remember: %w", err)
+			}
+			remember.Key = func() (string, error) { return svc.Token(context.Background()) }
 		case "static":
 			key, keyFile := r.Auth.APIKey, r.Auth.APIKeyFile
 			remember.Key = func() (string, error) { // the file is read per write: a refreshed token is picked up
@@ -391,7 +416,7 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 	wctx, cancelWorkers := context.WithCancel(ctx)
 	defer cancelWorkers()
 	if workers > 0 {
-		h := &harness.Harness{Store: store, Providers: registry, Gateways: gateways, Classifiers: classifiers, A2A: a2aClient, CMI: cmiClient, CMIKey: cmiKey, Remember: remember, Metrics: worker.NewMetrics(metrics), Log: log}
+		h := &harness.Harness{Store: store, Providers: registry, Gateways: gateways, Classifiers: classifiers, A2A: a2aClient, CMI: cmiClient, CMIKey: cmiKey, CMIToken: cmiToken, Remember: remember, Metrics: worker.NewMetrics(metrics), Log: log}
 		w := &worker.Worker{ID: env("IDP_HOST_INSTANCE", hostname), Store: store, Harness: h, Concurrency: workers, Lease: lease, Log: log}
 		wg.Add(1)
 		go func() {
@@ -406,7 +431,7 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 		wg.Wait()
 		return nil
 	}
-	srvAPI := &api.API{Store: store, Auth: verifier, Gateways: gatewayAuth, Providers: registry.Names(), Log: log, Metrics: metrics, Version: version, CMI: cmiClient, CMIKey: cmiKey, CMIAuth: cmiAuth}
+	srvAPI := &api.API{Store: store, Auth: verifier, Gateways: gatewayAuth, Providers: registry.Names(), Log: log, Metrics: metrics, Version: version, CMI: cmiClient, CMIKey: cmiKey, CMIToken: cmiToken, CMIAuth: cmiAuth}
 	srv := &http.Server{Addr: env("IDP_HOST_LISTEN", "127.0.0.1:8450"), Handler: observability.HTTPMiddleware(tp, "idp-host/api", srvAPI.Handler()),
 		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 0, IdleTimeout: 120 * time.Second}
 	if cert := env("IDP_HOST_TLS_CERT_FILE", ""); cert != "" {

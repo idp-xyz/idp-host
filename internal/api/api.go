@@ -53,9 +53,12 @@ type API struct {
 	CMI     *cmiclient.Client
 	CMIAuth GatewayAuth // how the HOST obtains the caller's CMI credential; APIKey when static
 	CMIKey  string
-	Log     *slog.Logger
-	Metrics *observability.Metrics
-	Version string
+	// CMIToken is the HOST's own credential for the CMI, minted and refreshed by itself (D36); set
+	// instead of CMIKey, which is a token that stops working when it expires.
+	CMIToken func(context.Context) (string, error)
+	Log      *slog.Logger
+	Metrics  *observability.Metrics
+	Version  string
 
 	// StreamPoll is how often the event stream polls the store (default 150 ms).
 	StreamPoll time.Duration
@@ -641,6 +644,13 @@ func (a *API) resolveContext(r *http.Request, p authorization.Principal, doc *ag
 		query = query[:4096]
 	}
 	bearer := a.CMIKey
+	if a.CMIToken != nil {
+		tok, err := a.CMIToken(r.Context())
+		if err != nil {
+			return skip("the HOST's own CMI credential could not be obtained", err)
+		}
+		bearer = tok
+	}
 	if a.CMIAuth.Exchanger != nil {
 		tok, _ := identity.Bearer(r)
 		cred, err := a.delegate(r.Context(), a.CMIAuth, tok)

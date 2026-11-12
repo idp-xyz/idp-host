@@ -105,7 +105,7 @@ type Gateway struct {
 
 // GatewayAuth is how the HOST authenticates to the gateway on the user's behalf.
 type GatewayAuth struct {
-	Mode             string `yaml:"mode"` // delegation | static
+	Mode             string `yaml:"mode"` // delegation | static | client_credentials
 	TokenEndpoint    string `yaml:"tokenEndpoint"`
 	ClientID         string `yaml:"clientId"`
 	ClientSecret     string `yaml:"clientSecret"`
@@ -192,6 +192,16 @@ func Load(path string) (*File, error) {
 			if c.Auth.ClientSecret == "" {
 				return nil, errors.New("cmi: delegation needs clientSecret[File]")
 			}
+		case "client_credentials":
+			if c.Auth.TokenEndpoint == "" || c.Auth.ClientID == "" || c.Auth.Audience == "" {
+				return nil, errors.New("cmi: client_credentials needs tokenEndpoint, clientId and audience")
+			}
+			if c.Auth.ClientSecret, err = secret(c.Auth.ClientSecret, c.Auth.ClientSecretFile); err != nil {
+				return nil, fmt.Errorf("cmi: %w", err)
+			}
+			if c.Auth.ClientSecret == "" {
+				return nil, errors.New("cmi: client_credentials needs clientSecret[File]")
+			}
 		case "static":
 			if c.Auth.APIKey, err = secret(c.Auth.APIKey, c.Auth.APIKeyFile); err != nil {
 				return nil, fmt.Errorf("cmi: %w", err)
@@ -200,7 +210,7 @@ func Load(path string) (*File, error) {
 				return nil, errors.New("cmi: static auth needs apiKey[File]")
 			}
 		default:
-			return nil, errors.New("cmi: auth.mode must be delegation or static")
+			return nil, errors.New("cmi: auth.mode must be delegation, client_credentials or static")
 		}
 		if r := c.Remember; r != nil {
 			if r.Source == "" {
@@ -264,6 +274,16 @@ func Load(path string) (*File, error) {
 					if a.ClientSecret == "" {
 						return nil, errors.New("cmi.remember: delegation needs clientSecret[File]")
 					}
+				case "client_credentials":
+					if a.TokenEndpoint == "" || a.ClientID == "" || a.Audience == "" {
+						return nil, errors.New("cmi.remember: client_credentials needs tokenEndpoint, clientId and audience")
+					}
+					if a.ClientSecret, err = secret(a.ClientSecret, a.ClientSecretFile); err != nil {
+						return nil, fmt.Errorf("cmi.remember: %w", err)
+					}
+					if a.ClientSecret == "" {
+						return nil, errors.New("cmi.remember: client_credentials needs clientSecret[File]")
+					}
 				case "static":
 					if a.APIKey, err = secret(a.APIKey, a.APIKeyFile); err != nil {
 						return nil, fmt.Errorf("cmi.remember: %w", err)
@@ -272,7 +292,7 @@ func Load(path string) (*File, error) {
 						return nil, errors.New("cmi.remember: static auth needs apiKey[File]")
 					}
 				default:
-					return nil, errors.New("cmi.remember: auth.mode must be delegation or static")
+					return nil, errors.New("cmi.remember: auth.mode must be delegation, client_credentials or static")
 				}
 			}
 		}
