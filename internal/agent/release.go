@@ -92,7 +92,7 @@ type Definition struct {
 type ContextPolicy struct {
 	CMI       bool     `json:"cmi,omitempty"`
 	Purpose   string   `json:"purpose,omitempty"`
-	MaxTokens int      `json:"maxTokens,omitempty"` // CMI budget (default 2000, at most 32000)
+	MaxTokens int      `json:"maxTokens,omitempty"` // CMI budget (0 = the CMI's default: 3000 since CMI ADR-0001 D46, 2000 before; at most 32000)
 	MaxItems  int      `json:"maxItems,omitempty"`  // CMI budget (default 20, at most 100)
 	Kinds     []string `json:"kinds,omitempty"`     // memory | knowledge (empty = both)
 	Sources   []string `json:"sources,omitempty"`   // knowledge sources (empty = all visible)
