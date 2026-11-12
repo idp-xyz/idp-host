@@ -387,6 +387,67 @@ func TestConfirmationThenConfirmOrReject(t *testing.T) {
 	}
 }
 
+func TestConfirmationExpiresWithTheRun(t *testing.T) {
+	// D35: the default confirmation timeout (900 s) outlives a run with a minute left; the request expires with the run
+	e := setup(t)
+	m := newMem(def(), user("echo this"), run.Input{})
+	e.h.Store = m
+	if err := e.h.Run(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	var pending *run.ToolCall
+	for _, c := range m.calls {
+		pending = c
+	}
+	deadline := m.rc.Run.DeadlineAt
+	interrupt := m.events[len(m.events)-1]["outcome"].(map[string]any)["interrupts"].([]map[string]any)[0]
+	if !pending.ConfirmationExpiresAt.Equal(deadline) || interrupt["expiresAt"] != deadline.UTC().Format(time.RFC3339) {
+		t.Fatalf("expires %s (interrupt %v), deadline %s", pending.ConfirmationExpiresAt, interrupt["expiresAt"], deadline)
+	}
+	// a confirmation timeout shorter than the time left keeps its own expiry
+	d := def()
+	d.Limits.ConfirmationTimeoutSeconds = 30
+	e = setup(t)
+	m = newMem(d, user("echo this"), run.Input{})
+	e.h.Store = m
+	start := time.Now()
+	if err := e.h.Run(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range m.calls {
+		pending = c
+	}
+	if exp := pending.ConfirmationExpiresAt; exp.Before(start.Add(30*time.Second)) || !exp.Before(m.rc.Run.DeadlineAt) {
+		t.Fatalf("expires %s, deadline %s", exp, m.rc.Run.DeadlineAt)
+	}
+}
+
+func TestNothingRunsAfterTheDeadline(t *testing.T) {
+	// D35: the owner confirmed, but the run is claimed after its deadline: the tool is not called
+	e := setup(t)
+	m := newMem(def(), user("echo this"), run.Input{})
+	e.h.Store = m
+	if err := e.h.Run(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	var pending *run.ToolCall
+	for _, c := range m.calls {
+		pending = c
+	}
+	pending.State = run.CallConfirmed
+	m.status, m.rc.Run.Status = run.StatusRunning, run.StatusRunning
+	m.rc.Run.DeadlineAt = time.Now().Add(-time.Second)
+	err := e.h.Run(context.Background(), claim)
+	var f *run.Failure
+	if !errors.As(err, &f) || f.Code != run.FailTimeout || m.status != run.StatusFailed || m.failCode != run.FailTimeout ||
+		len(e.mcp.Calls()) != 0 || pending.State != run.CallConfirmed {
+		t.Fatalf("%v %s %s calls %v %+v", err, m.status, m.failCode, e.mcp.Calls(), pending)
+	}
+	if types := m.types(); types[len(types)-1] != "RUN_ERROR" {
+		t.Fatal(types)
+	}
+}
+
 func TestDeniedToolAndStepLimit(t *testing.T) {
 	e := setup(t)
 	e.model.Script = func(msgs []fakemodel.Message, tools []string) fakemodel.Turn {

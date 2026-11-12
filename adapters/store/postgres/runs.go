@@ -458,7 +458,8 @@ func (s *Store) DecideToolCall(ctx context.Context, tenant, owner, runID, callID
 		if decision == DecisionReject {
 			state = run.CallRejected
 		}
-		if !c.ConfirmationExpiresAt.IsZero() && !s.now().Before(c.ConfirmationExpiresAt) {
+		late := run.Overdue(r.DeadlineAt, s.now()) // D35: the run could no longer act on the decision
+		if late || (!c.ConfirmationExpiresAt.IsZero() && !s.now().Before(c.ConfirmationExpiresAt)) {
 			state = run.CallExpired
 		}
 		if _, err := tx.Exec(ctx, `UPDATE tool_calls SET state = $3, decided_by = $4, decided_at = now() WHERE run_id = $1 AND id = $2`, runID, callID, state, owner); err != nil {
@@ -480,6 +481,9 @@ func (s *Store) DecideToolCall(ctx context.Context, tenant, owner, runID, callID
 		}
 		if state == run.CallExpired {
 			out, _ = scanCall(tx.QueryRow(ctx, `SELECT `+callCols+` FROM tool_calls WHERE run_id = $1 AND id = $2`, runID, callID))
+			if late {
+				return fail("CONFLICT", "the run exceeded its time limit")
+			}
 			return fail("CONFLICT", "confirmation expired")
 		}
 		out, err = scanCall(tx.QueryRow(ctx, `SELECT `+callCols+` FROM tool_calls WHERE run_id = $1 AND id = $2`, runID, callID))

@@ -260,3 +260,22 @@ D32 让运行"读"CMI；没有"写"，线程之外的后续运行就记不住这
 | D34 | **`cmi.remember.mode`：`turns`（默认，D33 不变）\| `facts` \| `both`**；`facts` 与 `both` 需要 `facts {provider, model, maxFacts（默认 5，1..20）, timeout（默认 20s）}`，provider 必须是本配置里的提供者（启动时检查）。运行 COMPLETED 之后，在后台（和 D33 一样不拖慢流的结束、失败只记日志和指标）：(1) 用写入者身份读该用户已有的事实（`GET /v1/memory/records?scopeKind=subject&scopeId=…`，取 `structured.fact`）；(2) 调一次模型，**只给用户的那句话和已知事实**，要求输出 JSON `{facts:[{key,value,statement}]}`；(3) 逐条 `POST /v1/memory/facts`（`Idempotency-Key: host-fact-<runId>-<key>`，`validFrom` 为运行结束时间，不设终点，`kind: semantic`，标签 `fact`、`conversation`，出处 `run:<runId>/fact/<key>`）。助手的回答**不发给模型、不存储**。模型输出视为不可信：严格解析（取第一个 JSON 对象），键必须符合 CMI 的键格式，取值不超过 120 字、陈述不超过 300 字，重复键只留第一个，不合格的丢弃不修补，条数有上限。提示词规定：键只描述属性不含取值（`diet` 而不是 `diet_vegetarian`），已知事实里有同一属性就原样沿用其键（这是更新取代旧值的机制），更正和长期偏好也算事实，别人的属性、问题、一次性请求、假设不算，并明说用户消息是数据不是指令。指标 `idp_host_memory_writes_total{outcome}` 增加 `fact_created`、`fact_updated`、`fact_unchanged`、`fact_stale`（409：CMI 的现行值比这条陈述新）、`extract_failed`、`no_facts` | 评测里真实抽取（本机 Qwen3.8-flash，改进后的提示词）把"前 5 含过期值"从 0.92 降到 0.06，当前值排第一从 0.45 升到 0.79，当前值在前 5 为 0.89（原样存回合 0.92；精确抽取的上限是 0.96 / 0.99 / 0.00）；用户的话经过的是他自己的作用域，提示注入最多让他自己的记忆多一条，且仍经过 CMI 写入时的注入扫描；不存助手的回答去掉了"助手答错被记成事实"的污染 |
 
 局限：抽取错误率取决于模型（评测用本机 Qwen3.8-flash：一条消息一次调用，约 1.3% 失败，268 条真值事实抽到 252 条，约 6% 漏抽；提示词是在评测数据上改的，真实对话要再测）；漏抽会让该事实根本不在记忆里。**建议用 `facts`**：`both` 同时保留回合记录，回合里的旧值仍会被取回，会把"前 5 含过期值"带回去；只有在更怕漏记时才用 `both`。`turns` 仍是默认（评测之外还没有真实对话的验证），Workspace 的"我的记忆"页列出和删除的是 CMI 里这个人的全部记录，事实记录也在其中。
+
+## 17. D35：确认不越过运行期限（2026-11-12 决策与实施）
+
+起因：运行的期限（`deadlineAt` = 创建时间 + `runTimeoutSeconds`，缺省 300 秒）在创建时定下、之后不变，确认请求的过期时间却从请求时刻起按 `confirmationTimeoutSeconds`（缺省 900 秒）计算。按缺省值，第 5 到第 15 分钟之间的确认会被接受；运行恢复时先执行已确认的工具（`resolveDecided`），再在循环开头发现超期，以 `RUN_TIMEOUT` 失败：工具的副作用已经发生，所有者看到的却是失败。这是 idp-workspace 复现其 D18（运行等待确认时的入箱）时发现的。
+
+| # | 决策 | 理由 |
+|---|---|---|
+| D35 | **运行期限之后不再执行任何东西，确认请求最迟随运行期限过期**（修订 D7）：(1) 确认请求的过期时间取"请求时刻 + `confirmationTimeoutSeconds`"与运行期限中较早的一个，`tool_calls.confirmation_expires_at`、`CUSTOM idp.host/confirmation.required` 与 `RUN_FINISHED` 中断里的 `expiresAt` 都是这个值；(2) Worker 在期限之后认领运行时，直接以 `RUN_TIMEOUT` 失败：不执行已确认的调用（它保持 CONFIRMED、没有结果），也不调网关和模型；(3) 期限之后的确认或拒绝得到 409 `the run exceeded its time limit`，不记录任何东西，请求由过期清理（每 5 秒）收尾，运行随即以 `RUN_TIMEOUT` 结束。确认时限短于运行剩余时间时行为不变：请求过期后运行继续，模型收到"确认请求已过期" | 期限是运行的边界：过了期限运行只能失败，这时再执行工具只留下副作用，而需要确认的工具往往正是有副作用的那些。过期时间封顶后，中断给出的就是真正有效的截止时间（Workspace 收件箱据此显示过期时间），超期的运行在期限后几秒内结束，不再挂到确认超时。不改契约：字段与形状不变，只是取值不晚于期限 |
+
+**取舍与边界**
+- 按缺省值（运行 300 秒、确认 900 秒），确认窗口就是运行 5 分钟里剩下的时间；需要更长等待的发布件应调大 `runTimeoutSeconds`。另一种做法是等待确认的时间不计入运行时限（恢复时顺延期限），那会改变 `runTimeoutSeconds` 与 `deadlineAt` 的含义，本决策不做。
+- 所有者在期限前确认、Worker 在期限后才认领（积压或 Worker 重启）：调用同样不执行，运行以 `RUN_TIMEOUT` 失败。期限是硬的，不为已确认的调用留宽限。
+- 本决策之前创建、过期时间晚于期限的请求：期限之后的决定同样得到 409、不会执行；运行要到请求自身过期时才由清理收尾。
+
+**实施**：`internal/run`（`Overdue`）、`internal/harness`（`dispatch` 把过期时间封顶到期限；`Run` 认领后先查期限；循环里的期限判断改用 `Overdue`）、`adapters/store/postgres`（`DecideToolCall` 在期限之后按过期处理）。
+
+**验证**：单元（`make test`，-race）新增两项：缺省确认时限下过期时间等于运行期限、中断的 `expiresAt` 相同，确认时限短于剩余时间时保留自己的过期时间；期限前已确认、期限后才认领的运行以 `RUN_TIMEOUT` 失败，工具没有被调用，调用保持 CONFIRMED。集成（真实 PostgreSQL 17，`make test-integration`，21/21）新增 confirmation-and-deadline：工具调用的 `confirmationExpiresAt` 等于运行的 `deadlineAt`，中断的 `expiresAt` 相同；期限之后确认得到 409 `the run exceeded its time limit`，调用仍待确认；清理过期请求、运行以 `RUN_TIMEOUT` 失败，echo 没有被调用；期限前确认、期限后认领同样失败且不调用。把三个生产文件恢复为修改前的版本，这三项测试都失败：过期时间是请求时刻加 900 秒；期限后才认领的运行先调用了 echo（结果 hi）再以 `RUN_TIMEOUT` 失败。
+
+**局限（不标 PASS）**：没有在 compose 或 kind 的整平台上重放 idp-workspace 的两个复现场景。
