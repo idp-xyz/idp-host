@@ -158,6 +158,10 @@ func (h *Harness) Run(ctx context.Context, c *run.Claim) error {
 		}
 		return h.fail(ctx, c, run.FailReleaseGone, "the run's release cannot be loaded: "+err.Error())
 	}
+	if run.Overdue(rc.Run.DeadlineAt, h.Now()) {
+		// D35: a run claimed after its deadline does nothing more, not even a call its owner confirmed
+		return h.fail(ctx, c, run.FailTimeout, "the run exceeded its time limit")
+	}
 	t := &turn{h: h, ctx: ctx, claim: c, rc: rc, def: rc.Release.Effective(), messages: rc.Messages, frontend: map[string]bool{}, visible: map[string]bool{},
 		subagents: map[string]agent.EmbeddedSubagent{}, resources: rc.Release.OnDemandResources()}
 	if rc.Run.Input.ToolExecution == run.ToolExecutionCaller {
@@ -550,7 +554,7 @@ func (s *streamer) finish() error {
 func (t *turn) loop() error {
 	h := t.h
 	for {
-		if !t.rc.Run.DeadlineAt.IsZero() && !h.Now().Before(t.rc.Run.DeadlineAt) {
+		if run.Overdue(t.rc.Run.DeadlineAt, h.Now()) {
 			return h.fail(t.ctx, t.claim, run.FailTimeout, "the run exceeded its time limit")
 		}
 		primary := t.def.Model
@@ -842,6 +846,9 @@ func (t *turn) dispatch(step int, msg agui.Message) (string, error) {
 		case t.def.Confirmation.For(tc.Tool) == agent.ConfirmConfirm:
 			tc.State = run.CallPendingConfirmation
 			tc.ConfirmationExpiresAt = now.Add(time.Duration(t.def.Limits.ConfirmationTimeoutSeconds) * time.Second)
+			if d := t.rc.Run.DeadlineAt; !d.IsZero() && d.Before(tc.ConfirmationExpiresAt) {
+				tc.ConfirmationExpiresAt = d // D35: a decision after the run's deadline could not be used
+			}
 			events = append(events, agui.Custom(agui.CustomConfirmationRequired, map[string]any{"toolCallId": tc.ID, "tool": tc.Tool, "arguments": json.RawMessage(canon), "expiresAt": tc.ConfirmationExpiresAt.UTC().Format(time.RFC3339)}))
 			interrupts = append(interrupts, map[string]any{"type": "confirmation", "toolCallId": tc.ID, "tool": tc.Tool, "arguments": json.RawMessage(canon), "expiresAt": tc.ConfirmationExpiresAt.UTC().Format(time.RFC3339)})
 		default:

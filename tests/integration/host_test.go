@@ -473,6 +473,77 @@ func TestHostEndToEnd(t *testing.T) {
 		}
 	})
 
+	t.Run("confirmation-and-deadline", func(t *testing.T) {
+		// D35: a confirmation request expires with the run, and nothing runs after the run's deadline
+		defer func() { e.store.Now, e.harness.Now = time.Now, time.Now }()
+		later := func() time.Time { return time.Now().Add(10 * time.Minute) }
+		echoes := func() int {
+			n := 0
+			for _, c := range e.mcp.Calls() {
+				if c.Name == "echo" {
+					n++
+				}
+			}
+			return n
+		}
+		before := echoes()
+		timedOut := func(id string) {
+			t.Helper()
+			got := e.must(200, "GET", "/v1/runs/"+id, "carol", nil)
+			if got["status"] != run.StatusFailed || got["failureCode"] != run.FailTimeout || echoes() != before {
+				t.Fatalf("%v, echo calls %d then %d", got, before, echoes())
+			}
+		}
+
+		// the default confirmation timeout (900 s) outlives the default run (300 s)
+		r := e.must(202, "POST", "/v1/agents/assistant/runs", "carol", runBody("thr-dl1", "echo late"), "Idempotency-Key", "dl1")
+		id := r["runId"].(string)
+		e.drive()
+		deadline, err := time.Parse(time.RFC3339Nano, e.must(200, "GET", "/v1/runs/"+id, "carol", nil)["deadlineAt"].(string))
+		if err != nil {
+			t.Fatal(err)
+		}
+		call := e.must(200, "GET", "/v1/runs/"+id+"/tool-calls", "carol", nil)["toolCalls"].([]any)[0].(map[string]any)
+		if expires, err := time.Parse(time.RFC3339Nano, call["confirmationExpiresAt"].(string)); err != nil || !expires.Equal(deadline) {
+			t.Fatalf("expires %v (%v), deadline %s", call["confirmationExpiresAt"], err, deadline)
+		}
+		_, events, _ := e.sse("GET", "/v1/runs/"+id+"/events", "carol", nil)
+		if in := events[len(events)-1]["outcome"].(map[string]any)["interrupts"].([]any)[0].(map[string]any); in["expiresAt"] != deadline.UTC().Format(time.RFC3339) {
+			t.Fatalf("%v, deadline %s", in, deadline)
+		}
+		// after the deadline a decision is refused and nothing is recorded
+		e.store.Now = later
+		st, body := e.call("POST", "/v1/runs/"+id+"/tool-calls/"+call["toolCallId"].(string)+"/decide", "carol", map[string]any{"decision": "confirm"})
+		if problem, _ := body["error"].(map[string]any); st != 409 || problem["message"] != "the run exceeded its time limit" {
+			t.Fatalf("%d %v", st, body)
+		}
+		if c := e.must(200, "GET", "/v1/runs/"+id+"/tool-calls", "carol", nil)["toolCalls"].([]any)[0].(map[string]any); c["state"] != run.CallPendingConfirmation {
+			t.Fatalf("%v", c)
+		}
+		// the sweep expires the request and queues the run, which fails without calling the tool
+		n, err := e.store.ExpireConfirmations(context.Background())
+		if err != nil || n != 1 {
+			t.Fatal(err, n)
+		}
+		e.store.Now, e.harness.Now = time.Now, later
+		e.drive()
+		timedOut(id)
+
+		// confirmed before the deadline but claimed after it (a backlog): the call is still not executed
+		e.harness.Now = time.Now
+		r = e.must(202, "POST", "/v1/agents/assistant/runs", "carol", runBody("thr-dl2", "echo later"), "Idempotency-Key", "dl2")
+		id = r["runId"].(string)
+		e.drive()
+		callID := e.must(200, "GET", "/v1/runs/"+id+"/tool-calls", "carol", nil)["toolCalls"].([]any)[0].(map[string]any)["toolCallId"].(string)
+		e.must(200, "POST", "/v1/runs/"+id+"/tool-calls/"+callID+"/decide", "carol", map[string]any{"decision": "confirm"})
+		e.harness.Now = later
+		e.drive()
+		timedOut(id)
+		if calls := e.must(200, "GET", "/v1/runs/"+id+"/tool-calls", "carol", nil)["toolCalls"].([]any); len(calls) != 1 || calls[0].(map[string]any)["state"] != run.CallConfirmed {
+			t.Fatalf("%v", calls)
+		}
+	})
+
 	t.Run("cancel-queued", func(t *testing.T) {
 		r := e.must(202, "POST", "/v1/agents/assistant/runs", "carol", runBody("thr-5", "hello"), "Idempotency-Key", "x1")
 		id := r["runId"].(string)

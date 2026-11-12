@@ -35,6 +35,11 @@ func Terminal(status string) bool {
 	return status == StatusCompleted || status == StatusFailed || status == StatusCanceled
 }
 
+// Overdue reports whether a run with this deadline is out of time at now (a zero deadline never is).
+func Overdue(deadline, now time.Time) bool {
+	return !deadline.IsZero() && !now.Before(deadline)
+}
+
 // Tool call states.
 const (
 	CallPendingConfirmation = "PENDING_CONFIRMATION"
