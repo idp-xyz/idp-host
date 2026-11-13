@@ -115,6 +115,10 @@ type GatewayAuth struct {
 	APIKey           string `yaml:"apiKey"`
 	APIKeyFile       string `yaml:"apiKeyFile"`
 	CAFile           string `yaml:"caFile"` // for the token endpoint
+	// SessionBound (delegation): the exchange also yields a refresh token bound to the user's session, and a run renews
+	// its credential with it until the user signs out (ADR-0001 D38). The authorization server must allow it (Keycloak:
+	// the client's "Allow refresh token in Standard Token Exchange" = same session).
+	SessionBound bool `yaml:"sessionBound"`
 }
 
 var nameRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$`)
@@ -318,6 +322,9 @@ func Load(path string) (*File, error) {
 				return nil, fmt.Errorf("gateway %s: delegation needs clientSecret[File]", g.Name)
 			}
 		case "static":
+			if g.Auth.SessionBound {
+				return nil, fmt.Errorf("gateway %s: sessionBound needs mode delegation", g.Name)
+			}
 			if g.Auth.APIKey, err = secret(g.Auth.APIKey, g.Auth.APIKeyFile); err != nil {
 				return nil, fmt.Errorf("gateway %s: %w", g.Name, err)
 			}

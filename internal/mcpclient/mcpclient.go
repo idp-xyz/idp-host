@@ -82,6 +82,9 @@ type RPCError struct {
 	Code    int             `json:"code"`
 	Message string          `json:"message"`
 	Data    json.RawMessage `json:"data,omitempty"`
+	// HTTPStatus is the status the error came with (a gateway answers an unacceptable credential with 401 and a
+	// JSON-RPC body).
+	HTTPStatus int `json:"-"`
 }
 
 // Error implements error.
@@ -92,6 +95,13 @@ type HTTPError struct{ Status int }
 
 // Error implements error.
 func (e *HTTPError) Error() string { return fmt.Sprintf("gateway HTTP %d", e.Status) }
+
+// Unauthorized reports whether the gateway refused the credential (HTTP 401), with or without a JSON-RPC body.
+func Unauthorized(err error) bool {
+	var he *HTTPError
+	var re *RPCError
+	return errors.As(err, &he) && he.Status == http.StatusUnauthorized || errors.As(err, &re) && re.HTTPStatus == http.StatusUnauthorized
+}
 
 // NamedParam maps methods to the param carried in Mcp-Name.
 var NamedParam = map[string]string{"tools/call": "name", "prompts/get": "name", "resources/read": "uri"}
@@ -155,6 +165,7 @@ func (c *Client) Call(ctx context.Context, endpoint, bearer, method string, para
 		return nil, errors.New("malformed JSON-RPC response")
 	}
 	if out.Error != nil {
+		out.Error.HTTPStatus = resp.StatusCode
 		return nil, out.Error
 	}
 	if resp.StatusCode != http.StatusOK || len(out.Result) == 0 || out.Result[0] != '{' {

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -63,5 +65,23 @@ func TestResultText(t *testing.T) {
 	}
 	if _, err := CheckEndpoint("https://u:p@gw/mcp"); err == nil {
 		t.Fatal("credentials in endpoint accepted")
+	}
+}
+
+// The gateway answers an unacceptable credential with 401 and a JSON-RPC body; both shapes count as a refusal (D38).
+func TestUnauthorizedIsRecognized(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Unauthorized"}}`)
+	}))
+	defer srv.Close()
+	c := &Client{HTTP: NewHTTPClient(5*time.Second, nil), Info: ClientInfo{Name: "t", Version: "1"}}
+	_, err := c.CallTool(context.Background(), srv.URL, "tok", "x", json.RawMessage(`{}`))
+	if !Unauthorized(err) {
+		t.Fatalf("not recognized: %v", err)
+	}
+	if Unauthorized(&RPCError{Code: -32600, Message: "Unauthorized", HTTPStatus: 200}) || Unauthorized(errors.New("x")) || !Unauthorized(&HTTPError{Status: 401}) {
+		t.Fatal("misclassified")
 	}
 }

@@ -15,6 +15,7 @@ import (
 	"idp-host/adapters/providers/openai"
 	"idp-host/internal/agent"
 	"idp-host/internal/agui"
+	"idp-host/internal/credential"
 	"idp-host/internal/guard"
 	"idp-host/internal/mcpclient"
 	"idp-host/internal/model"
@@ -27,6 +28,9 @@ import (
 type memStore struct {
 	mu          sync.Mutex
 	fileTickets *run.FileTickets
+	credExp     time.Time           // zero = does not expire
+	refresh     string              // a session-bound credential's refresh token (D38)
+	saved       []*credential.Token // renewed credentials
 	rc          run.Context
 	events      []agui.Event
 	calls       map[string]*run.ToolCall
@@ -206,6 +210,26 @@ func (m *memStore) childEnds(id, status, output, code string) {
 	m.children[id].Status, m.children[id].Output, m.children[id].FailureCode = status, output, code
 	m.events = append(m.events, agui.Custom(agui.CustomSubagentFinished, map[string]any{"runId": id, "status": status}))
 	m.status, m.rc.Run.Status = run.StatusRunning, run.StatusRunning
+}
+
+func (m *memStore) RunCredential(context.Context, *run.Claim) (*credential.Token, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cred == "" {
+		return nil, &run.Failure{Code: run.FailCredential, Message: "no credential"}
+	}
+	return &credential.Token{AccessToken: m.cred, ExpiresAt: m.credExp, RefreshToken: m.refresh}, nil
+}
+
+func (m *memStore) SaveCredential(_ context.Context, _ *run.Claim, tok *credential.Token) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cred, m.credExp = tok.AccessToken, tok.ExpiresAt
+	if tok.RefreshToken != "" {
+		m.refresh = tok.RefreshToken
+	}
+	m.saved = append(m.saved, tok)
+	return nil
 }
 
 func (m *memStore) FileTickets(context.Context, *run.Claim) (*run.FileTickets, error) {

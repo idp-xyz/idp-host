@@ -92,10 +92,12 @@ type env struct {
 	model    *fakemodel.Server
 	mcp      *fakemcp.Server
 	mcpDeleg *fakemcp.Server
-	tokens   map[string]string
-	tenantA  string
-	tenantB  string
-	ownerURL string
+	// D38: the session-bound gateway
+	mcpSession *fakemcp.Server
+	tokens     map[string]string
+	tenantA    string
+	tenantB    string
+	ownerURL   string
 }
 
 var profile = identity.Profile{Issuer: "idp-host-it", Audience: "idp-host", TenantClaim: "tenant_id", RolesClaim: "roles"}
@@ -163,20 +165,37 @@ func newEnv(t *testing.T) *env {
 				http.Error(w, `{"error":"invalid_request"}`, 400)
 				return
 			}
+			if r.PostForm.Get("requested_token_type") == "urn:ietf:params:oauth:token-type:refresh_token" { // D38: session-bound
+				_, _ = w.Write([]byte(`{"access_token":"stale-access","expires_in":300,"refresh_token":"rt-session"}`))
+				return
+			}
 			_, _ = fmt.Fprintf(w, `{"access_token":"delegated:%s","expires_in":300}`, r.PostForm.Get("subject_token"))
+		case "refresh_token":
+			if r.PostForm.Get("refresh_token") != "rt-session" {
+				http.Error(w, `{"error":"invalid_grant","error_description":"Session not active"}`, 400)
+				return
+			}
+			_, _ = w.Write([]byte(`{"access_token":"renewed-access","expires_in":300,"refresh_token":"rt-session"}`))
 		default:
 			http.Error(w, `{"error":"unsupported_grant_type"}`, 400)
 		}
 	}))
 	t.Cleanup(idp.Close)
 	fx2.RequireBearer = "delegated:" + tokens["carol"]
+	// D38: a session-bound gateway that accepts only a renewed credential
+	fx3 := fakemcp.New()
+	fx3.RequireBearer = "renewed-access"
+	xs3 := httptest.NewServer(fx3.Handler())
+	t.Cleanup(xs3.Close)
+	sessionX := &credential.Exchanger{TokenEndpoint: idp.URL, ClientID: "idp-host", ClientSecret: "host-secret", Audience: "gw", SessionBound: true, HTTP: idp.Client()}
 
 	verifier, _ := identity.NewDevVerifier(profile, []byte(devSecret))
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	// metrics and tracing wrap the ResponseWriter: the stream must still flush through them
 	a := &api.API{Store: store, Auth: verifier, Log: log, Providers: []string{"fake"}, Version: "it", StreamPoll: 20 * time.Millisecond, Metrics: observability.NewMetrics(),
 		Gateways: map[string]api.GatewayAuth{"edge": {}, "delegated": {ActorToken: true,
-			Exchanger: &credential.Exchanger{TokenEndpoint: idp.URL, ClientID: "idp-host", ClientSecret: "host-secret", Audience: "gw", HTTP: idp.Client()}}}}
+			Exchanger: &credential.Exchanger{TokenEndpoint: idp.URL, ClientID: "idp-host", ClientSecret: "host-secret", Audience: "gw", HTTP: idp.Client()}},
+			"session": {ActorToken: true, Exchanger: sessionX}}}
 	tp, _, err := observability.Setup("idp-host-it", "it", log)
 	if err != nil {
 		t.Fatal(err)
@@ -190,9 +209,11 @@ func newEnv(t *testing.T) *env {
 	edge.Name, edge.StaticBearer = "edge", "static-key"
 	deleg := mc(xs2.URL)
 	deleg.Name = "delegated"
-	h := &harness.Harness{Store: store, Providers: model.NewRegistry(prov), Gateways: map[string]*harness.Gateway{"edge": edge, "delegated": deleg}, Log: log, DeltaFlush: time.Millisecond}
+	sess := mc(xs3.URL)
+	sess.Name, sess.Refresh = "session", sessionX.Refresh
+	h := &harness.Harness{Store: store, Providers: model.NewRegistry(prov), Gateways: map[string]*harness.Gateway{"edge": edge, "delegated": deleg, "session": sess}, Log: log, DeltaFlush: time.Millisecond}
 	w := &worker.Worker{ID: "it-worker", Store: store, Harness: h, Lease: 30 * time.Second, Log: log}
-	return &env{t: t, store: store, host: a, harness: h, api: srv, worker: w, model: fm, mcp: fx, mcpDeleg: fx2, tokens: tokens, tenantA: tenantA, tenantB: tenantB, ownerURL: ownerURL}
+	return &env{t: t, store: store, host: a, harness: h, api: srv, worker: w, model: fm, mcp: fx, mcpDeleg: fx2, mcpSession: fx3, tokens: tokens, tenantA: tenantA, tenantB: tenantB, ownerURL: ownerURL}
 }
 
 // drive lets the worker serve every claimable run.
@@ -629,6 +650,34 @@ func TestHostEndToEnd(t *testing.T) {
 		calls := e.mcpDeleg.Calls()
 		if len(calls) != 1 || calls[0].Bearer != "delegated:"+e.tokens["carol"] {
 			t.Fatalf("the gateway did not receive the delegated token: %+v", calls)
+		}
+	})
+
+	t.Run("session-bound-delegation", func(t *testing.T) {
+		// D38: the exchange yields a refresh token, sealed with the run; the gateway refuses the first credential and the
+		// worker renews it with the stored refresh token; when the run ends, both are cleared
+		e.publish("session-agent", definition("session", []string{"sum"}, nil))
+		r := e.must(202, "POST", "/v1/agents/session-agent/runs", "carol", runBody("thr-9", "please sum"), "Idempotency-Key", "s1")
+		id := r["runId"].(string)
+		conn, err := pgx.Connect(context.Background(), e.ownerURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close(context.Background())
+		var refresh []byte
+		if err := conn.QueryRow(context.Background(), `SELECT credential_refresh FROM runs WHERE id = $1`, id).Scan(&refresh); err != nil || len(refresh) == 0 || strings.Contains(string(refresh), "rt-session") {
+			t.Fatalf("the refresh token is not sealed with the run: %v %d", err, len(refresh))
+		}
+		e.drive()
+		if got := e.must(200, "GET", "/v1/runs/"+id, "carol", nil); got["status"] != run.StatusCompleted {
+			t.Fatalf("%v", got)
+		}
+		calls := e.mcpSession.Calls()
+		if len(calls) != 1 || calls[0].Name != "sum" || calls[0].Bearer != "renewed-access" {
+			t.Fatalf("the call did not go through with the renewed credential: %+v", calls)
+		}
+		if err := conn.QueryRow(context.Background(), `SELECT credential_refresh FROM runs WHERE id = $1`, id).Scan(&refresh); err != nil || refresh != nil {
+			t.Fatalf("the refresh token outlives the run: %v %d", err, len(refresh))
 		}
 	})
 

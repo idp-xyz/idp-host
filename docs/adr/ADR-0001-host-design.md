@@ -308,3 +308,19 @@ D32 让运行"读"CMI；没有"写"，线程之外的后续运行就记不住这
 
 **局限**：票据在有效期内、在 HOST 的进程内存里仍然是可用的凭据；运行若长于票据的有效期（由签发方定），之后的导入导出会被拒绝。敏感级别与外部模型的上限（平台 ADR-0002 F8）不在本决策内。
 
+## 20. D38：运行的委派凭据在用户会话内续期（2026-11-13 决策与实施）
+
+起因（真实模型试用发现）：bob 在工作台让 office-assistant 做一张 Excel，运行以 STEP_LIMIT 结束。运行的网关凭据是在创建时由 bob 的令牌换来的（工作台换成 HOST 受众，HOST 再换成网关受众），Keycloak 换出的令牌最多活到原令牌剩下的时间：bob 登录 7 分钟后发的请求，凭据只剩 2 分 53 秒。本地模型一步要想几十秒到一分半，第 8 次调用起网关一律回 401，HOST 把它当普通工具错误交给模型，模型又重试了 22 次，直到 30 步用完。
+
+| # | 决策 | 理由 |
+|---|---|---|
+| D38 | **委派凭据绑定用户会话并在运行中续期**。网关的 `auth` 增加 `sessionBound`（只用于 delegation）：令牌交换请求 `requested_token_type=refresh_token`，HOST 拿到网关凭据的同时拿到一个绑定在用户会话上的 refresh token，与凭据一起加密存入 `runs.credential_refresh`（迁移 0009），运行结束或取消时与凭据一同清除，子 agent 运行沿用父运行的。Worker 在每一轮开始与每次网关调用前取用凭据：离过期不到 1 分钟就先用 refresh token 续期并存回。网关仍然以 401 拒绝时，续期一次、重发一次（401 发生在鉴权，工具没有执行，重发安全）；续期被拒（`invalid_grant`：用户已退出、会话闲置超时或到达最长时限、被撤销）或续期后仍被拒，运行立即以 `CREDENTIAL_EXPIRED` 结束，原因写进这次工具调用的结果与运行的失败消息，**不再把凭据错误交给模型**。授权服务器暂时不答而现有凭据还有效时，照用现有的。没有 `sessionBound` 的网关行为不变（过期即结束，原因同样明确）。调用方（idp-workspace D25）的交换也要绑定会话：Keycloak 只允许对"在用户会话里有客户端会话"的令牌再交换出 refresh token | 运行代表用户行事，能代表多久应该由用户的会话决定，而不是由用户发请求那一刻手里令牌还剩几分钟决定。refresh token 留在 HOST 内、加密、随运行清除，不交给网关与模型；用户退出登录，运行在下一次网关调用时就停下，权限随会话一起收回。凭据错误交给模型只会被当成工具故障反复重试 |
+
+**Keycloak 设置（已实测 26.8.1）**：客户端 `idp-host` 与 `idp-workspace` 的 `standard.token.exchange.enableRefreshRequestedTokenType = SAME_SESSION`（管理台：Allow refresh token in Standard Token Exchange = Same session）。实测：直接交换用户登录令牌可得 refresh token；交换"已经是交换所得"的令牌，只有前一次交换也请求了 refresh token（从而在会话里留下客户端会话）才行，否则 `creating a new session is needed`。续期得到的令牌用户、受众、会话不变，有效期是客户端的完整寿命；用户登出后续期得到 `invalid_grant / Session not active`。会话闲置时限默认 30 分钟、最长 10 小时：运行中的续期本身就是活动。
+
+**实施**：`internal/credential`（`Exchanger.SessionBound`、`Refresh`、`ErrSessionEnded`、`Token.RefreshToken`）；`internal/mcpclient`（`RPCError.HTTPStatus`、`Unauthorized`：网关以 401 带 JSON-RPC 错误体拒绝凭据）；`internal/config`（`sessionBound`，static 模式拒绝）；`adapters/store/postgres`（迁移 0009、`RunCredential`、`SaveCredential`，创建、子运行、终态与取消时的封存与清除）；`internal/harness`（`gatewayBearer`、`credentialFailure`；列工具与调用工具时的续期与一次重发）；`cmd/idp-host`（`gateways[].Refresh`）。
+
+**验证**：单元（`internal/credential`：会话绑定的交换请求并保存 refresh token，续期、服务端不轮换时沿用旧的、被拒的 refresh token 报告会话结束、服务器不可达不算会话结束；`internal/mcpclient`：带 JSON-RPC 体的 401 被识别；`internal/harness`：快过期的凭据在网关看到之前续期并保存，网关拒绝后续期并重发，会话结束时运行在下一次网关调用停下、模型只被调用一次、工具调用以原因作答，无法续期时照旧结束）；集成（`TestHostEndToEnd/session-bound-delegation`，真实 PostgreSQL：refresh token 加密随运行存下，网关只认续期后的凭据而运行完成，运行结束后清除）；平台（PATH I：等待确认中的真实运行持有 refresh token；PATH K：对平台的 Keycloak 走一遍工作台与 HOST 的会话绑定交换、续期、登出后被拒）。
+
+**局限**：会话最长时限（默认 10 小时）是硬上限；工作台的运行跟随者（D18）在确认等待之后重连 HOST 时用的仍是创建时的令牌，长时间等待后可能读不到事件（另行处理）。
+

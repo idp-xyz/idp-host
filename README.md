@@ -61,7 +61,9 @@ gateways:
   - name: edge
     endpoint: https://mcp.example.com/mcp
     auth: {mode: delegation, tokenEndpoint: https://idp.example.com/realms/idp/protocol/openid-connect/token,
-           clientId: idp-host, clientSecretFile: /run/secrets/host-client, audience: https://mcp.example.com/mcp, actorToken: true}
+           clientId: idp-host, clientSecretFile: /run/secrets/host-client, audience: https://mcp.example.com/mcp, actorToken: true,
+           sessionBound: true}   # D38: a run renews its credential until the user signs out (Keycloak: client attribute
+                                 # standard.token.exchange.enableRefreshRequestedTokenType = SAME_SESSION, also on the caller's client)
 cmi:   # optional (ADR-0001 D32): releases with context.cmi = true resolve a ContextPackage here at run creation
   endpoint: https://cmi.example.com
   auth: {mode: delegation, tokenEndpoint: https://idp.example.com/realms/idp/protocol/openid-connect/token,

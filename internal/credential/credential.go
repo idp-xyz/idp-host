@@ -65,14 +65,22 @@ type Exchanger struct {
 	ClientID      string
 	ClientSecret  string
 	Audience      string // the gateway's client / resource identifier at the authorization server
-	HTTP          *http.Client
+	// SessionBound asks for a refresh token bound to the user's session alongside the delegated token (D38), so that
+	// a run can renew its credential until the user signs out or the session reaches its limits.
+	SessionBound bool
+	HTTP         *http.Client
 }
 
 // Token is an exchanged token.
 type Token struct {
-	AccessToken string
-	ExpiresAt   time.Time
+	AccessToken  string
+	ExpiresAt    time.Time
+	RefreshToken string // only from a session-bound exchange or a refresh
 }
+
+// ErrSessionEnded: the authorization server no longer renews the credential (the user signed out, the session idled
+// out or reached its maximum, or it was revoked).
+var ErrSessionEnded = errors.New("the user's session has ended")
 
 // Exchange trades subjectToken for a delegated token. actorToken, when non-empty, is sent as the
 // actor_token (delegation profile); otherwise the client credentials identify the actor.
@@ -81,7 +89,11 @@ func (e *Exchanger) Exchange(ctx context.Context, subjectToken, actorToken strin
 	form.Set("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange")
 	form.Set("subject_token", subjectToken)
 	form.Set("subject_token_type", "urn:ietf:params:oauth:token-type:access_token")
-	form.Set("requested_token_type", "urn:ietf:params:oauth:token-type:access_token")
+	if e.SessionBound {
+		form.Set("requested_token_type", "urn:ietf:params:oauth:token-type:refresh_token")
+	} else {
+		form.Set("requested_token_type", "urn:ietf:params:oauth:token-type:access_token")
+	}
 	if e.Audience != "" {
 		form.Set("audience", e.Audience)
 	}
@@ -90,6 +102,38 @@ func (e *Exchanger) Exchange(ctx context.Context, subjectToken, actorToken strin
 		form.Set("actor_token_type", "urn:ietf:params:oauth:token-type:access_token")
 	}
 	return e.post(ctx, form)
+}
+
+// Refresh renews a session-bound credential. ErrSessionEnded when the server refuses the refresh token itself.
+func (e *Exchanger) Refresh(ctx context.Context, refreshToken string) (*Token, error) {
+	if refreshToken == "" {
+		return nil, ErrSessionEnded
+	}
+	form := url.Values{}
+	form.Set("grant_type", "refresh_token")
+	form.Set("refresh_token", refreshToken)
+	tok, err := e.post(ctx, form)
+	if err != nil {
+		var re *refused
+		if errors.As(err, &re) && (re.code == "invalid_grant" || re.status == http.StatusUnauthorized) {
+			return nil, fmt.Errorf("%w (%s)", ErrSessionEnded, re.code)
+		}
+		return nil, err
+	}
+	if tok.RefreshToken == "" {
+		tok.RefreshToken = refreshToken
+	}
+	return tok, nil
+}
+
+// refused is the authorization server's refusal.
+type refused struct {
+	status int
+	code   string
+}
+
+func (r *refused) Error() string {
+	return fmt.Sprintf("token exchange refused (HTTP %d%s)", r.status, suffix(r.code))
 }
 
 // ClientCredentials obtains the HOST's own token: the actor_token of a delegation when the server
@@ -124,12 +168,13 @@ func (e *Exchanger) post(ctx context.Context, form url.Values) (*Token, error) {
 			Error string `json:"error"`
 		}
 		_ = json.Unmarshal(body, &e)
-		return nil, fmt.Errorf("token exchange refused (HTTP %d%s)", resp.StatusCode, suffix(e.Error))
+		return nil, &refused{status: resp.StatusCode, code: e.Error}
 	}
 	var out struct {
-		AccessToken string `json:"access_token"`
-		ExpiresIn   int64  `json:"expires_in"`
-		TokenType   string `json:"token_type"`
+		AccessToken  string `json:"access_token"`
+		ExpiresIn    int64  `json:"expires_in"`
+		TokenType    string `json:"token_type"`
+		RefreshToken string `json:"refresh_token"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil || out.AccessToken == "" {
 		return nil, errors.New("token endpoint returned no access token")
@@ -138,7 +183,7 @@ func (e *Exchanger) post(ctx context.Context, form url.Values) (*Token, error) {
 	if out.ExpiresIn <= 0 {
 		exp = time.Now().Add(5 * time.Minute)
 	}
-	return &Token{AccessToken: out.AccessToken, ExpiresAt: exp}, nil
+	return &Token{AccessToken: out.AccessToken, ExpiresAt: exp, RefreshToken: out.RefreshToken}, nil
 }
 
 func suffix(code string) string {

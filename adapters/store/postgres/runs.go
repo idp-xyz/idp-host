@@ -252,13 +252,18 @@ func (s *Store) CreateRun(ctx context.Context, tenant string, in CreateRunInput)
 			if len(fresh) == 0 && len(known) == 0 {
 				return fail("INVALID", "the run needs at least one message")
 			}
-			var cred []byte
+			var cred, credRefresh []byte
 			var credExp any
 			if in.Credential != nil {
 				if cred, err = s.Box.Seal([]byte(in.Credential.AccessToken)); err != nil {
 					return err
 				}
 				credExp = in.Credential.ExpiresAt
+				if in.Credential.RefreshToken != "" { // D38: renewed within the user's session
+					if credRefresh, err = s.Box.Seal([]byte(in.Credential.RefreshToken)); err != nil {
+						return err
+					}
+				}
 			}
 			var tickets []byte
 			if in.FileTickets != nil {
@@ -280,8 +285,8 @@ func (s *Store) CreateRun(ctx context.Context, tenant string, in CreateRunInput)
 				ctxPkg = in.ContextPackageID
 			}
 			if _, err := tx.Exec(ctx, `INSERT INTO runs (tenant_id, id, thread_id, agent_id, release_id, release_digest, owner, status, idempotency_key, request_sha256, input,
-			credential, credential_expires_at, trace_id, deadline_at, execution_ref, context_package_id, file_tickets) VALUES ($1, $2, $3, $4, $5, $6, $7, 'QUEUED', $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
-				tenant, runID, threadID, a.ID, releaseID, env.Digest, in.Owner, in.IdempotencyKey, hash, inputRaw, cred, credExp, trace, deadline, execRef, ctxPkg, tickets); err != nil {
+			credential, credential_expires_at, trace_id, deadline_at, execution_ref, context_package_id, file_tickets, credential_refresh) VALUES ($1, $2, $3, $4, $5, $6, $7, 'QUEUED', $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`,
+				tenant, runID, threadID, a.ID, releaseID, env.Digest, in.Owner, in.IdempotencyKey, hash, inputRaw, cred, credExp, trace, deadline, execRef, ctxPkg, tickets, credRefresh); err != nil {
 				if isUniqueViolation(err) {
 					if strings.Contains(constraintOf(err), "idempotency") {
 						return errRetry // the same request raced; the retry replays it
@@ -539,7 +544,7 @@ func (s *Store) cancelResting(ctx context.Context, tx pgx.Tx, tenant string, r *
 	if _, err := tx.Exec(ctx, `UPDATE tool_calls SET state = 'REJECTED', decided_by = $2, decided_at = now() WHERE run_id = $1 AND state = 'PENDING_CONFIRMATION'`, r.ID, "cancel"); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE runs SET status = 'CANCELED', failure_code = 'CANCELED', failure_message = $2, finished_at = now(), lease_owner = NULL, lease_until = NULL, credential = NULL, file_tickets = NULL WHERE id = $1`, r.ID, reason); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE runs SET status = 'CANCELED', failure_code = 'CANCELED', failure_message = $2, finished_at = now(), lease_owner = NULL, lease_until = NULL, credential = NULL, credential_refresh = NULL, file_tickets = NULL WHERE id = $1`, r.ID, reason); err != nil {
 		return err
 	}
 	if err := appendEvents(ctx, tx, tenant, r.ID, []agui.Event{agui.RunError(reason, "CANCELED")}); err != nil {
@@ -881,7 +886,7 @@ func (s *Store) Finish(ctx context.Context, c *run.Claim, status, failureCode, f
 			return err
 		}
 		if finished {
-			if _, err := tx.Exec(ctx, `UPDATE runs SET credential = NULL, file_tickets = NULL WHERE id = $1`, c.RunID); err != nil {
+			if _, err := tx.Exec(ctx, `UPDATE runs SET credential = NULL, credential_refresh = NULL, file_tickets = NULL WHERE id = $1`, c.RunID); err != nil {
 				return err
 			}
 		}
@@ -973,10 +978,10 @@ func (s *Store) CreateChildRun(ctx context.Context, c *run.Claim, in run.ChildRu
 			if _, err := tx.Exec(ctx, `INSERT INTO threads (tenant_id, id, owner, agent_id) VALUES ($1, $2, $3, $4)`, c.TenantID, childID, parent.Owner, ag.ID); err != nil {
 				return err
 			}
-			var cred []byte
+			var cred, credRefresh []byte
 			var credExp *time.Time
 			if eff := doc.Effective(); in.Gateway != "" && eff.Tools.Gateway == in.Gateway && len(eff.Tools.Allow) > 0 {
-				if err := tx.QueryRow(ctx, `SELECT credential, credential_expires_at FROM runs WHERE id = $1`, parent.ID).Scan(&cred, &credExp); err != nil {
+				if err := tx.QueryRow(ctx, `SELECT credential, credential_expires_at, credential_refresh FROM runs WHERE id = $1`, parent.ID).Scan(&cred, &credExp, &credRefresh); err != nil {
 					return err
 				}
 			}
@@ -1002,8 +1007,8 @@ func (s *Store) CreateChildRun(ctx context.Context, c *run.Claim, in run.ChildRu
 				exp = *credExp
 			}
 			if _, err := tx.Exec(ctx, `INSERT INTO runs (tenant_id, id, thread_id, agent_id, release_id, release_digest, owner, status, idempotency_key, request_sha256, input,
-			credential, credential_expires_at, trace_id, deadline_at, execution_ref, parent_run_id, depth) VALUES ($1, $2, $2, $3, $4, $5, $6, 'QUEUED', $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
-				c.TenantID, childID, ag.ID, releaseID, env.Digest, parent.Owner, "sub:"+in.ToolCallID, hash, inputRaw, cred, exp, trace, deadline, execRef, parent.ID, parent.Depth+1); err != nil {
+			credential, credential_expires_at, trace_id, deadline_at, execution_ref, parent_run_id, depth, credential_refresh) VALUES ($1, $2, $2, $3, $4, $5, $6, 'QUEUED', $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
+				c.TenantID, childID, ag.ID, releaseID, env.Digest, parent.Owner, "sub:"+in.ToolCallID, hash, inputRaw, cred, exp, trace, deadline, execRef, parent.ID, parent.Depth+1, credRefresh); err != nil {
 				return err
 			}
 			if _, err := appendMessages(ctx, tx, c.TenantID, childID, childID, []agui.Message{msg}); err != nil {
@@ -1121,6 +1126,67 @@ func (s *Store) Credential(ctx context.Context, c *run.Claim) (string, error) {
 		return nil
 	})
 	return tok, err
+}
+
+// RunCredential returns the run's delegated gateway credential with its expiry and, when it is session-bound, its
+// refresh token (D38). Unlike Credential it does not refuse an expired token: the caller may renew it.
+func (s *Store) RunCredential(ctx context.Context, c *run.Claim) (*credential.Token, error) {
+	var out *credential.Token
+	err := s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
+		r, err := s.owned(ctx, tx, c)
+		if err != nil {
+			return err
+		}
+		var sealed, sealedRefresh []byte
+		if err := tx.QueryRow(ctx, `SELECT credential, credential_refresh FROM runs WHERE id = $1`, c.RunID).Scan(&sealed, &sealedRefresh); err != nil {
+			return err
+		}
+		if sealed == nil {
+			return &run.Failure{Code: run.FailCredential, Message: "the run carries no gateway credential"}
+		}
+		if s.Box == nil {
+			return errors.New("credential key not configured")
+		}
+		plain, err := s.Box.Open(sealed)
+		if err != nil {
+			return &run.Failure{Code: run.FailCredential, Message: "the credential cannot be decrypted"}
+		}
+		out = &credential.Token{AccessToken: string(plain), ExpiresAt: r.CredentialExpiresAt}
+		if sealedRefresh != nil {
+			rt, err := s.Box.Open(sealedRefresh)
+			if err != nil {
+				return &run.Failure{Code: run.FailCredential, Message: "the credential cannot be decrypted"}
+			}
+			out.RefreshToken = string(rt)
+		}
+		return nil
+	})
+	return out, err
+}
+
+// SaveCredential replaces the run's credential with a renewed one (D38); fenced by the claim.
+func (s *Store) SaveCredential(ctx context.Context, c *run.Claim, tok *credential.Token) error {
+	if s.Box == nil {
+		return errors.New("credential key not configured")
+	}
+	sealed, err := s.Box.Seal([]byte(tok.AccessToken))
+	if err != nil {
+		return err
+	}
+	var sealedRefresh []byte
+	if tok.RefreshToken != "" {
+		if sealedRefresh, err = s.Box.Seal([]byte(tok.RefreshToken)); err != nil {
+			return err
+		}
+	}
+	return s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
+		if _, err := s.owned(ctx, tx, c); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `UPDATE runs SET credential = $2, credential_expires_at = $3, credential_refresh = coalesce($4, credential_refresh) WHERE id = $1`,
+			c.RunID, sealed, tok.ExpiresAt, sealedRefresh)
+		return err
+	})
 }
 
 // FileTickets returns the run's decrypted file tickets (D37); nil when it has none.

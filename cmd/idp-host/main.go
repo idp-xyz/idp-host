@@ -323,8 +323,11 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 				return fmt.Errorf("gateway %s: %w", g.Name, err)
 			}
 			auth.Exchanger = &credential.Exchanger{TokenEndpoint: g.Auth.TokenEndpoint, ClientID: g.Auth.ClientID, ClientSecret: g.Auth.ClientSecret, Audience: g.Auth.Audience,
-				HTTP: &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil, TLSClientConfig: tokenTLS}}}
+				SessionBound: g.Auth.SessionBound, HTTP: &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil, TLSClientConfig: tokenTLS}}}
 			auth.ActorToken = g.Auth.ActorToken
+			if g.Auth.SessionBound { // D38: a run renews its credential within the user's session
+				gw.Refresh = auth.Exchanger.Refresh
+			}
 		}
 		gateways[g.Name] = gw
 		gatewayAuth[g.Name] = auth

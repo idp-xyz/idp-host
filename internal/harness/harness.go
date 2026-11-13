@@ -22,6 +22,7 @@ import (
 	"idp-host/internal/agui"
 	"idp-host/internal/canonical"
 	"idp-host/internal/cmiclient"
+	"idp-host/internal/credential"
 	"idp-host/internal/guard"
 	"idp-host/internal/mcpclient"
 	"idp-host/internal/model"
@@ -40,6 +41,9 @@ type Store interface {
 	Finish(ctx context.Context, c *run.Claim, status, failureCode, failureMessage string, events []agui.Event) error
 	Credential(ctx context.Context, c *run.Claim) (string, error)
 	FileTickets(ctx context.Context, c *run.Claim) (*run.FileTickets, error) // the member's file tickets (D37)
+	// the run's delegated credential with its refresh token, and its renewal (D38)
+	RunCredential(ctx context.Context, c *run.Claim) (*credential.Token, error)
+	SaveCredential(ctx context.Context, c *run.Claim, tok *credential.Token) error
 	// sub-agent runs (D22)
 	CreateChildRun(ctx context.Context, c *run.Claim, in run.ChildRunInput) (*run.Run, error)
 	ChildOutcome(ctx context.Context, c *run.Claim, childID string) (*run.ChildOutcome, error)
@@ -52,7 +56,12 @@ type Gateway struct {
 	Client   *mcpclient.Client
 	// StaticBearer, when set, is used instead of the run's delegated credential (development).
 	StaticBearer string
+	// Refresh renews a session-bound delegated credential (D38); nil when the gateway's credential is not renewable.
+	Refresh func(ctx context.Context, refreshToken string) (*credential.Token, error)
 }
+
+// credentialLeeway: a delegated credential this close to its expiry is renewed before a gateway call.
+const credentialLeeway = time.Minute
 
 // Metrics receives what the harness observes; nil disables.
 type Metrics interface {
@@ -128,7 +137,6 @@ type turn struct {
 	def             agent.Definition
 	messages        []agui.Message
 	gateway         *Gateway
-	bearer          string
 	tools           []model.ToolSpec
 	frontend        map[string]bool
 	visible         map[string]bool
@@ -138,6 +146,7 @@ type turn struct {
 	output          *guard.Output                        // the tenant's and the release's output filter (D28)
 	flagged         map[string]bool                      // untrusted content already reported in this turn (D27)
 	fileProps       map[string]map[string]string         // gateway tool -> property -> fileAttachment | fileDelivery (D37)
+	cred            *credential.Token                    // the run's delegated gateway credential, as last loaded or renewed (D38)
 	tickets         *run.FileTickets                     // loaded at the first file-taking call
 }
 
@@ -242,21 +251,24 @@ func (t *turn) prepareTools() error {
 			return h.fail(t.ctx, t.claim, run.FailGateway, "gateway "+t.def.Tools.Gateway+" is not configured")
 		}
 		t.gateway = gw
-		bearer := gw.StaticBearer
-		if bearer == "" {
-			var err error
-			if bearer, err = h.Store.Credential(t.ctx, t.claim); err != nil {
-				var f *run.Failure
-				if errors.As(err, &f) {
-					return h.fail(t.ctx, t.claim, f.Code, f.Message)
-				}
-				return err
-			}
+		bearer, err := t.gatewayBearer(false)
+		if err != nil {
+			return t.credentialFailure(nil, err)
 		}
-		t.bearer = bearer
 		lctx, cancel := context.WithTimeout(t.ctx, h.ToolTimeout)
 		tools, err := gw.Client.ListTools(lctx, gw.Endpoint, bearer)
 		cancel()
+		if mcpclient.Unauthorized(err) { // D38: renewed once; a credential the gateway still refuses ends the run
+			if bearer, err = t.gatewayBearer(true); err != nil {
+				return t.credentialFailure(nil, err)
+			}
+			lctx, cancel := context.WithTimeout(t.ctx, h.ToolTimeout)
+			tools, err = gw.Client.ListTools(lctx, gw.Endpoint, bearer)
+			cancel()
+			if mcpclient.Unauthorized(err) {
+				return t.credentialFailure(nil, refusedCredential())
+			}
+		}
 		if err != nil {
 			return h.fail(t.ctx, t.claim, run.FailGateway, "tools/list failed: "+sanitize(err))
 		}
@@ -412,6 +424,73 @@ func delivered(tc run.ToolCall, res *mcpclient.CallResult) (agui.Event, bool) {
 	}
 	f := s.File
 	return agui.Custom(agui.CustomFileDelivered, map[string]any{"toolCallId": tc.ID, "ref": f.Ref, "name": f.Name, "mediaType": f.MediaType, "size": f.Size, "sha256": f.SHA256}), true
+}
+
+// gatewayBearer returns the bearer for the gateway (D38): the static one, or the run's delegated credential, renewed with
+// its refresh token when it expires within credentialLeeway (or always, when force). A credential that has expired
+// and cannot be renewed, or a session that has ended, is a *run.Failure: the run ends with it.
+func (t *turn) gatewayBearer(force bool) (string, error) {
+	gw, h := t.gateway, t.h
+	if gw.StaticBearer != "" {
+		return gw.StaticBearer, nil
+	}
+	if t.cred == nil {
+		tok, err := h.Store.RunCredential(t.ctx, t.claim)
+		if err != nil {
+			return "", err
+		}
+		t.cred = tok
+	}
+	now := h.Now()
+	valid := t.cred.ExpiresAt.IsZero() || now.Before(t.cred.ExpiresAt)
+	if !force && (t.cred.ExpiresAt.IsZero() || t.cred.ExpiresAt.Sub(now) > credentialLeeway) {
+		return t.cred.AccessToken, nil
+	}
+	if gw.Refresh == nil || t.cred.RefreshToken == "" {
+		if valid && !force {
+			return t.cred.AccessToken, nil
+		}
+		return "", &run.Failure{Code: run.FailCredential, Message: "the delegated credential expired at " + t.cred.ExpiresAt.UTC().Format(time.RFC3339) +
+			" and cannot be renewed: send the request again"}
+	}
+	rctx, cancel := context.WithTimeout(t.ctx, 15*time.Second)
+	tok, err := gw.Refresh(rctx, t.cred.RefreshToken)
+	cancel()
+	if err != nil {
+		if errors.Is(err, credential.ErrSessionEnded) {
+			return "", &run.Failure{Code: run.FailCredential, Message: "the user's session has ended (signed out, idle too long or at its maximum length), " +
+				"so the run can no longer act for them: sign in and send the request again"}
+		}
+		if valid && !force { // the authorization server did not answer: the current credential still works for now
+			h.Log.Warn("renewing the delegated credential failed", "run", t.claim.RunID, "error", err)
+			return t.cred.AccessToken, nil
+		}
+		return "", &run.Failure{Code: run.FailCredential, Message: "the delegated credential could not be renewed: " + err.Error()}
+	}
+	if err := h.Store.SaveCredential(t.ctx, t.claim, tok); err != nil {
+		return "", err
+	}
+	t.cred = tok
+	return tok.AccessToken, nil
+}
+
+func refusedCredential() error {
+	return &run.Failure{Code: run.FailCredential, Message: "the gateway refuses the run's delegated credential even after renewing it"}
+}
+
+// credentialFailure ends the run for a credential it cannot use (D38), answering the call it was about to make (if any)
+// with the reason; an error that is not a *run.Failure is returned as it is.
+func (t *turn) credentialFailure(tc *run.ToolCall, err error) error {
+	var f *run.Failure
+	if !errors.As(err, &f) {
+		return err
+	}
+	if tc != nil {
+		if aerr := t.answer(*tc, run.CallFailed, "", f.Message); aerr != nil {
+			return aerr
+		}
+	}
+	return t.h.fail(t.ctx, t.claim, f.Code, f.Message)
 }
 
 func sanitize(err error) string {
@@ -586,10 +665,27 @@ func (t *turn) execute(tc run.ToolCall) (bool, error) {
 	if err := h.Store.UpdateToolCall(t.ctx, t.claim, tc.ID, run.CallExecuting, "", false, nil); err != nil {
 		return false, err
 	}
+	bearer, err := t.gatewayBearer(false)
+	if err != nil {
+		return false, t.credentialFailure(&tc, err)
+	}
 	start := h.Now()
 	cctx, cancel := context.WithTimeout(t.ctx, h.ToolTimeout)
-	res, err := t.gateway.Client.CallTool(cctx, t.gateway.Endpoint, t.bearer, tc.Tool, args)
+	res, err := t.gateway.Client.CallTool(cctx, t.gateway.Endpoint, bearer, tc.Tool, args)
 	cancel()
+	if mcpclient.Unauthorized(err) {
+		// D38: the gateway refused the credential before it reached the tool, so the call is made again once with a
+		// renewed one; a refusal after that ends the run instead of handing the model an error it cannot fix
+		if bearer, err = t.gatewayBearer(true); err != nil {
+			return false, t.credentialFailure(&tc, err)
+		}
+		cctx, cancel := context.WithTimeout(t.ctx, h.ToolTimeout)
+		res, err = t.gateway.Client.CallTool(cctx, t.gateway.Endpoint, bearer, tc.Tool, args)
+		cancel()
+		if mcpclient.Unauthorized(err) {
+			return false, t.credentialFailure(&tc, refusedCredential())
+		}
+	}
 	outcome := "ok"
 	if err != nil {
 		outcome = "error"
