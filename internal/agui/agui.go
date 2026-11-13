@@ -342,4 +342,6 @@ const (
 	// content guards (ADR-0001 D27, D28)
 	CustomGuardFlagged = "idp.host/guard.flagged"
 	CustomGuardBlocked = "idp.host/guard.blocked"
+	// a run delivered a file to its owner (D37): {toolCallId, ref, name, mediaType, size, sha256}
+	CustomFileDelivered = "idp.host/file.delivered"
 )

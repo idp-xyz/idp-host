@@ -293,3 +293,18 @@ D32 让运行"读"CMI；没有"写"，线程之外的后续运行就记不住这
 **验证**：单元（`internal/credential`：有效期内只签发一次、临近过期自动换新、寿命 1 秒的令牌连续三次调用都拿到可用的、20 个并发调用只签发一次、被拒绝后下次仍能恢复、没有配置时报错；`internal/config`：读写两处的合法写法与四种缺字段的拒绝）；整平台（idp-telos-go `deploy/compose/e2e.sh`，PATH A–I 全过，其中 PATH E 写入记忆、PATH G 抽取事实都走这条新凭据）。
 
 **局限（不标 PASS）**：没有在验收里跑满一小时去证明"过期后仍然工作"——那一点由单元测试（1 秒寿命的令牌）保证，验收只保证新路径本身可用；另外读取路径在 kind 上仍用 `delegation`（有意：按成员身份读，取回的才是他自己的记忆），`client_credentials` 的读取只在单元测试覆盖。
+
+## 19. D37：成员文件经票据进出运行（2026-11-13 决策与实施，平台 ADR-0002 阶段 1）
+
+起因：office 档位（平台 ADR-0002 阶段 0）让 Agent 能在沙箱里做 Word / Excel / PowerPoint，但成员既交不出自己的文件，也拿不到做好的文件。字节不能经过模型（会进上下文、调用记录和网关审计，25 MB 的文件也放不进去），凭据也不能进模型的输入。
+
+| # | 决策 | 理由 |
+|---|---|---|
+| D37 | **RunOptions 增 `idp.host/attachments` 与 `idp.host/delivery`（契约 1.8.0）**：调用方（idp-workspace）为每个附件给出 `{ref, name, mediaType, size, sha256, ticket}`，再给一张写票据 `{ticket}`；票据由文件的所有者系统签发，HOST 不解读。HOST 把票据从 forwardedProps 中取出，加密存入 `runs.file_tickets`（与网关凭据同一把 `IDP_HOST_CREDENTIAL_KEY`，运行结束、取消时与凭据一同清除），运行的 input 只留附件的描述，幂等摘要也只含描述（重签的票据重放同一个请求）。模型只被告知 `attachment:N  "名称"  类型  大小`，以及可以用 `output` 交付。网关工具的输入 Schema 用 `format` 声明哪个顶层属性接收文件：`idp-attachment` 收 `attachment:N`，`idp-delivery` 收 `output`；HOST 在允许列表与确认之后、发往网关之前把它们换成票据，别的工具、别的属性一律不换。记录的工具调用、确认页、事件与对话里都是模型写的引用。交付调用成功且结果带 `structuredContent.deliveredFile` 时追加事件 `idp.host/file.delivered {toolCallId, ref, name, mediaType, size, sha256}`。附件与交付要求 HOST 执行工具（`toolExecution: caller` 时 422），没有凭据密钥时 409；子 agent 运行拿不到票据 | 票据自带授权、可验证、短时、范围最小，替换放在确认之后，模型、外部模型、事件日志、网关调用记录都碰不到它（平台 ADR-0002 F3）。用 Schema 的 `format` 声明而不是按工具名硬编码：HOST 不认识 idp-sandbox，而只有经网关四眼登记、目录被钉住的工具才可能声明它；没有声明的工具即使参数里写着 `output` 也拿不到票据 |
+
+**实施**：`internal/run`（`Attachment`、`Delivery`、`FileTickets`、`WithoutFileOptions`，选项严格解析：至多 10 个、ref 互不相同、名称一行可打印且不含路径分隔符、票据为三段 base64url 且至多 8192 字符、多余字段拒绝）；`internal/api`（`createRun` 的拒绝与去除）；`adapters/store/postgres`（迁移 0008 的 `file_tickets`，`FileTickets` 解密，终态与取消时清除）；`internal/harness`（`fileProperties`、`fileArguments`、`filesNote`、`delivered`）；契约 1.8.0（`FileAttachment`、`FileDelivery`；`attachments` 的条目在选项里额外要求 `ticket`）。
+
+**验证**：单元（`internal/run`：选项的接受与 16 种拒绝、去除后的 forwardedProps 不含票据；契约：示例往返、8 种新拒绝用例 schema 与 API 一致；`internal/harness`：完整的创建→导入→运行→交付流程中网关只在声明的属性里收到票据，模型的输入、事件、调用记录与对话里都没有票据，`file.delivered` 带上 ref；越界的 `attachment:2`、伪造的票据串、`attachment:0`、非字符串、未许可的交付、`output` 以外的目标都在发出前拒绝；没有声明的工具里写 `output`、`attachment:1` 原样发出）；集成（`TestHostEndToEnd/file-tickets`，真实 PostgreSQL：存下的 input 不含票据、`file_tickets` 是密文，重签票据的重放返回同一个运行，沙箱收到第一次请求的票据，事件与工具调用记录不含票据，运行结束后 `file_tickets` 为 NULL，`caller` 加交付被拒）。
+
+**局限**：票据在有效期内、在 HOST 的进程内存里仍然是可用的凭据；运行若长于票据的有效期（由签发方定），之后的导入导出会被拒绝。敏感级别与外部模型的上限（平台 ADR-0002 F8）不在本决策内。
+

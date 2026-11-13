@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"path"
 	"regexp"
 	"strings"
 	"sync"
@@ -44,6 +45,62 @@ type Script func(messages []Message, tools []string) Turn
 // "run shell:" and "run office:", the sandbox's office profile)
 var workspaceRE = regexp.MustCompile(`workspace ([0-9a-f]{32}) created`)
 var sandboxCodeRE = regexp.MustCompile(`(?s)^run (python|shell|office):\s*(.+)$`)
+
+// the file flow (idp-host D37): "edit office: <code>" with a file attached creates a workspace, imports attachment:1 as
+// in<ext>, runs the code (which writes out<ext>), delivers out<ext> as "<name>-edited<ext>" and reports what was delivered.
+// The attachment's name comes from the HOST's note about the files ("attachment:1  \"<name>\" ...").
+var editRE = regexp.MustCompile(`(?s)^edit (python|shell|office):\s*(.+)$`)
+var attachmentNoteRE = regexp.MustCompile(`attachment:1  "([^"]+)"`)
+
+// editFlow answers the next step of the file flow, or false when the conversation is not one.
+func editFlow(messages []Message, has func(string) bool, toolName func(string) string) (Turn, bool) {
+	var code []string
+	name := ""
+	for _, m := range messages {
+		if c := editRE.FindStringSubmatch(m.Content); m.Role == "user" && c != nil {
+			code = c
+		}
+		if n := attachmentNoteRE.FindStringSubmatch(m.Content); n != nil && m.Role != "user" && m.Role != "tool" {
+			_ = json.Unmarshal([]byte(`"`+n[1]+`"`), &name)
+		}
+	}
+	if code == nil || name == "" || !has("sandbox_create") || !has("sandbox_import_file") || !has("sandbox_run") || !has("sandbox_export_file") {
+		return Turn{}, false
+	}
+	ext := path.Ext(name)
+	last := messages[len(messages)-1]
+	if last.Role == "user" {
+		return Turn{Reasoning: "need a workspace for the file", ToolCalls: []Call{{Name: toolName("sandbox_create"), Args: `{}`}}}, true
+	}
+	ws := ""
+	for _, m := range messages {
+		if w := workspaceRE.FindStringSubmatch(m.Content); m.Role == "tool" && w != nil {
+			ws = w[1]
+		}
+	}
+	prev := ""
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "assistant" && len(messages[i].ToolCalls) > 0 {
+			prev = messages[i].ToolCalls[0].Name
+			break
+		}
+	}
+	call := func(tool string, args map[string]any) (Turn, bool) {
+		b, _ := json.Marshal(args)
+		return Turn{Reasoning: "next step of the file", ToolCalls: []Call{{Name: toolName(tool), Args: string(b)}}}, true
+	}
+	switch {
+	case ws == "":
+		return Turn{Text: "Result: " + last.Content}, true
+	case strings.HasSuffix(prev, "sandbox_create"):
+		return call("sandbox_import_file", map[string]any{"workspaceId": ws, "source": "attachment:1", "path": "in" + ext})
+	case strings.HasSuffix(prev, "sandbox_import_file") && !strings.HasPrefix(last.Content, "error"):
+		return call("sandbox_run", map[string]any{"workspaceId": ws, "language": code[1], "code": strings.TrimSpace(code[2])})
+	case strings.HasSuffix(prev, "sandbox_run"):
+		return call("sandbox_export_file", map[string]any{"workspaceId": ws, "path": "out" + ext, "target": "output", "name": strings.TrimSuffix(name, ext) + "-edited" + ext})
+	}
+	return Turn{Text: "Result: " + last.Content}, true
+}
 
 var additionRE = regexp.MustCompile(`(\d+)\s*\+\s*(\d+)`)
 
@@ -107,6 +164,9 @@ func DefaultScript(messages []Message, tools []string) Turn {
 			}
 		}
 		return name
+	}
+	if t, ok := editFlow(messages, has, toolName); ok {
+		return t
 	}
 	switch last.Role {
 	case "tool":

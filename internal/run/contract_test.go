@@ -31,7 +31,7 @@ var update = flag.Bool("update", false, "regenerate api/contracts/examples.json 
 
 const (
 	contractDir = "../../api/contracts"
-	contractID  = "urn:idp:telos:host:1.7.0"
+	contractID  = "urn:idp:telos:host:1.8.0"
 )
 
 type noLoader struct{}
@@ -172,8 +172,14 @@ func exampleOptions(digest string) []run.Options {
 	return []run.Options{
 		{ExecutionRef: "execution:shipment-7f3a", ToolExecution: run.ToolExecutionCaller, ReleaseDigest: digest, MaxOutputTokens: 1024},
 		{ReleaseDigest: digest},
+		// a Workspace member's request with a file to edit and a file to deliver (D37)
+		{Attachments: []run.Attachment{{Ref: "6f1c2a9e-8d4b-4c3a-9e21-0b7d5f3a8c41", Name: "报价单.docx", MediaType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+			Size: 48213, SHA256: strings.Repeat("3b", 32), Ticket: exampleTicket}}, Delivery: &run.Delivery{Ticket: exampleTicket}},
 	}
 }
+
+// exampleTicket has the shape of a ticket (the HOST does not read it).
+const exampleTicket = "eyJhbGciOiJFUzI1NiIsImtpZCI6IndzLTEifQ.eyJhdWQiOiJpZHAtd29ya3NwYWNlLWZpbGVzIn0.c2lnbmF0dXJl"
 
 type example struct {
 	Definition string          `json:"definition"`
@@ -221,7 +227,7 @@ func buildExamples(t *testing.T) []byte {
 		add("RunOptions", o)
 	}
 	b, err := json.MarshalIndent(examplesFile{
-		Description: "idp.telos.host 1.7.0 的示例：每一个都是 idp-host 实际产出或原样接受的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录，RunOptions 经 run.ParseOptions 解析后原样往返）。",
+		Description: "idp.telos.host 1.8.0 的示例：每一个都是 idp-host 实际产出或原样接受的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录，RunOptions 经 run.ParseOptions 解析后原样往返）。",
 		GeneratedBy: "go test ./internal/run -run TestContract -update",
 		Examples:    out,
 	}, "", "  ")
@@ -335,7 +341,8 @@ func TestContractFieldsMatchGo(t *testing.T) {
 		"SkillRef": agent.SkillRef{}, "SkillDefinition": agent.SkillDefinition{}, "EmbeddedSkill": agent.EmbeddedSkill{}, "SkillRelease": agent.SkillDocument{},
 		"RunOptions": run.Options{}, "SubagentRef": agent.SubagentRef{}, "EmbeddedSubagent": agent.EmbeddedSubagent{}, "SkillMerge": agent.SkillMerge{}, "Resource": agent.Resource{},
 		"Guards": agent.Guards{}, "InputGuard": agent.InputGuard{}, "OutputGuard": agent.OutputGuard{}, "Evaluation": agent.Evaluation{}, "EvalCase": agent.EvalCase{}, "Expectation": agent.Expectation{},
-		"Routing": agent.Routing{}, "Candidate": agent.Candidate{}, "A2ARef": agent.A2ARef{}, "ContextPolicy": agent.ContextPolicy{}}
+		"Routing": agent.Routing{}, "Candidate": agent.Candidate{}, "A2ARef": agent.A2ARef{}, "ContextPolicy": agent.ContextPolicy{},
+		"FileAttachment": run.Attachment{}, "FileDelivery": run.Delivery{}}
 	for def, zero := range closed {
 		d, ok := defs[def].(map[string]any)
 		if !ok {
@@ -556,6 +563,14 @@ func TestContractRejectsWhatOpenRejects(t *testing.T) {
 		"execution ref with space":  {run.OptExecutionRef, "has space"},
 		"execution ref too long":    {run.OptExecutionRef, strings.Repeat("x", 257)},
 		"execution ref not visible": {run.OptExecutionRef, "tab\there"},
+		"attachments empty":         {run.OptAttachments, []any{}},
+		"attachment without ticket": {run.OptAttachments, []any{map[string]any{"ref": "f1", "name": "a.txt", "mediaType": "text/plain", "size": 1, "sha256": strings.Repeat("0a", 32)}}},
+		"attachment name with path": {run.OptAttachments, []any{map[string]any{"ref": "f1", "name": "../a.txt", "mediaType": "text/plain", "size": 1, "sha256": strings.Repeat("0a", 32), "ticket": exampleTicket}}},
+		"attachment name two lines": {run.OptAttachments, []any{map[string]any{"ref": "f1", "name": "a\nb.txt", "mediaType": "text/plain", "size": 1, "sha256": strings.Repeat("0a", 32), "ticket": exampleTicket}}},
+		"attachment extra field":    {run.OptAttachments, []any{map[string]any{"ref": "f1", "name": "a.txt", "mediaType": "text/plain", "size": 1, "sha256": strings.Repeat("0a", 32), "ticket": exampleTicket, "path": "/x"}}},
+		"eleven attachments":        {run.OptAttachments, elevenAttachments()},
+		"delivery without ticket":   {run.OptDelivery, map[string]any{}},
+		"delivery ticket malformed": {run.OptDelivery, map[string]any{"ticket": "a.b"}},
 	}
 	opts := exampleOptions(env.Digest)[0]
 	for name, c := range optionCases {
@@ -575,4 +590,12 @@ func TestContractRejectsWhatOpenRejects(t *testing.T) {
 	if _, err := run.ParseOptions(json.RawMessage(`{"app/theme":"dark","idp.host/toolExecution":"server"}`)); err != nil {
 		t.Errorf("the API rejects a caller's own forwardedProps key: %v", err)
 	}
+}
+
+func elevenAttachments() []any {
+	var out []any
+	for i := 0; i < 11; i++ {
+		out = append(out, map[string]any{"ref": fmt.Sprintf("f%d", i), "name": "a.txt", "mediaType": "text/plain", "size": 1, "sha256": strings.Repeat("0a", 32), "ticket": exampleTicket})
+	}
+	return out
 }

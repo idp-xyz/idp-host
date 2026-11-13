@@ -25,17 +25,18 @@ import (
 
 // memStore is an in-memory Store with the fencing and resolution semantics of the real one.
 type memStore struct {
-	mu       sync.Mutex
-	rc       run.Context
-	events   []agui.Event
-	calls    map[string]*run.ToolCall
-	steps    []run.Step
-	status   string
-	failCode string
-	cred     string
-	fenced   bool
-	fenceAt  int // fence after this many event appends (0 = never)
-	appends  int
+	mu          sync.Mutex
+	fileTickets *run.FileTickets
+	rc          run.Context
+	events      []agui.Event
+	calls       map[string]*run.ToolCall
+	steps       []run.Step
+	status      string
+	failCode    string
+	cred        string
+	fenced      bool
+	fenceAt     int // fence after this many event appends (0 = never)
+	appends     int
 	// sub-agent runs: what CreateChildRun was asked for, and what ChildOutcome answers
 	children map[string]*run.ChildOutcome
 	inputs   map[string]run.ChildRunInput
@@ -205,6 +206,10 @@ func (m *memStore) childEnds(id, status, output, code string) {
 	m.children[id].Status, m.children[id].Output, m.children[id].FailureCode = status, output, code
 	m.events = append(m.events, agui.Custom(agui.CustomSubagentFinished, map[string]any{"runId": id, "status": status}))
 	m.status, m.rc.Run.Status = run.StatusRunning, run.StatusRunning
+}
+
+func (m *memStore) FileTickets(context.Context, *run.Claim) (*run.FileTickets, error) {
+	return m.fileTickets, nil
 }
 
 func (m *memStore) Credential(context.Context, *run.Claim) (string, error) {

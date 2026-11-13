@@ -11,6 +11,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +39,7 @@ type Store interface {
 	UpdateToolCall(ctx context.Context, c *run.Claim, id, state, result string, isError bool, events []agui.Event) error
 	Finish(ctx context.Context, c *run.Claim, status, failureCode, failureMessage string, events []agui.Event) error
 	Credential(ctx context.Context, c *run.Claim) (string, error)
+	FileTickets(ctx context.Context, c *run.Claim) (*run.FileTickets, error) // the member's file tickets (D37)
 	// sub-agent runs (D22)
 	CreateChildRun(ctx context.Context, c *run.Claim, in run.ChildRunInput) (*run.Run, error)
 	ChildOutcome(ctx context.Context, c *run.Claim, childID string) (*run.ChildOutcome, error)
@@ -134,7 +137,18 @@ type turn struct {
 	waiting         bool                                 // a delegated call's child run has not ended yet
 	output          *guard.Output                        // the tenant's and the release's output filter (D28)
 	flagged         map[string]bool                      // untrusted content already reported in this turn (D27)
+	fileProps       map[string]map[string]string         // gateway tool -> property -> fileAttachment | fileDelivery (D37)
+	tickets         *run.FileTickets                     // loaded at the first file-taking call
 }
+
+// Formats a gateway tool's input schema gives a property that takes a member's file (D37): the model writes
+// attachment:N or output there, and the HOST puts the run's ticket in its place just before the call.
+const (
+	fileAttachment = "idp-attachment"
+	fileDelivery   = "idp-delivery"
+)
+
+var attachmentRE = regexp.MustCompile(`^attachment:([1-9][0-9]?)$`)
 
 // guardBlock ends a model call whose output the guard refused.
 type guardBlock struct {
@@ -255,6 +269,12 @@ func (t *turn) prepareTools() error {
 				continue
 			}
 			t.visible[tool.Name] = true
+			if props := fileProperties(tool.InputSchema); len(props) > 0 {
+				if t.fileProps == nil {
+					t.fileProps = map[string]map[string]string{}
+				}
+				t.fileProps[tool.Name] = props
+			}
 			desc := tool.Description
 			if desc == "" {
 				desc = tool.Title
@@ -292,6 +312,106 @@ func (t *turn) prepareTools() error {
 			Parameters: json.RawMessage(`{"type":"object","properties":{"skill":{"type":"string"},"name":{"type":"string"}},"required":["skill","name"],"additionalProperties":false}`)})
 	}
 	return nil
+}
+
+// fileProperties returns the top-level properties of a tool's input schema that take a member's file.
+func fileProperties(schema json.RawMessage) map[string]string {
+	var s struct {
+		Properties map[string]struct {
+			Format string `json:"format"`
+		} `json:"properties"`
+	}
+	if json.Unmarshal(schema, &s) != nil {
+		return nil
+	}
+	var out map[string]string
+	for name, p := range s.Properties {
+		if p.Format == fileAttachment || p.Format == fileDelivery {
+			if out == nil {
+				out = map[string]string{}
+			}
+			out[name] = p.Format
+		}
+	}
+	return out
+}
+
+// fileArguments puts the run's tickets in place of attachment:N and output in a file-taking call's arguments (D37). It
+// returns the arguments to send, whether the call delivers a file, and a message for the model when the call cannot be
+// made. The recorded call, the confirmation and the event log keep what the model wrote.
+func (t *turn) fileArguments(tc run.ToolCall) (json.RawMessage, bool, string, error) {
+	props := t.fileProps[tc.Tool]
+	if len(props) == 0 {
+		return json.RawMessage(tc.Arguments), false, "", nil
+	}
+	var args map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(tc.Arguments), &args); err != nil {
+		return json.RawMessage(tc.Arguments), false, "", nil // the gateway reports malformed arguments
+	}
+	in := t.rc.Run.Input
+	delivers := false
+	for name, format := range props {
+		raw, ok := args[name]
+		if !ok {
+			continue
+		}
+		var v string
+		if json.Unmarshal(raw, &v) != nil {
+			return nil, false, name + " must be a string", nil
+		}
+		if t.tickets == nil && (len(in.Attachments) > 0 || in.Delivery) {
+			tk, err := t.h.Store.FileTickets(t.ctx, t.claim)
+			if err != nil {
+				return nil, false, "", err
+			}
+			if tk == nil {
+				tk = &run.FileTickets{}
+			}
+			t.tickets = tk
+		}
+		var ticket string
+		switch format {
+		case fileAttachment:
+			m := attachmentRE.FindStringSubmatch(v)
+			if m == nil {
+				return nil, false, fmt.Sprintf("%s must be attachment:N, one of the files attached to this request (%d attached)", name, len(in.Attachments)), nil
+			}
+			n, _ := strconv.Atoi(m[1])
+			if n > len(in.Attachments) || t.tickets == nil || n > len(t.tickets.Read) {
+				return nil, false, fmt.Sprintf("there is no %s: %d files are attached to this request", v, len(in.Attachments)), nil
+			}
+			ticket = t.tickets.Read[n-1]
+		case fileDelivery:
+			if v != "output" {
+				return nil, false, name + " must be output", nil
+			}
+			if !in.Delivery || t.tickets == nil || t.tickets.Write == "" {
+				return nil, false, "files cannot be delivered from this request", nil
+			}
+			ticket, delivers = t.tickets.Write, true
+		}
+		args[name], _ = json.Marshal(ticket)
+	}
+	out, err := json.Marshal(args)
+	return out, delivers, "", err
+}
+
+// delivered reads what a delivering call returned (structuredContent.deliveredFile) as the file.delivered event.
+func delivered(tc run.ToolCall, res *mcpclient.CallResult) (agui.Event, bool) {
+	var s struct {
+		File *struct {
+			Ref       string `json:"ref"`
+			Name      string `json:"name"`
+			MediaType string `json:"mediaType"`
+			Size      int64  `json:"size"`
+			SHA256    string `json:"sha256"`
+		} `json:"deliveredFile"`
+	}
+	if json.Unmarshal(res.StructuredContent, &s) != nil || s.File == nil || s.File.Ref == "" {
+		return agui.Event{}, false
+	}
+	f := s.File
+	return agui.Custom(agui.CustomFileDelivered, map[string]any{"toolCallId": tc.ID, "ref": f.Ref, "name": f.Name, "mediaType": f.MediaType, "size": f.Size, "sha256": f.SHA256}), true
 }
 
 func sanitize(err error) string {
@@ -456,12 +576,19 @@ func (t *turn) execute(tc run.ToolCall) (bool, error) {
 	if t.gateway == nil {
 		return false, t.answer(tc, run.CallFailed, "", "no gateway configured")
 	}
+	args, delivers, refusal, err := t.fileArguments(tc)
+	if err != nil {
+		return false, err
+	}
+	if refusal != "" {
+		return false, t.answer(tc, run.CallFailed, "", refusal)
+	}
 	if err := h.Store.UpdateToolCall(t.ctx, t.claim, tc.ID, run.CallExecuting, "", false, nil); err != nil {
 		return false, err
 	}
 	start := h.Now()
 	cctx, cancel := context.WithTimeout(t.ctx, h.ToolTimeout)
-	res, err := t.gateway.Client.CallTool(cctx, t.gateway.Endpoint, t.bearer, tc.Tool, json.RawMessage(tc.Arguments))
+	res, err := t.gateway.Client.CallTool(cctx, t.gateway.Endpoint, t.bearer, tc.Tool, args)
 	cancel()
 	outcome := "ok"
 	if err != nil {
@@ -480,6 +607,13 @@ func (t *turn) execute(tc run.ToolCall) (bool, error) {
 	}
 	if res.IsError {
 		return false, t.answer(tc, run.CallFailed, text, "the tool reported an error")
+	}
+	if delivers {
+		if ev, ok := delivered(tc, res); ok {
+			if err := h.Store.AppendEvents(t.ctx, t.claim, []agui.Event{ev}); err != nil {
+				return false, err
+			}
+		}
 	}
 	return true, t.answer(tc, run.CallDone, text, "")
 }
@@ -938,6 +1072,9 @@ func (t *turn) guardedMessages() ([]agui.Message, error) {
 		report(fmt.Sprintf("ctx:%d", i), "context", c.Description, findings, in.Context == guard.ModeBlock)
 		msgs = append(msgs, agui.Message{ID: "ctx", Role: agui.RoleDeveloper, Content: c.Description + "\n" + value})
 	}
+	if note := t.filesNote(); note != "" {
+		msgs = append(msgs, agui.Message{ID: "files", Role: agui.RoleDeveloper, Content: note})
+	}
 	for _, m := range t.messages {
 		if m.Role == agui.RoleTool && m.Content != "" && in.ToolResults != guard.ModeOff { // an error-only result is the HOST's own text
 			content, findings := guard.Apply(in.ToolResults, "tool_result", m.Content)
@@ -952,6 +1089,43 @@ func (t *turn) guardedMessages() ([]agui.Message, error) {
 		}
 	}
 	return msgs, nil
+}
+
+// filesNote tells the model about the member's files and where its own files can go (D37): names, types and sizes,
+// never a ticket. It is said only when a gateway tool can take them.
+func (t *turn) filesNote() string {
+	in := t.rc.Run.Input
+	if len(t.fileProps) == 0 || (len(in.Attachments) == 0 && !in.Delivery) {
+		return ""
+	}
+	var takes, delivers bool
+	for _, props := range t.fileProps {
+		for _, f := range props {
+			takes = takes || f == fileAttachment
+			delivers = delivers || f == fileDelivery
+		}
+	}
+	var b strings.Builder
+	if takes && len(in.Attachments) > 0 {
+		b.WriteString("The user attached these files to this request. A tool that takes a file accepts the reference on the left:\n")
+		for i, a := range in.Attachments {
+			fmt.Fprintf(&b, "attachment:%d  %s  %s  %s\n", i+1, strconv.Quote(a.Name), a.MediaType, humanSize(a.Size))
+		}
+	}
+	if delivers && in.Delivery {
+		b.WriteString("To give the user a file, deliver it with target output; they will see it on this request and can download it.\n")
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func humanSize(n int64) string {
+	switch {
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1f MB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%d KB", (n+512)>>10)
+	}
+	return fmt.Sprintf("%d bytes", n)
 }
 
 // guardOutput applies the output guard to a completed answer (D28): blocked patterns over the whole

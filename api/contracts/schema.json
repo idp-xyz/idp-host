@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:idp:telos:host:1.7.0",
+  "$id": "urn:idp:telos:host:1.8.0",
   "title": "idp.telos.host 1.5.0",
-  "description": "idp-host（Agent Hosting & Coordination）对外发布的契约：AgentRelease（agent 行为的不可变发布件，ADR-0001 D2；1.1.0 起可嵌入 Skill，D17）、SkillRelease（skill 的不可变发布件）、Envelope（发布件加内容摘要）、AgentRun（一次运行的记录，API 返回的形态；1.3.0 起可为子 agent 运行，D22）和 RunOptions（1.2.0 起：创建运行时的调用方选项，D19）。1.3.0 新增：Definition 的 subagents 与 skillMerge（D22、D24）、Limits 的 maxSubagentDepth、SkillDefinition 的 resources（D23）、AgentRelease 的 subagents、AgentRun 的 parentRunId / depth 与状态 AWAITING_SUBAGENT。1.4.0 新增：Definition 的 guards（输入护栏与输出过滤，D27、D28）与 evaluation（评估集，D26），AgentRun 的 purpose。1.5.0 新增：ModelProfile 的 routing（模型路由，D29）、SubagentRef / EmbeddedSubagent 的 a2a（远端 A2A agent，D30）。生产者是 idp-host，权威副本在 idp-host/api/contracts/，由 go test ./internal/run -run TestContract 保证与实现一致；idp-contracts 中的副本只能与之逐字节相同。JSON Schema 只描述形状与可本地判定的规则；摘要是否匹配由 agent.Open / agent.OpenSkill 判定，运行时不变量由 HOST 的状态机判定。",
+  "description": "idp-host（Agent Hosting & Coordination）对外发布的契约：AgentRelease（agent 行为的不可变发布件，ADR-0001 D2；1.1.0 起可嵌入 Skill，D17）、SkillRelease（skill 的不可变发布件）、Envelope（发布件加内容摘要）、AgentRun（一次运行的记录，API 返回的形态；1.3.0 起可为子 agent 运行，D22）和 RunOptions（1.2.0 起：创建运行时的调用方选项，D19）。1.3.0 新增：Definition 的 subagents 与 skillMerge（D22、D24）、Limits 的 maxSubagentDepth、SkillDefinition 的 resources（D23）、AgentRelease 的 subagents、AgentRun 的 parentRunId / depth 与状态 AWAITING_SUBAGENT。1.4.0 新增：Definition 的 guards（输入护栏与输出过滤，D27、D28）与 evaluation（评估集，D26），AgentRun 的 purpose。1.5.0 新增：ModelProfile 的 routing（模型路由，D29）、SubagentRef / EmbeddedSubagent 的 a2a（远端 A2A agent，D30）。1.8.0 新增：RunOptions 的 idp.host/attachments 与 idp.host/delivery（成员文件进出运行，D37；定义 FileAttachment、FileDelivery）。生产者是 idp-host，权威副本在 idp-host/api/contracts/，由 go test ./internal/run -run TestContract 保证与实现一致；idp-contracts 中的副本只能与之逐字节相同。JSON Schema 只描述形状与可本地判定的规则；摘要是否匹配由 agent.Open / agent.OpenSkill 判定，运行时不变量由 HOST 的状态机判定。",
   "oneOf": [
     {"$ref": "#/$defs/AgentRelease"},
     {"$ref": "#/$defs/SkillRelease"},
@@ -420,7 +420,7 @@
     },
     "RunOptions": {
       "title": "RunOptions",
-      "description": "创建运行时的调用方选项（ADR-0001 D19）：RunAgentInput.forwardedProps 中 idp.host/ 开头的键组成的对象，AG-UI（POST /ag-ui/agents/{ref}）与 REST（POST /v1/agents/{ref}/runs）两个入口都接受。本定义只描述 idp.host/ 键：forwardedProps 里其他命名空间的键属于调用方，HOST 原样保存、不解释，不在本契约内；idp.host/ 下的未知键与任何不合规的值都使请求被拒绝（422），调用方不会误以为某个选项生效了。四项都进入幂等摘要：同一 runId / Idempotency-Key 带不同选项被拒绝（409）。",
+      "description": "创建运行时的调用方选项（ADR-0001 D19）：RunAgentInput.forwardedProps 中 idp.host/ 开头的键组成的对象，AG-UI（POST /ag-ui/agents/{ref}）与 REST（POST /v1/agents/{ref}/runs）两个入口都接受。本定义只描述 idp.host/ 键：forwardedProps 里其他命名空间的键属于调用方，HOST 原样保存、不解释，不在本契约内；idp.host/ 下的未知键与任何不合规的值都使请求被拒绝（422），调用方不会误以为某个选项生效了。各项都进入幂等摘要（附件只以其描述进入，票据不进入：重签的票据重放同一个请求）：同一 runId / Idempotency-Key 带不同选项被拒绝（409）。",
       "x-idp-telos-owner": "idp.telos.host",
       "type": "object",
       "additionalProperties": false,
@@ -429,7 +429,36 @@
         "idp.host/toolExecution": {"enum": ["server", "caller"], "description": "server（缺省）：按 release 的工具策略经 MCP 网关执行工具。caller：工具由调用方执行——模型只看到请求里的前端工具（tools），看不到 release 的网关工具；HOST 不换取网关凭据、不接触网关；只调用一次模型；模型提出的调用作为前端工具调用交回（运行以 interrupt 结束，调用记为 FRONTEND），调用方在下一次运行中回传结果。模型若调用未声明的工具，运行以 STEP_LIMIT 失败。"},
         "idp.host/releaseDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "运行该 agent 的这一份发布件（AgentRelease 的 Envelope.digest），它必须是已批准的或已被取代的发布件，否则请求被拒绝（409）。缺省运行当前发布件。运行记录的 AgentRun.releaseDigest 就是实际运行的发布件。"},
         "idp.host/executionRef": {"type": "string", "pattern": "^[\\x21-\\x7e]{1,256}$", "description": "调用方的执行引用（EER 的 execution id），记录为 AgentRun.executionRef，用于两边的审计关联。"},
-        "idp.host/maxOutputTokens": {"type": "integer", "minimum": 1, "maximum": 1048576, "description": "本次运行的模型输出上限：只能压低 release 的 model.maxOutputTokens，不能放大。"}
+        "idp.host/maxOutputTokens": {"type": "integer", "minimum": 1, "maximum": 1048576, "description": "本次运行的模型输出上限：只能压低 release 的 model.maxOutputTokens，不能放大。"},
+        "idp.host/attachments": {"type": "array", "minItems": 1, "maxItems": 10, "items": {"allOf": [{"$ref": "#/$defs/FileAttachment"}, {"required": ["ticket"]}]}, "description": "1.8.0：成员附在这次请求上的文件（D37，平台 ADR-0002 F2、F3）。模型只知道第 N 个附件的名称、类型与大小，在输入 Schema 中 format 为 idp-attachment 的工具参数里写 attachment:N；HOST 在调用发往网关前把它换成该附件的票据。ref 互不相同。需要 toolExecution server 与 HOST 的凭据密钥，否则拒绝（422 / 409）。"},
+        "idp.host/delivery": {"$ref": "#/$defs/FileDelivery", "description": "1.8.0：本次运行可以把文件交给运行的所有者（D37）。模型在 format 为 idp-delivery 的工具参数里写 output，HOST 换成写票据；工具结果的 structuredContent.deliveredFile 记为事件 idp.host/file.delivered {toolCallId, ref, name, mediaType, size, sha256}。"}
+      }
+    },
+    "FileAttachment": {
+      "title": "FileAttachment",
+      "description": "1.8.0：一个附件（D37）。ref、name、mediaType、size、sha256 由文件的所有者系统（idp-workspace）给出，HOST 原样告诉模型（ticket 除外）；ticket 是该系统为这次运行签发的读票据（三段 base64url，至多 8192 字符），HOST 加密保存，不进运行的 input、事件日志、模型上下文与工具调用记录，运行结束时清除。",
+      "x-idp-telos-owner": "idp.telos.host",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ref", "name", "mediaType", "size", "sha256"],
+      "properties": {
+        "ref": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"},
+        "name": {"type": "string", "minLength": 1, "maxLength": 255, "pattern": "^[^\u0000-\u001f\u007f-\u009f/\\x5c  ]+$", "description": "一行可打印字符，不含路径分隔符"},
+        "mediaType": {"type": "string", "pattern": "^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$"},
+        "size": {"type": "integer", "minimum": 0, "maximum": 2147483648},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "ticket": {"type": "string", "maxLength": 8192, "pattern": "^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$", "description": "请求里必须有；HOST 存下的描述里没有"}
+      }
+    },
+    "FileDelivery": {
+      "title": "FileDelivery",
+      "description": "1.8.0：交付文件的许可（D37）：所有者系统为这次运行签发的写票据，与附件的票据同样加密保存、运行结束时清除。",
+      "x-idp-telos-owner": "idp.telos.host",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ticket"],
+      "properties": {
+        "ticket": {"type": "string", "maxLength": 8192, "pattern": "^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$"}
       }
     }
   }

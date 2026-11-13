@@ -594,7 +594,22 @@ func (a *API) createRun(r *http.Request, p authorization.Principal, ref, key str
 			}
 		}
 	}
-	input := run.Input{Tools: in.Tools, Context: in.Context, ForwardedProps: in.ForwardedProps, ToolExecution: opts.ToolExecution, MaxOutputTokens: opts.MaxOutputTokens}
+	tickets := opts.Tickets()
+	if tickets != nil {
+		// D37: a member's files go to the sandbox through tool calls the HOST executes, with tickets it keeps sealed
+		if opts.ToolExecution != "" {
+			return nil, false, transport.Fail(http.StatusUnprocessableEntity, "INVALID", "file attachments and delivery need tools executed by the HOST (toolExecution server)")
+		}
+		if a.Store.Box == nil {
+			return nil, false, transport.Fail(http.StatusConflict, "CONFLICT", "this host keeps no file tickets (IDP_HOST_CREDENTIAL_KEY is not set)")
+		}
+	}
+	input := run.Input{Tools: in.Tools, Context: in.Context, ForwardedProps: run.WithoutFileOptions(in.ForwardedProps), ToolExecution: opts.ToolExecution, MaxOutputTokens: opts.MaxOutputTokens,
+		Delivery: opts.Delivery != nil}
+	for _, at := range opts.Attachments {
+		at.Ticket = ""
+		input.Attachments = append(input.Attachments, at)
+	}
 	if input.Tools == nil {
 		input.Tools = []agui.Tool{}
 	}
@@ -607,7 +622,7 @@ func (a *API) createRun(r *http.Request, p authorization.Principal, ref, key str
 		return nil, false, err
 	}
 	out, replayed, err := a.Store.CreateRun(r.Context(), p.Tenant, postgres.CreateRunInput{ThreadID: in.ThreadID, RunID: in.RunID, AgentRef: ag.ID, Owner: p.Subject,
-		IdempotencyKey: key, Messages: in.Messages, Input: input, Credential: cred, TraceID: observability.TraceID(r.Context()),
+		IdempotencyKey: key, Messages: in.Messages, Input: input, Credential: cred, FileTickets: tickets, TraceID: observability.TraceID(r.Context()),
 		ReleaseID: releaseID, ExecutionRef: opts.ExecutionRef, ContextPackageID: packageID, Extra: extra})
 	return out, replayed, err
 }

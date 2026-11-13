@@ -95,6 +95,7 @@ type env struct {
 	tokens   map[string]string
 	tenantA  string
 	tenantB  string
+	ownerURL string
 }
 
 var profile = identity.Profile{Issuer: "idp-host-it", Audience: "idp-host", TenantClaim: "tenant_id", RolesClaim: "roles"}
@@ -191,7 +192,7 @@ func newEnv(t *testing.T) *env {
 	deleg.Name = "delegated"
 	h := &harness.Harness{Store: store, Providers: model.NewRegistry(prov), Gateways: map[string]*harness.Gateway{"edge": edge, "delegated": deleg}, Log: log, DeltaFlush: time.Millisecond}
 	w := &worker.Worker{ID: "it-worker", Store: store, Harness: h, Lease: 30 * time.Second, Log: log}
-	return &env{t: t, store: store, host: a, harness: h, api: srv, worker: w, model: fm, mcp: fx, mcpDeleg: fx2, tokens: tokens, tenantA: tenantA, tenantB: tenantB}
+	return &env{t: t, store: store, host: a, harness: h, api: srv, worker: w, model: fm, mcp: fx, mcpDeleg: fx2, tokens: tokens, tenantA: tenantA, tenantB: tenantB, ownerURL: ownerURL}
 }
 
 // drive lets the worker serve every claimable run.
@@ -896,6 +897,82 @@ func TestHostEndToEnd(t *testing.T) {
 		if st, _ := e.call("POST", "/v1/agents/assistant/runs", "carol", bad, "Idempotency-Key", "bad-2"); st != 422 {
 			t.Fatalf("unknown option: %d", st)
 		}
+	})
+
+	t.Run("file-tickets", func(t *testing.T) {
+		// D37: the member's files go through tickets the HOST seals apart from the run and swaps in for the sandbox
+		e.mcp.Tools = append(e.mcp.Tools,
+			fakemcp.Tool{Name: "sandbox_create", InputSchema: `{"type":"object"}`, Handle: func(map[string]any) (string, bool) {
+				return "workspace 0123456789abcdef0123456789abcdef created", false
+			}},
+			fakemcp.Tool{Name: "sandbox_import_file", InputSchema: `{"type":"object","properties":{"workspaceId":{"type":"string"},"source":{"type":"string","format":"idp-attachment"},"path":{"type":"string"}}}`,
+				Handle: func(a map[string]any) (string, bool) { return "imported", false }},
+			fakemcp.Tool{Name: "sandbox_run", InputSchema: `{"type":"object","properties":{"workspaceId":{"type":"string"},"language":{"type":"string"},"code":{"type":"string"}}}`,
+				Handle: func(map[string]any) (string, bool) { return "exit code 0", false }},
+			fakemcp.Tool{Name: "sandbox_export_file", InputSchema: `{"type":"object","properties":{"workspaceId":{"type":"string"},"path":{"type":"string"},"target":{"type":"string","format":"idp-delivery"},"name":{"type":"string"}}}`,
+				Handle: func(a map[string]any) (string, bool) { return "delivered", false },
+				Structured: func(a map[string]any) any {
+					return map[string]any{"deliveredFile": map[string]any{"ref": "file-out-9", "name": a["name"], "mediaType": "text/plain", "size": 3, "sha256": strings.Repeat("cd", 32)}}
+				}},
+		)
+		e.publish("filer", definition("edge", []string{"sandbox_create", "sandbox_import_file", "sandbox_run", "sandbox_export_file"}, nil))
+		ticket := func(kind, n string) string { return "eyJhbGciOiJFUzI1NiJ9.eyJraW5kIjoi" + kind + "In0." + n }
+		props := func(n string) map[string]any {
+			return map[string]any{"idp.host/attachments": []any{map[string]any{"ref": "file-in-9", "name": "notes.txt", "mediaType": "text/plain", "size": 12, "sha256": strings.Repeat("ef", 32), "ticket": ticket("read", n)}},
+				"idp.host/delivery": map[string]any{"ticket": ticket("write", n)}, "app/x": "kept"}
+		}
+		body := runBody("thr-files", "edit shell: tr a-z A-Z < in.txt > out.txt")
+		body["forwardedProps"] = props("c2lnMQ")
+		r := e.must(202, "POST", "/v1/agents/filer/runs", "carol", body, "Idempotency-Key", "f1")
+		id := r["runId"].(string)
+		// a retry carries freshly signed tickets: the same request
+		body["forwardedProps"] = props("c2lnMg")
+		if again := e.must(200, "POST", "/v1/agents/filer/runs", "carol", body, "Idempotency-Key", "f1"); again["runId"] != id {
+			t.Fatal("re-signed tickets made another run")
+		}
+		conn, err := pgx.Connect(context.Background(), e.ownerURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close(context.Background())
+		var input string
+		var sealed []byte
+		if err := conn.QueryRow(context.Background(), `SELECT input::text, file_tickets FROM runs WHERE id = $1`, id).Scan(&input, &sealed); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(input, "eyJ") || !strings.Contains(input, "notes.txt") || !strings.Contains(input, "app/x") || len(sealed) == 0 || strings.Contains(string(sealed), "eyJ") {
+			t.Fatalf("stored input %s, tickets sealed %v", input, len(sealed))
+		}
+		calls := len(e.mcp.Calls())
+		e.drive()
+		got := e.must(200, "GET", "/v1/runs/"+id, "carol", nil)
+		if got["status"] != run.StatusCompleted {
+			t.Fatalf("%v", got)
+		}
+		var imported, exported bool
+		for _, c := range e.mcp.Calls()[calls:] {
+			imported = imported || c.Name == "sandbox_import_file" && c.Args["source"] == ticket("read", "c2lnMQ")
+			exported = exported || c.Name == "sandbox_export_file" && c.Args["target"] == ticket("write", "c2lnMQ")
+		}
+		if !imported || !exported {
+			t.Fatalf("the sandbox did not get the first request's tickets: %+v", e.mcp.Calls()[calls:])
+		}
+		_, events, _ := e.sse("GET", "/v1/runs/"+id+"/events", "carol", nil)
+		raw, _ := json.Marshal(events)
+		if strings.Contains(string(raw), "eyJ") || !strings.Contains(string(raw), agui.CustomFileDelivered) || !strings.Contains(string(raw), "file-out-9") {
+			t.Fatalf("events: %s", raw)
+		}
+		tcs, _ := json.Marshal(e.must(200, "GET", "/v1/runs/"+id+"/tool-calls", "carol", nil))
+		if strings.Contains(string(tcs), "eyJ") || !strings.Contains(string(tcs), "attachment:1") {
+			t.Fatalf("tool calls: %s", tcs)
+		}
+		if err := conn.QueryRow(context.Background(), `SELECT file_tickets FROM runs WHERE id = $1`, id).Scan(&sealed); err != nil || sealed != nil {
+			t.Fatalf("the tickets outlive the run: %v %v", len(sealed), err)
+		}
+		// files need tools the HOST executes
+		bad := runBody("thr-files-2", "x")
+		bad["forwardedProps"] = map[string]any{"idp.host/toolExecution": "caller", "idp.host/delivery": map[string]any{"ticket": ticket("write", "eA")}}
+		e.must(422, "POST", "/v1/agents/filer/runs", "carol", bad, "Idempotency-Key", "f2")
 	})
 
 	t.Run("subagents", func(t *testing.T) {

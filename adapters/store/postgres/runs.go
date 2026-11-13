@@ -26,6 +26,7 @@ type CreateRunInput struct {
 	Messages       []agui.Message // the conversation as sent; messages already on the thread are skipped
 	Input          run.Input
 	Credential     *credential.Token // delegated gateway token, sealed before storage
+	FileTickets    *run.FileTickets  // the member's file tickets (D37), sealed before storage
 	TraceID        string
 	ReleaseID      string // the approved release to run; "" = the agent's current release
 	ExecutionRef   string // the caller's execution reference (EER), recorded on the run
@@ -95,7 +96,7 @@ func (s *Store) CreateRun(ctx context.Context, tenant string, in CreateRunInput)
 	if in.RunID != "" && !agui.ValidID(in.RunID) || in.ThreadID != "" && !agui.ValidID(in.ThreadID) {
 		return nil, false, fail("INVALID", "runId and threadId must match ^[A-Za-z0-9_.:-]{1,128}$")
 	}
-	if in.Credential != nil && s.Box == nil {
+	if (in.Credential != nil || in.FileTickets != nil) && s.Box == nil {
 		return nil, false, errors.New("credential key not configured")
 	}
 	var out *run.Run
@@ -259,6 +260,13 @@ func (s *Store) CreateRun(ctx context.Context, tenant string, in CreateRunInput)
 				}
 				credExp = in.Credential.ExpiresAt
 			}
+			var tickets []byte
+			if in.FileTickets != nil {
+				plain, _ := json.Marshal(in.FileTickets)
+				if tickets, err = s.Box.Seal(plain); err != nil {
+					return err
+				}
+			}
 			inputRaw, _ := json.Marshal(in.Input)
 			deadline := s.now().Add(time.Duration(doc.Definition.Limits.RunTimeoutSeconds) * time.Second)
 			var trace, execRef, ctxPkg any
@@ -272,8 +280,8 @@ func (s *Store) CreateRun(ctx context.Context, tenant string, in CreateRunInput)
 				ctxPkg = in.ContextPackageID
 			}
 			if _, err := tx.Exec(ctx, `INSERT INTO runs (tenant_id, id, thread_id, agent_id, release_id, release_digest, owner, status, idempotency_key, request_sha256, input,
-			credential, credential_expires_at, trace_id, deadline_at, execution_ref, context_package_id) VALUES ($1, $2, $3, $4, $5, $6, $7, 'QUEUED', $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
-				tenant, runID, threadID, a.ID, releaseID, env.Digest, in.Owner, in.IdempotencyKey, hash, inputRaw, cred, credExp, trace, deadline, execRef, ctxPkg); err != nil {
+			credential, credential_expires_at, trace_id, deadline_at, execution_ref, context_package_id, file_tickets) VALUES ($1, $2, $3, $4, $5, $6, $7, 'QUEUED', $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
+				tenant, runID, threadID, a.ID, releaseID, env.Digest, in.Owner, in.IdempotencyKey, hash, inputRaw, cred, credExp, trace, deadline, execRef, ctxPkg, tickets); err != nil {
 				if isUniqueViolation(err) {
 					if strings.Contains(constraintOf(err), "idempotency") {
 						return errRetry // the same request raced; the retry replays it
@@ -531,7 +539,7 @@ func (s *Store) cancelResting(ctx context.Context, tx pgx.Tx, tenant string, r *
 	if _, err := tx.Exec(ctx, `UPDATE tool_calls SET state = 'REJECTED', decided_by = $2, decided_at = now() WHERE run_id = $1 AND state = 'PENDING_CONFIRMATION'`, r.ID, "cancel"); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE runs SET status = 'CANCELED', failure_code = 'CANCELED', failure_message = $2, finished_at = now(), lease_owner = NULL, lease_until = NULL, credential = NULL WHERE id = $1`, r.ID, reason); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE runs SET status = 'CANCELED', failure_code = 'CANCELED', failure_message = $2, finished_at = now(), lease_owner = NULL, lease_until = NULL, credential = NULL, file_tickets = NULL WHERE id = $1`, r.ID, reason); err != nil {
 		return err
 	}
 	if err := appendEvents(ctx, tx, tenant, r.ID, []agui.Event{agui.RunError(reason, "CANCELED")}); err != nil {
@@ -873,7 +881,7 @@ func (s *Store) Finish(ctx context.Context, c *run.Claim, status, failureCode, f
 			return err
 		}
 		if finished {
-			if _, err := tx.Exec(ctx, `UPDATE runs SET credential = NULL WHERE id = $1`, c.RunID); err != nil {
+			if _, err := tx.Exec(ctx, `UPDATE runs SET credential = NULL, file_tickets = NULL WHERE id = $1`, c.RunID); err != nil {
 				return err
 			}
 		}
@@ -1113,6 +1121,33 @@ func (s *Store) Credential(ctx context.Context, c *run.Claim) (string, error) {
 		return nil
 	})
 	return tok, err
+}
+
+// FileTickets returns the run's decrypted file tickets (D37); nil when it has none.
+func (s *Store) FileTickets(ctx context.Context, c *run.Claim) (*run.FileTickets, error) {
+	var out *run.FileTickets
+	err := s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
+		if _, err := s.owned(ctx, tx, c); err != nil {
+			return err
+		}
+		var sealed []byte
+		if err := tx.QueryRow(ctx, `SELECT file_tickets FROM runs WHERE id = $1`, c.RunID).Scan(&sealed); err != nil {
+			return err
+		}
+		if sealed == nil {
+			return nil
+		}
+		if s.Box == nil {
+			return errors.New("credential key not configured")
+		}
+		plain, err := s.Box.Open(sealed)
+		if err != nil {
+			return &run.Failure{Code: run.FailCredential, Message: "the file tickets cannot be decrypted"}
+		}
+		out = &run.FileTickets{}
+		return json.Unmarshal(plain, out)
+	})
+	return out, err
 }
 
 // ExpireConfirmations turns pending confirmations past their expiry into EXPIRED and queues the

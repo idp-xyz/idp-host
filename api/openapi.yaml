@@ -296,7 +296,7 @@ components:
     ForwardedProps:
       description: >-
         Caller options (ADR-0001 D19). The idp.host/ keys are the published contract object
-        urn:idp:telos:host:1.2.0#/$defs/RunOptions; keys outside the idp.host/ namespace are kept with
+        urn:idp:telos:host:1.8.0#/$defs/RunOptions; keys outside the idp.host/ namespace are kept with
         the run and ignored; an unknown idp.host/ key is rejected (422).
       type: object
       properties:
@@ -304,6 +304,8 @@ components:
         idp.host/releaseDigest: {type: string, pattern: '^sha256:[0-9a-f]{64}$', description: run this approved (or superseded) release of the agent instead of the current one; 409 when the agent has no such release}
         idp.host/executionRef: {type: string, pattern: '^[\x21-\x7e]{1,256}$', description: 'the caller''s execution reference (EER), recorded on the run'}
         idp.host/maxOutputTokens: {type: integer, minimum: 1, maximum: 1048576, description: caps the release's model output limit for this run}
+        idp.host/attachments: {type: array, minItems: 1, maxItems: 10, items: {type: object, required: [ref, name, mediaType, size, sha256, ticket], properties: {ref: {type: string}, name: {type: string}, mediaType: {type: string}, size: {type: integer}, sha256: {type: string}, ticket: {type: string}}}, description: 'contract 1.8.0 FileAttachment (ADR-0001 D37): the member''s files for this run; the model is told name, type and size and writes attachment:N in a tool property of format idp-attachment, the HOST puts the sealed ticket there just before the gateway call. Needs toolExecution server (422) and IDP_HOST_CREDENTIAL_KEY (409)'}
+        idp.host/delivery: {type: object, required: [ticket], properties: {ticket: {type: string}}, description: 'contract 1.8.0 FileDelivery (D37): the run may deliver files to its owner; output in a tool property of format idp-delivery becomes this ticket, and a delivered file is the event idp.host/file.delivered'}
     Run:
       description: contract idp.telos.host AgentRun
       type: object

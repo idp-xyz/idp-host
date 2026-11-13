@@ -135,6 +135,9 @@ type Input struct {
 	// Caller options (ADR-0001 D19), taken from forwardedProps["idp.host/..."].
 	ToolExecution   string `json:"toolExecution,omitempty"`   // "" = server, or ToolExecutionCaller
 	MaxOutputTokens int    `json:"maxOutputTokens,omitempty"` // caps the release's model output limit
+	// The member's files for this run, without their tickets (D37), and whether the run may deliver files.
+	Attachments []Attachment `json:"attachments,omitempty"`
+	Delivery    bool         `json:"delivery,omitempty"`
 }
 
 // ToolExecutionCaller: the caller executes every tool. The run offers the model only the caller's

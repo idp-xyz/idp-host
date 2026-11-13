@@ -18,6 +18,8 @@ type Tool struct {
 	Description string
 	InputSchema string
 	Handle      func(args map[string]any) (text string, isError bool)
+	// Structured, when set, gives the result's structuredContent.
+	Structured func(args map[string]any) any
 }
 
 // Server is the fake.
@@ -159,7 +161,11 @@ func (s *Server) Handler() http.Handler {
 					if fixed, ok := s.Results[name]; ok {
 						text, isErr = fixed, false
 					}
-					s.write(w, req.ID, map[string]any{"content": []map[string]any{{"type": "text", "text": text}}, "isError": isErr, "_meta": info}, nil, 200)
+					res := map[string]any{"content": []map[string]any{{"type": "text", "text": text}}, "isError": isErr, "_meta": info}
+					if t.Structured != nil && !isErr {
+						res["structuredContent"] = t.Structured(args)
+					}
+					s.write(w, req.ID, res, nil, 200)
 					return
 				}
 			}
