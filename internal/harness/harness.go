@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"idp-host/internal/a2a"
 	"idp-host/internal/agent"
@@ -474,6 +475,44 @@ func (t *turn) gatewayBearer(force bool) (string, error) {
 	return tok.AccessToken, nil
 }
 
+// toolCallError is what the model reads of a refused call: the JSON-RPC error and, when the gateway refused the
+// arguments, its reason (for example a missing required property), so that the model can correct the call instead of
+// repeating it. The run's file tickets never appear in it (D37).
+func (t *turn) toolCallError(err error) string {
+	msg := sanitize(err)
+	var rpc *mcpclient.RPCError
+	if errors.As(err, &rpc) && rpc.Code == -32602 && len(rpc.Data) > 0 {
+		var d struct {
+			Reason string `json:"reason"`
+		}
+		if json.Unmarshal(rpc.Data, &d) == nil && strings.TrimSpace(d.Reason) != "" {
+			r := strings.TrimSpace(d.Reason)
+			if len(r) > 600 {
+				cut := 600
+				for cut > 0 && !utf8.RuneStart(r[cut]) {
+					cut--
+				}
+				r = r[:cut] + "…"
+			}
+			msg += ": " + r
+		}
+	}
+	return t.redactTickets(msg)
+}
+
+// redactTickets removes the run's file tickets from text the model will read.
+func (t *turn) redactTickets(s string) string {
+	if t.tickets == nil {
+		return s
+	}
+	for _, tk := range append(append([]string(nil), t.tickets.Read...), t.tickets.Write) {
+		if tk != "" {
+			s = strings.ReplaceAll(s, tk, "[file ticket]")
+		}
+	}
+	return s
+}
+
 func refusedCredential() error {
 	return &run.Failure{Code: run.FailCredential, Message: "the gateway refuses the run's delegated credential even after renewing it"}
 }
@@ -692,9 +731,9 @@ func (t *turn) execute(tc run.ToolCall) (bool, error) {
 		if h.Metrics != nil {
 			h.Metrics.ToolCall(t.gateway.Name, outcome, h.Now().Sub(start))
 		}
-		return false, t.answer(tc, run.CallFailed, "", "tool call failed: "+sanitize(err))
+		return false, t.answer(tc, run.CallFailed, "", "tool call failed: "+t.toolCallError(err))
 	}
-	text := res.Text(h.ToolResultLimit)
+	text := t.redactTickets(res.Text(h.ToolResultLimit))
 	if res.IsError {
 		outcome = "tool_error"
 	}

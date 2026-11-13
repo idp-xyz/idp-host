@@ -324,3 +324,13 @@ D32 让运行"读"CMI；没有"写"，线程之外的后续运行就记不住这
 
 **局限**：会话最长时限（默认 10 小时）是硬上限；工作台的运行跟随者（D18）在确认等待之后重连 HOST 时用的仍是创建时的令牌，长时间等待后可能读不到事件（另行处理）。
 
+## 21. D39：网关拒绝参数的原因交给模型（2026-11-13）
+
+起因（真实模型试用）：office-assistant 两次调用 `sandbox_run` 漏了必填的 `language`，网关按钉住的 Schema 拒绝并在 `data.reason` 里写明"missing property 'language'"，HOST 却只把"Invalid arguments for tool …"交给模型，模型猜不出错在哪，白白用掉两步。
+
+| # | 决策 | 理由 |
+|---|---|---|
+| D39 | 网关以 -32602 拒绝参数时，HOST 把 `data.reason`（至多 600 字节）接在错误后面交给模型。本运行的文件票据在交给模型的任何工具结果与错误里都替换成 `[file ticket]` | 原因说的是模型自己写的参数，模型据此一步就能改对；拒绝信息可能引用参数值，而参数里可能已换成票据（D37），所以一律替换 |
+
+**验证**：`internal/harness` 的 `TestRefusedArgumentsReachTheModelWithTheReason`、`TestTicketsNeverReachTheModelThroughAnError`（fakemcp 新增按网关格式回 -32602 与 `data.reason` 的 `Refuse`）。
+

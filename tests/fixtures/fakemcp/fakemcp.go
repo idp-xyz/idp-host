@@ -20,6 +20,9 @@ type Tool struct {
 	Handle      func(args map[string]any) (text string, isError bool)
 	// Structured, when set, gives the result's structuredContent.
 	Structured func(args map[string]any) any
+	// Refuse, when it returns a reason, answers like the gateway does for arguments that fail the pinned schema:
+	// -32602 "Invalid arguments for tool <name>" with data.reason.
+	Refuse func(args map[string]any) string
 }
 
 // Server is the fake.
@@ -156,6 +159,12 @@ func (s *Server) Handler() http.Handler {
 			s.calls = append(s.calls, Call{Name: name, Args: args, Bearer: bearer})
 			s.mu.Unlock()
 			for _, t := range s.Tools {
+				if t.Name == name && t.Refuse != nil {
+					if reason := t.Refuse(args); reason != "" {
+						s.write(w, req.ID, nil, map[string]any{"code": -32602, "message": "Invalid arguments for tool " + name, "data": map[string]string{"reason": reason}}, 200)
+						return
+					}
+				}
 				if t.Name == name {
 					text, isErr := t.Handle(args)
 					if fixed, ok := s.Results[name]; ok {
