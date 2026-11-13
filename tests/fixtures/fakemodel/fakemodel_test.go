@@ -27,6 +27,17 @@ func TestSandboxFlow(t *testing.T) {
 	if got := DefaultScript([]Message{user}, []string{"minimal__echo"}); len(got.ToolCalls) != 0 {
 		t.Fatalf("%+v", got)
 	}
+	// "run office:" runs in the sandbox's office profile (idp-sandbox ADR-0001 D14), "run shell:" in the shell
+	for lang, code := range map[string]string{"office": "officecli create r.docx", "shell": "echo hi"} {
+		u := Message{Role: "user", Content: "run " + lang + ": " + code}
+		if t1 := DefaultScript([]Message{u}, tools); len(t1.ToolCalls) != 1 || t1.ToolCalls[0].Name != "sandbox__sandbox_create" {
+			t.Fatalf("%s first turn: %+v", lang, t1)
+		}
+		t2 := DefaultScript([]Message{u, created}, tools)
+		if len(t2.ToolCalls) != 1 || !strings.Contains(t2.ToolCalls[0].Args, `"language":"`+lang+`"`) || !strings.Contains(t2.ToolCalls[0].Args, code) {
+			t.Fatalf("%s second turn: %+v", lang, t2)
+		}
+	}
 }
 
 func TestDefaultScriptExtractsFactsFromTheUsersMessageOnly(t *testing.T) {

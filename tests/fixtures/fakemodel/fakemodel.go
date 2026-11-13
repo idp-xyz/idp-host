@@ -40,9 +40,10 @@ type Message struct {
 // Script decides the answer from the conversation and the offered tool names.
 type Script func(messages []Message, tools []string) Turn
 
-// the workspace id idp-sandbox's sandbox_create answers with, and the code of a "run python:" request
+// the workspace id idp-sandbox's sandbox_create answers with, and the language and code of a "run python:" request (also
+// "run shell:" and "run office:", the sandbox's office profile)
 var workspaceRE = regexp.MustCompile(`workspace ([0-9a-f]{32}) created`)
-var sandboxCodeRE = regexp.MustCompile(`(?s)^run python:\s*(.+)$`)
+var sandboxCodeRE = regexp.MustCompile(`(?s)^run (python|shell|office):\s*(.+)$`)
 
 var additionRE = regexp.MustCompile(`(\d+)\s*\+\s*(\d+)`)
 
@@ -113,7 +114,7 @@ func DefaultScript(messages []Message, tools []string) Turn {
 		if m := workspaceRE.FindStringSubmatch(last.Content); m != nil && has("sandbox_run") {
 			for i := len(messages) - 1; i >= 0; i-- {
 				if c := sandboxCodeRE.FindStringSubmatch(messages[i].Content); messages[i].Role == "user" && c != nil {
-					args, _ := json.Marshal(map[string]any{"workspaceId": m[1], "language": "python", "code": strings.TrimSpace(c[1])})
+					args, _ := json.Marshal(map[string]any{"workspaceId": m[1], "language": c[1], "code": strings.TrimSpace(c[2])})
 					return Turn{Reasoning: "run it in the workspace", ToolCalls: []Call{{Name: toolName("sandbox_run"), Args: string(args)}}}
 				}
 			}
