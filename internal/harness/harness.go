@@ -2,8 +2,8 @@
 // model request from the release and the thread, calls the model, turns the model's tool calls
 // into gateway calls (after the release's allow list and confirmation policy), records every step,
 // message, tool call and usage as events, and ends the turn as completed, failed, canceled or
-// waiting for the owner. It holds no business state. The one call it makes without the model is
-// D41: at the step limit it delivers a validated office file still sitting in a sandbox workspace.
+// waiting for the owner. It holds no business state. The only calls it makes without the model are
+// D41's: at the step limit it delivers the files a run made in a sandbox workspace and never exported.
 package harness
 
 import (
@@ -848,8 +848,8 @@ func (t *turn) loop() error {
 		primary := t.def.Model
 		step, cancelRequested, err := h.Store.StartStep(t.ctx, t.claim, t.def.Limits.MaxSteps, t.def.Limits.MaxTokensPerRun, primary.Provider, primary.Model)
 		if errors.Is(err, run.ErrStepLimit) {
-			// D41: a validated office file can still be in the workspace. Deliver it before the run is failed,
-			// while the write ticket is still there. A store or credential error already finished the run.
+			// D41: a finished file can still be in the workspace. Deliver it before the run is failed, while
+			// the write ticket is still there. A store or credential error already finished the run.
 			n, serr := t.salvage()
 			if serr != nil {
 				return serr

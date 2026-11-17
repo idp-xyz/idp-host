@@ -96,17 +96,42 @@ func stepLimitMessage(max, delivered int) string {
 	case 0:
 		return msg
 	case 1:
-		return msg + "; 1 validated file was delivered from the workspace"
+		return msg + "; 1 file was delivered from the workspace as it stood"
 	default:
-		return fmt.Sprintf("%s; %d validated files were delivered from the workspace", msg, delivered)
+		return fmt.Sprintf("%s; %d files were delivered from the workspace as they stood", msg, delivered)
 	}
 }
 
-// salvage delivers office files the model validated, or that still validate, when the step limit has
-// been reached and the model never exported them (D41). It returns how many files were delivered.
-// A store or credential error is returned as it is (the run is already finished when the error is a
-// failure). Anything else — no workspace, a tool error, a file that does not validate — delivers nothing
-// for that file and does not by itself fail the run.
+// salvageable says whether a file left in the workspace is one the host delivers at the step limit, and the
+// command that must succeed first ("" = none). An office file must validate and a PDF must open (D41, D42).
+// Markdown has no such check, and it is also what a model takes its notes in, so only a Markdown file under
+// out/ counts: that is where the skill tells the model to put what is meant for the user.
+func salvageable(p string) (check string, ok bool) {
+	switch strings.ToLower(path.Ext(p)) {
+	case ".docx", ".xlsx", ".pptx":
+		return "officecli validate " + shQuote(p), true
+	case ".pdf":
+		return "pdftext --check " + shQuote(p), true
+	case ".md":
+		return "", strings.HasPrefix(p, "out/")
+	}
+	return "", false
+}
+
+// workspacePath is a path as sandbox_list_files gives it: relative to the workspace, without ./ or /work/.
+func workspacePath(p string) string {
+	p = path.Clean(strings.TrimPrefix(strings.TrimSpace(p), "/work/"))
+	if p == "." || strings.HasPrefix(p, "../") {
+		return ""
+	}
+	return strings.TrimPrefix(p, "/")
+}
+
+// salvage delivers the files the run made and never exported, when the step limit has been reached (D41,
+// D42): office files that validate, PDF files that open, and Markdown under out/. It returns how many files
+// were delivered. A store or credential error is returned as it is (the run is already finished when the
+// error is a failure). Anything else — no workspace, a tool error, a file that fails its check — delivers
+// nothing for that file and does not by itself fail the run.
 func (t *turn) salvage() (int, error) {
 	if !t.canSalvage() || run.Overdue(t.rc.Run.DeadlineAt, t.h.Now()) {
 		return 0, nil
@@ -121,30 +146,40 @@ func (t *turn) salvage() (int, error) {
 	}
 	var candidates []string
 	for _, p := range listedFiles(res) {
-		if imported[p] || exported[p] || !officeExt(p) {
+		p = workspacePath(p)
+		if _, ok := salvageable(p); !ok || imported[p] || exported[p] {
 			continue
 		}
 		candidates = append(candidates, p)
 	}
-	sort.Strings(candidates)
+	// what the model put under out/ first: the limits below may not reach every file
+	sort.Slice(candidates, func(i, j int) bool {
+		a, b := strings.HasPrefix(candidates[i], "out/"), strings.HasPrefix(candidates[j], "out/")
+		if a != b {
+			return a
+		}
+		return candidates[i] < candidates[j]
+	})
 	delivered := 0
 	checked := 0
 	for _, p := range candidates {
 		if delivered >= salvageMaxDeliver || checked >= salvageMaxChecks || run.Overdue(t.rc.Run.DeadlineAt, t.h.Now()) {
 			break
 		}
-		checked++
-		ok, res, err = t.salvageCall(t.toolNamed("sandbox_run"), map[string]any{
-			"workspaceId": ws,
-			"language":    "office",
-			"code":        "officecli validate " + shQuote(p),
-		})
-		if err != nil || !ok {
-			return delivered, err
-		}
-		code, known := exitCode(res)
-		if !known || code != 0 {
-			continue
+		if check, _ := salvageable(p); check != "" {
+			checked++
+			ok, res, err = t.salvageCall(t.toolNamed("sandbox_run"), map[string]any{
+				"workspaceId": ws,
+				"language":    "office",
+				"code":        check,
+			})
+			if err != nil || !ok {
+				return delivered, err
+			}
+			code, known := exitCode(res)
+			if !known || code != 0 {
+				continue
+			}
 		}
 		ok, res, err = t.salvageCall(t.toolNamed("sandbox_export_file"), map[string]any{
 			"workspaceId": ws,
@@ -208,7 +243,7 @@ func (t *turn) sandboxState() (ws string, imported, exported map[string]bool) {
 			}
 			_ = json.Unmarshal([]byte(c.Function.Arguments), &args)
 			kind[c.ID] = base
-			paths[c.ID] = args.Path
+			paths[c.ID] = workspacePath(args.Path) // ./in/a.pdf and in/a.pdf are one file
 			workspaces[c.ID] = args.WorkspaceID
 		}
 		if m.Role != "tool" || m.Error != "" {
@@ -324,14 +359,6 @@ func exportSucceeded(res *mcpclient.CallResult) bool {
 		} `json:"deliveredFile"`
 	}
 	return json.Unmarshal(res.StructuredContent, &s) == nil && s.File != nil && s.File.Ref != ""
-}
-
-func officeExt(p string) bool {
-	switch strings.ToLower(path.Ext(p)) {
-	case ".docx", ".xlsx", ".pptx":
-		return true
-	}
-	return false
 }
 
 func shQuote(s string) string {

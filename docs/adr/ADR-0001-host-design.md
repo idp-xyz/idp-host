@@ -392,3 +392,19 @@ D40 局限里的报价表，在指引改成「先交付」之后又跑了一次�
 
 **验证**：`TestBudgetIsToldAndNotStored`（说明出现在交给模型的内容里，不写入会话）；`TestLastStepsOfferOnlyDelivery`（4 步里的后两步只给出交付工具，再调用运行被拒绝，没有工作区时不兜底）；`TestStepLimitDeliversTheValidatedFile`（导入的、空的、非 Office 的、校验失败的都不交，校验通过的按写票据交出去，记录里仍是 `output`）；`TestStepLimitSkipsAFileAlreadyDelivered`；`TestStepLimitWithoutDeliveryDoesNotTouchTheWorkspace`。去掉兜底或收尾，对应的测试失败。
 
+**真实模型**（2026-11-17，compose 平台）：同一份报价表、同一句话在新会话里用 84 步、约 27 分钟完成，第 78 步模型自己交付了工作簿（185,707 字节），输入最高占窗口的 71%，没有走到上限。兜底在真实网关与沙箱上的触发见 D42。
+
+## 24. D42：步数用尽时也交出 PDF 与 Markdown（2026-11-17）
+
+office 档位能读写 PDF 了（idp-sandbox D17），成员也会要 Markdown。D41 的兜底只认 Word、Excel、PowerPoint。
+
+| # | 决策 | 理由 |
+|---|---|---|
+| D42 | **兜底交付扩到 PDF 与 Markdown。** 工作区里这次会话没有导入过、也没有交付过的文件：`.docx` / `.xlsx` / `.pptx` 仍先过 `officecli validate`；`.pdf` 先过 `pdftext --check`（能打开、至少一页）；`.md` 只交 `out/` 下的，不跑检查。`out/` 下的排在前面，上限不变（至多检查 8 个、交付 5 个）。路径先规整再比较：模型导入时写的 `./in/a.pdf`、`/work/in/a.pdf` 与列出来的 `in/a.pdf` 是同一个文件。失败消息改为 `the run reached its limit of N steps; 2 files were delivered from the workspace as they stood`，不再说"已校验" | PDF 与 Office 文件一样是成品格式，能打开就值得交。Markdown 没有可跑的检查，又是模型记笔记的格式，把工作区里所有 `.md` 都交出去会把草稿也交给成员；`out/` 是 skill 让模型放成品的地方，放进去就是模型自己说"这是给用户的"。消息原来说"已校验"，对 Markdown 不成立；"as they stood"说的是事实：文件是上限那一刻的样子，不是 agent 说做完了的样子。成员附来的 PDF 现在也是候选格式，路径写法不同就认不出它是导入的，会把成员自己的文件再交回去，所以先规整 |
+
+**实施**：`internal/harness`（`salvageable`、`workspacePath`；`salvage` 按它们筛选、排序、决定是否先跑检查）。
+
+**验证**：`TestStepLimitDeliversPDFAndMarkdownToo`（`out/` 下的 PDF 与 Markdown、别处能打开的 PDF 交出去；打不开的 PDF、`out/` 之外的 Markdown、CSV、以 `./in/…` 导入的成员文件都不交；Markdown 不跑检查；三个 `file.delivered`）。去掉路径规整或 `out/` 的限制，这个测试失败。D41 的测试改用新的消息。
+
+**在真实网关与沙箱上触发了一次**（2026-11-17，compose 平台，真实模型）：bob 上传一份 Markdown，让 office-assistant 排成 PDF、另写一份摘要，放在 `out/`，先不交付；运行完成，没有交付。随后给 office-assistant 发布一个步数上限为 2 的发布件（短于 3 步的运行没有收尾段），bob 在同一会话追问一件需要三次运行的事。模型走完两步后，harness 依次调用 `sandbox_list_files`、`sandbox_export_file`（摘要，不检查）、`sandbox_run`（`pdftext --check 'out/派送价格说明.pdf'`，退出码 0）、`sandbox_export_file`（PDF）；运行以 `STEP_LIMIT` 结束，消息是"…2 files were delivered from the workspace as they stood"，两个 `file.delivered`，收件箱是"failed"并列出两个文件，bob 下载到的两个文件与记录的 SHA-256 一致，导入的那份 Markdown 没有被交回，运行结束后票据已清除。之后把原来的发布件重新设为当前。这也是 D41 的兜底第一次在真实平台上运行；此前只有对假网关的单元测试。
+

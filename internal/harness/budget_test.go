@@ -158,7 +158,7 @@ func TestStepLimitDeliversTheValidatedFile(t *testing.T) {
 	if !errorsAs(err, &f) || f.Code != run.FailStepLimit {
 		t.Fatalf("%v", err)
 	}
-	if !strings.Contains(runError(m), "1 validated file was delivered from the workspace") {
+	if runError(m) != "the run reached its limit of 2 steps; 1 file was delivered from the workspace as it stood" {
 		t.Fatalf("failure %q", runError(m))
 	}
 	var exported []string
@@ -254,8 +254,108 @@ func TestStepLimitSkipsAFileAlreadyDelivered(t *testing.T) {
 	if exports != 1 {
 		t.Fatalf("exports %d", exports)
 	}
-	if strings.Contains(runError(m), "validated") {
+	if runError(m) != "the run reached its limit of 2 steps" {
 		t.Fatalf("failure %q", runError(m))
+	}
+}
+
+// D42: at the step limit a PDF that opens is delivered like an office file that validates, and so is Markdown the
+// model put under out/. A PDF that does not open, Markdown elsewhere (the model's notes) and the member's own file,
+// however the model wrote its path when it imported it, stay where they are.
+func TestStepLimitDeliversPDFAndMarkdownToo(t *testing.T) {
+	e := setup(t)
+	sandboxTools(e.mcp)
+	e.mcp.Tools = append(e.mcp.Tools, fakemcp.Tool{
+		Name: "sandbox_list_files", InputSchema: `{"type":"object","properties":{"workspaceId":{"type":"string"}}}`,
+		Handle: func(map[string]any) (string, bool) { return "7 files", false },
+		Structured: func(map[string]any) any {
+			return map[string]any{"files": []map[string]any{
+				{"path": "in/来件.pdf", "size": 9000},
+				{"path": "notes.md", "size": 300},
+				{"path": "draft.pdf", "size": 4000},
+				{"path": "bad.pdf", "size": 4000},
+				{"path": "out/摘要.md", "size": 800},
+				{"path": "out/报告.pdf", "size": 5000},
+				{"path": "out/data.csv", "size": 50},
+			}}
+		},
+	})
+	for i := range e.mcp.Tools {
+		if e.mcp.Tools[i].Name != "sandbox_run" {
+			continue
+		}
+		e.mcp.Tools[i].Handle = func(map[string]any) (string, bool) { return "ran", false }
+		e.mcp.Tools[i].Structured = func(a map[string]any) any {
+			code, _ := a["code"].(string)
+			exit := 0
+			if strings.Contains(code, "bad.pdf") {
+				exit = 1
+			}
+			return map[string]any{"exitCode": exit}
+		}
+	}
+	for i := range e.mcp.Tools {
+		if e.mcp.Tools[i].Name == "sandbox_export_file" { // the fixture's reference is the same for every file
+			e.mcp.Tools[i].Structured = func(a map[string]any) any {
+				return map[string]any{"deliveredFile": map[string]any{"ref": "file-" + a["name"].(string), "name": a["name"], "mediaType": "application/pdf", "size": 1, "sha256": strings.Repeat("ab", 32)}}
+			}
+		}
+	}
+	wsRe := regexp.MustCompile(`workspace ([0-9a-f]{32}) created`)
+	e.model.Script = func(msgs []fakemodel.Message, tools []string) fakemodel.Turn {
+		for _, msg := range msgs {
+			if msg.Role == "tool" {
+				if w := wsRe.FindStringSubmatch(msg.Content); w != nil {
+					return fakemodel.Turn{ToolCalls: []fakemodel.Call{{Name: "sandbox_import_file", Args: `{"workspaceId":"` + w[1] + `","source":"attachment:1","path":"./in/来件.pdf"}`}}}
+				}
+			}
+		}
+		return fakemodel.Turn{ToolCalls: []fakemodel.Call{{Name: "sandbox_create", Args: `{}`}}}
+	}
+	d := filesDef()
+	d.Limits.MaxSteps = 2
+	d.Tools.Allow = []string{"sandbox_create", "sandbox_import_file", "sandbox_run", "sandbox_list_files", "sandbox_export_file"}
+	m := newMem(d, user("summarize the PDF and give me a report"), filesInput())
+	m.fileTickets = &run.FileTickets{Read: []string{readTicket}, Write: writeTicket}
+	e.h.Store = m
+	err := e.h.Run(context.Background(), claim)
+	var f *run.Failure
+	if !errorsAs(err, &f) || f.Code != run.FailStepLimit {
+		t.Fatalf("%v", err)
+	}
+	if runError(m) != "the run reached its limit of 2 steps; 3 files were delivered from the workspace as they stood" {
+		t.Fatalf("failure %q", runError(m))
+	}
+	var exported, checks []string
+	for _, c := range e.mcp.Calls() {
+		switch c.Name {
+		case "sandbox_export_file":
+			if c.Args["target"] != writeTicket {
+				t.Fatalf("export went out without the write ticket: %v", c.Args["target"])
+			}
+			exported = append(exported, c.Args["path"].(string)+" as "+c.Args["name"].(string))
+		case "sandbox_run":
+			if c.Args["language"] != "office" {
+				t.Fatalf("check call %v", c.Args)
+			}
+			checks = append(checks, c.Args["code"].(string))
+		}
+	}
+	// what is under out/ comes first; Markdown is not run through a check
+	if got := strings.Join(exported, ", "); got != "out/报告.pdf as 报告.pdf, out/摘要.md as 摘要.md, draft.pdf as draft.pdf" {
+		t.Fatalf("exported %s", got)
+	}
+	if got := strings.Join(checks, "; "); got != "pdftext --check 'out/报告.pdf'; pdftext --check 'bad.pdf'; pdftext --check 'draft.pdf'" {
+		t.Fatalf("checks %s", got)
+	}
+	delivered := 0
+	for _, ev := range m.events {
+		if ev.Type() == agui.EventCustom && ev["name"] == agui.CustomFileDelivered {
+			delivered++
+		}
+	}
+	if delivered != 3 {
+		t.Fatalf("%d file.delivered events", delivered)
 	}
 }
 
@@ -332,7 +432,7 @@ func TestSalvageKeepsTheWorkspaceThatRan(t *testing.T) {
 	e.h.Store = m
 	err := e.h.Run(context.Background(), claim)
 	var f *run.Failure
-	if !errorsAs(err, &f) || f.Code != run.FailStepLimit || !strings.Contains(runError(m), "1 validated file") {
+	if !errorsAs(err, &f) || f.Code != run.FailStepLimit || !strings.Contains(runError(m), "1 file was delivered") {
 		t.Fatalf("%v %q", err, runError(m))
 	}
 	for _, c := range e.mcp.Calls() {
