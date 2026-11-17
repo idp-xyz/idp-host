@@ -302,8 +302,8 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-		return nil, model.Classify(resp.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10)) // read to classify it (D40), never kept
+		return nil, model.ClassifyBody(resp.StatusCode, body)
 	}
 	acc := &accumulator{}
 	mt := strings.ToLower(strings.TrimSpace(strings.Split(resp.Header.Get("Content-Type"), ";")[0]))

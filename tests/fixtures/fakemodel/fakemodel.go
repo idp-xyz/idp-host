@@ -22,6 +22,10 @@ type Turn struct {
 	Reasoning string
 	ToolCalls []Call
 	Status    int // non-zero: answer this HTTP status instead
+	// ErrorCode is the code of the error answered with Status on the OpenAI wire (e.g. context_length_exceeded).
+	ErrorCode string
+	// CutOff answers on the OpenAI wire with finish_reason "length": the model ran out of context or output.
+	CutOff bool
 }
 
 // Call is a requested tool call.
@@ -110,6 +114,7 @@ type Server struct {
 	calls     atomic.Int64
 	mu        sync.Mutex
 	last      []Message
+	history   [][]Message // every request, including the host's budget note
 	lastTools []string
 	lastMax   int
 	models    []string
@@ -144,10 +149,26 @@ func (s *Server) Last() []Message {
 	return append([]Message(nil), s.last...)
 }
 
+// History returns every request, in order, including notes the script itself does not see.
+func (s *Server) History() [][]Message {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([][]Message, len(s.history))
+	for i, msgs := range s.history {
+		out[i] = append([]Message(nil), msgs...)
+	}
+	return out
+}
+
 // DefaultScript: a user message mentioning "sum" calls sum_weights when offered; after a tool
 // result it reports the result; a user message starting with "fail:" makes the server answer 500;
 // otherwise it echoes.
 func DefaultScript(messages []Message, tools []string) Turn {
+	// D41: the host appends a budget note the model reads and the thread does not store. Scripts decide
+	// from the conversation, not from that note.
+	if n := len(messages); n > 0 && strings.HasPrefix(messages[n-1].Content, "Budget:") {
+		messages = messages[:n-1]
+	}
 	last := messages[len(messages)-1]
 	has := func(name string) bool {
 		for _, t := range tools {
@@ -365,21 +386,25 @@ var unwrapRE = regexp.MustCompile(`(?s)^<untrusted source="[a-z_]+">\n(.*)\n</un
 func (s *Server) decide(msgs []Message, tools []string) Turn {
 	s.calls.Add(1)
 	s.mu.Lock()
-	s.last = msgs
+	s.last = append([]Message(nil), msgs...)
+	s.history = append(s.history, s.last)
 	s.lastTools = tools
 	s.mu.Unlock()
-	// scripts reason about the tool's own output: strip the wrapper a guarded HOST adds
-	plain := make([]Message, len(msgs))
-	for i, m := range msgs {
+	// scripts reason about the tool's own output: strip the wrapper a guarded HOST adds, and the
+	// budget note the host appends for the model (D41), which is not part of the conversation
+	plain := make([]Message, 0, len(msgs))
+	for _, m := range msgs {
 		if m.Role == "tool" {
 			if sub := unwrapRE.FindStringSubmatch(m.Content); sub != nil {
 				m.Content = sub[1]
 			}
 		}
-		plain[i] = m
+		if (m.Role == "system" || m.Role == "developer") && strings.HasPrefix(m.Content, "Budget:") {
+			continue
+		}
+		plain = append(plain, m)
 	}
-	msgs = plain
-	return s.Script(msgs, tools)
+	return s.Script(plain, tools)
 }
 
 func (s *Server) recordMax(n int) {
@@ -443,10 +468,17 @@ func (s *Server) openai(w http.ResponseWriter, r *http.Request) {
 	}
 	turn := s.decide(msgs, tools)
 	if turn.Status != 0 {
-		writeJSON(w, turn.Status, map[string]any{"error": map[string]any{"message": "scripted failure"}})
+		failure := map[string]any{"message": "scripted failure"}
+		if turn.ErrorCode != "" {
+			failure["code"] = turn.ErrorCode
+		}
+		writeJSON(w, turn.Status, map[string]any{"error": failure})
 		return
 	}
 	finish := "stop"
+	if turn.CutOff {
+		finish = "length"
+	}
 	var toolCalls []map[string]any
 	for i, c := range turn.ToolCalls {
 		toolCalls = append(toolCalls, map[string]any{"index": i, "id": fmt.Sprintf("call_%d_%d", s.calls.Load(), i), "type": "function",

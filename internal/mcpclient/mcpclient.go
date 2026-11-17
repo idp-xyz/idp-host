@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/otel/propagation"
 
@@ -288,7 +289,11 @@ func (r *CallResult) Text(limit int) string {
 	}
 	s := sb.String()
 	if limit > 0 && len(s) > limit {
-		s = s[:limit] + "\n[truncated]"
+		cut := limit
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+		s = s[:cut] + fmt.Sprintf("\n[truncated: %d of %d bytes shown; narrow the output (head, grep, a summary) to see the part you need]", cut, len(s))
 	}
 	return s
 }

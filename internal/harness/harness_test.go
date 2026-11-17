@@ -300,6 +300,14 @@ func user(text string) []agui.Message {
 	return []agui.Message{{ID: "u1", Role: agui.RoleUser, Content: text}}
 }
 
+// spoken is the last message that is not the host's budget note (D41).
+func spoken(messages []fakemodel.Message) fakemodel.Message {
+	if n := len(messages); n > 0 && strings.HasPrefix(messages[n-1].Content, "Budget:") {
+		messages = messages[:n-1]
+	}
+	return messages[len(messages)-1]
+}
+
 var claim = &run.Claim{TenantID: "t", RunID: "run_1", WorkerID: "w", Epoch: 1}
 
 func TestPlainAnswer(t *testing.T) {
@@ -650,7 +658,7 @@ func subagentRelease(depth int) *agent.Document {
 // delegating is a model script: a user asking to "delegate" calls the helper agent, a tool result is
 // reported, anything else is echoed.
 func delegating(messages []fakemodel.Message, tools []string) fakemodel.Turn {
-	last := messages[len(messages)-1]
+	last := spoken(messages)
 	if last.Role == "tool" {
 		return fakemodel.Turn{Text: "Result: " + last.Content}
 	}
@@ -771,7 +779,7 @@ func TestSubagentToolNotOfferedBeyondDepthOrInCallerMode(t *testing.T) {
 func TestOnDemandSkillResource(t *testing.T) {
 	e := setup(t)
 	e.model.Script = func(messages []fakemodel.Message, tools []string) fakemodel.Turn {
-		last := messages[len(messages)-1]
+		last := spoken(messages)
 		if last.Role == "tool" {
 			return fakemodel.Turn{Text: "Result: " + last.Content}
 		}
@@ -879,7 +887,7 @@ func TestInputGuardBlockWithholdsFlaggedToolResult(t *testing.T) {
 func TestOutputGuardBlocksRedactsAndBuffers(t *testing.T) {
 	e := setup(t)
 	e.model.Script = func(messages []fakemodel.Message, _ []string) fakemodel.Turn {
-		return fakemodel.Turn{Text: "Contact bob@example.com, card 4111 1111 1111 1111. " + messages[len(messages)-1].Content}
+		return fakemodel.Turn{Text: "Contact bob@example.com, card 4111 1111 1111 1111. " + spoken(messages).Content}
 	}
 	// redaction only
 	d := def()

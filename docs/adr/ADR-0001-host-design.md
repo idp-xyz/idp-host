@@ -334,3 +334,61 @@ D32 让运行"读"CMI；没有"写"，线程之外的后续运行就记不住这
 
 **验证**：`internal/harness` 的 `TestRefusedArgumentsReachTheModelWithTheReason`、`TestTicketsNeverReachTheModelThroughAnError`（fakemcp 新增按网关格式回 -32602 与 `data.reason` 的 `Refuse`）。
 
+## 22. D40：模型读到的工具结果有上限，装不下时说明原因（2026-11-13 发现，2026-11-17 决策与实施）
+
+起因（真实模型试用）：bob 上传一份 282 KB 的报价表（xlsx）让 office-assistant 处理，两次都没有结果。模型的上下文窗口是 131,072 token，HOST 每一步都把会话里所有工具结果原样交给模型，单个结果的上限是 64 KiB。
+
+- **在已经跑过三次运行的会话里**：第 1 步的输入就有 89,323 token，第 15 步 129,919，第 16 步模型服务回 400。运行以 `MODEL_ERROR: model call failed: status_400` 结束；bob 在同一会话重试三次，每次都在第 1 步得到同样的 400，看不出原因，也看不出该换会话。
+- **换了新会话**：从 2,073 token 开始，几次打印表格内容的结果各有 15–35 KB，第 28 步输入 129,992 token，回答写了 1,072 token 就被截断（`finish_reason=length`），运行却记为 `COMPLETED`，没有交付文件；随后三次追问都是同样的"截断但完成"。
+
+两个会话里的工具结果分别有 196 KB 和 213 KB，录得的密度是 0.27–0.85 token/字节（数字密集的表格最高，中位 0.45）。
+
+| # | 决策 | 理由 |
+|---|---|---|
+| D40 | **模型读到的工具结果有上限；装不下时，运行说明原因。** ① 单个网关工具结果交给模型的上限从 64 KiB 降到 16 KiB，在字符边界截断，并写明共多少字节、显示了多少、请缩小输出。② 每一步交给模型的会话里，最近 6 个工具结果保持原样；更早且超过 1,200 字节的只给头 2/3 与尾 1/3，中间写明省略了多少字节、需要时缩小范围重跑。skill 的参考文档（`resource__read`）与出错的结果不缩短。存下来的会话与事件不变，变的只是模型这一步读到的内容。③ 回答因长度被截断且没有工具调用时，运行以 `MODEL_ERROR` 结束，消息写明回答被截断、当时的输入 token 数与步数，不再记为完成。④ OpenAI 兼容的模型服务以 400 拒绝、正文表明请求超出上下文窗口时，这一步的错误码是 `context_length`，运行的失败消息写明会话已装不下模型的上下文窗口、请开新会话或一次少做一些；其余 400 仍是 `status_400` | 旧的工具结果模型已经读过并据此行动，需要时可以再取；整份留着只会把后面的步骤挤掉。参考文档是 skill 要模型只读一次的，缩短了它只能再读一遍。被截断的回答不是回答：记为完成，用户看到的是半句话和一件没做完的事。超出窗口不是模型服务的故障而是这个会话的状态，重试没有用，用户要知道该怎么办。正文只用来分类，不记录也不交给任何人，D9 的"只有错误码"不变 |
+
+**按录下的两个会话回放**（真实代码，量的是 `guardedMessages` 实际交给模型的内容；token 数按录下的每步增长折算，是估计值；结果被缩短后模型的做法也会不同，这里只比大小）：
+
+| 会话 | 时刻 | 工具结果（字节） | 输入 token（录得 → D40 之后的估计） |
+|---|---|---|---|
+| 新会话 | 第 28 步，回答被截断 | 213,299 → 84,686 | 129,992 → 约 46,000（窗口的 35%） |
+| 已有三次运行的会话 | 第 4 次运行第 16 步，400 | 196,394 → 127,536 | 约 131,500 → 约 106,000（81%） |
+
+**取舍与边界**：
+
+- 上限按字节算，不按 token：HOST 不知道各个模型的分词。最坏情况是最近 6 个结果都是 16 KiB 的数字表格，约 8 万 token；窗口比这小的模型仍会超出，由 ③④ 说明原因。
+- 每当一个结果滑出"最近 6 个"被缩短，它之后的内容在模型服务的前缀缓存里就失效，那一步要重新处理最近几个结果。在参考主机的模型服务上，一步在开始写回答之前的耗时从约 2.5 秒变成约 4.5 秒（两次真实运行第 8 步之后各步的耗时对回答 token 数的回归；生成速度不变，约 125 token/秒）。
+- 16 KiB、6 个、1,200 字节是 `Harness` 的默认值，没有配置项。
+- 被截断但带有工具调用的回答不在 ③ 之内，行为不变。
+- ④ 只在 OpenAI 兼容适配器里实现，认的是 OpenAI、vLLM、llama.cpp 与参考主机上 Strata 的说法；Anthropic 与 Gemini 适配器仍报 `status_400`。说法不在其列的服务也仍报 `status_400`，`tests/live` 的用例会把它查出来。
+
+**实施**：`internal/harness`（`Harness.KeepToolResults`、`OldToolResultBytes`；`oldToolResults`、`shortenOld`，`guardedMessages` 在输入防护之前缩短；`loop` 里 ③④ 的两条失败消息）；`internal/mcpclient`（`CallResult.Text` 在字符边界截断并写明字节数）；`internal/model`（`CodeContextLength`、`ClassifyBody`）；`adapters/providers/openai`（非 200 时读至多 64 KiB 正文用于分类）；`tests/fixtures/fakemodel`（`Turn.CutOff`、`Turn.ErrorCode`）；`tests/live`（`TestLiveRequestTooLongIsToldApart`）。
+
+**验证**：单元（`internal/harness`：`TestOldToolResultsAreShortenedForTheModel`，旧的长结果只剩头尾，参考文档、最近的结果与短结果不变，存下来的会话不变；`TestCutOffAnswerIsNotACompletedRun`；`TestRequestTooLongForTheModelSaysSo`，`context_length_exceeded` 的 400 得到说明，别的 400 仍是 `status_400`；`internal/model`：`TestClassifyBody`；`internal/mcpclient`：`TestResultText`）。去掉 ②③④ 中任何一处实现，对应的测试失败。`make test`、`make test-integration`（真实 PostgreSQL）通过。回放见上表。
+
+**真实模型**（2026-11-17，compose 平台，只换了 `idp-host` 的镜像；模型服务 Strata 0.1.27，`qwen3.8-flash-next-iq3_xxs`，窗口 131,072）：
+
+- bob 用同一份报价表、同一句话在新会话里重跑：50 步里输入最高 72,702 token（窗口的 55%），第 22 步之后随着旧结果被缩短有升有降，没有 400，也没有被截断的回答。**这次运行仍然没有交付文件**：它以 `STEP_LIMIT` 结束，模型 50 步都在写解析这份表的脚本（见局限）。
+- 那个此前每次都在第 1 步得到 400 的会话：第 1 步输入 113,148 token（86%），正常作答。上表的估计（约 106,000）偏低约 6%。
+- 模型服务对装不下的请求的回答是 `prompt (N tokens) + max tokens (M) exceeds the context (131072); requests are never truncated`，不是事先按 llama.cpp 的格式写的那几种说法；补上之后 `TestLiveRequestTooLongIsToldApart`（真实适配器，2 MiB 的请求）通过，去掉则失败。OpenAI、vLLM、llama.cpp 三种说法是按各自公开的错误格式写的，没有对着真实服务核对过。
+- 没有做的：让一次平台上的运行真的超出窗口并看到 ④ 的失败消息。这条路径分两半验证过（真实服务到适配器的错误码，错误码到运行的失败消息）。
+
+**局限**：
+
+- 长会话仍然会增长。模型自己写的工具调用参数（脚本）不缩短，在那个已有三次运行的会话里有 140 KB；每个旧结果也还留约 1.3 KB。那个会话现在占窗口的 86%，再跑一次就会超出，届时用户得到 ④ 的说明。把旧的轮次压缩成摘要是另一个决定。
+- 这份报价表的任务在步数上限里没有做完。上限提到 120 步、45 分钟后再跑一次（新会话，2026-11-17 04:38–05:12 UTC）：120 步、约 34 分钟，输入最高 119,448 token（窗口的 91%），6 个工具结果被截断，没有 400，也没有交付文件。117 次 `sandbox_run` 花在抽出表格、反复打印和重写解析上，`sandbox_export_file` 一次都没有。步数不是缺口。指引已改成先交付再看，写进当前的 officecli skill 与 office-assistant 发布件；这次运行用的还是改之前的那一版。
+- 用改过的指引又跑了一次（新会话，同一份表、同一句话，2026-11-17 05:25–05:55 UTC）：仍然用满 120 步，约 29 分钟，输入最高 116,863 token（窗口的 89%），以 `STEP_LIMIT` 结束，`sandbox_export_file` 一次都没有。不同的是文件做出来了：第 94 步建出工作簿，第 114 步 `officecli validate` 通过，剩下的 6 步用在核对和调格式上。模型不知道自己还剩几步：harness 只用步数上限来终止运行，没有把上限或已用的步数告诉模型，skill 里也只说步数有限。用户在同一会话里追问一句之后，下一次运行用 13 步、114 秒交付了文件（245,916 字节，10 个工作表），其中前 11 步还在校验和调整；这时会话占窗口的 93%。交付的文件对照源表核对过：2,872 行运价的每个价格都与源表一致，769 行附加费都能在源表对应的工作表里找到；重量档 `1000+` 有两处写成了 `1000`，渠道目录的物流商一列 17 行里有 11 行是空的或填成了分组标题。指引让模型把文件做了出来，没有让它在一次运行里交付。
+- 工作台的跟随者原来 10 分钟就放弃（idp-workspace D11）。这次运行的收件箱是"failed / STEP_LIMIT"，不再是"result unavailable"。跟随改到运行自己的 `deadlineAt` 之后（idp-workspace D26）。
+
+## 23. D41：告诉模型还剩几步，最后两步只交付，步数用尽时交出所校验的文件（2026-11-17）
+
+D40 局限里的报价表，在指引改成「先交付」之后又跑了一次：第 94 步做出工作簿，第 114 步 `officecli validate` 通过，剩下的步数用在核对和调格式上，120 步用尽，`sandbox_export_file` 一次都没有。文件还在工作区里。模型不知道自己走到了第几步；到上限时 harness 只结束运行，不看工作区。同一会话里追问一句，下一次运行才把文件交出去，而且前 11 步仍在改格式。
+
+| # | 决策 | 理由 |
+|---|---|---|
+| D41 | **预算、收尾、兜底。** ① 每一步交给模型的内容里加一条不落库的说明：这是第 N 步、共 M 步、这一步之后还剩几步、离运行期限还剩多久。② M≥3 且这一步是最后两步之一，并且这个 agent 有声明了 `idp-delivery` 的工具时，这一步只把这些交付工具交给模型；别的调用记为拒绝，原因是运行正在收尾、只剩交付。短于 3 步的运行不留收尾段，否则没有步数做正事。③ 下一步会超过步数上限时，在记 `STEP_LIMIT` 之前，若这次请求允许交付、对话里能找到沙箱工作区、并且列文件、运行、交付三个工具都在：列出文件，跳过这次导入成功的和已经交付成功的，对其余 `.docx` / `.xlsx` / `.pptx` 用 `language: office` 跑 `officecli validate`，通过的以 `target: output` 交付。至多检查 8 个、交付 5 个。记录里仍是 `output`，票据只在发往网关时换上（D37）。校验没通过、没有工作区、office 语言跑不了，就什么都不交，失败消息与原来相同。交出去了，失败码仍是 `STEP_LIMIT`，消息写明交了几个已校验的文件；`idp.host/file.delivered` 照常记，收件箱因此既有失败原因也有文件。兜底不等待确认：运行已经不能再走一步，交付的授权是这次请求上的写票据。期限已过则不做。 | 模型看不见上限，就会把最后几步花在打磨上。只靠提示不够：追问时它仍先改了 11 步才导出，所以最后两步拿掉别的工具。即便如此它仍可能不调用导出；文件已经能校验、人在等，就由 harness 交出去。不把运行改记为完成：工作没在上限内收束，文件是兜底交的。沙箱看不到步数，也不能自己把文件推给成员（D37 的票据在 HOST） |
+
+**实施**：`internal/harness`（`budgetNote`、`modelTools`、`wrappingUp`，`guardedMessages` 把说明加在这一步会话的末尾、不写入线程，这样前面的对话仍是稳定前缀；`dispatch` 在收尾步拒绝非交付调用；`loop` 在 `ErrStepLimit` 时 `salvage`，工作区取最后一次成功的沙箱调用，被拒绝的调用不算）。office 镜像里看表结构的命令是 idp-sandbox D16，skill 文案在 `deploy/compose/e2e.sh`。
+
+**验证**：`TestBudgetIsToldAndNotStored`（说明出现在交给模型的内容里，不写入会话）；`TestLastStepsOfferOnlyDelivery`（4 步里的后两步只给出交付工具，再调用运行被拒绝，没有工作区时不兜底）；`TestStepLimitDeliversTheValidatedFile`（导入的、空的、非 Office 的、校验失败的都不交，校验通过的按写票据交出去，记录里仍是 `output`）；`TestStepLimitSkipsAFileAlreadyDelivered`；`TestStepLimitWithoutDeliveryDoesNotTouchTheWorkspace`。去掉兜底或收尾，对应的测试失败。
+

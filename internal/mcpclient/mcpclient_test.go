@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -60,7 +61,7 @@ func TestResultText(t *testing.T) {
 		t.Fatal(r.Text(0))
 	}
 	r = &CallResult{StructuredContent: json.RawMessage(`{"k":1}`)}
-	if r.Text(0) != `{"k":1}` || r.Text(3) != `{"k`+"\n[truncated]" {
+	if r.Text(0) != `{"k":1}` || !strings.HasPrefix(r.Text(3), `{"k`+"\n[truncated: 3 of 7 bytes shown") {
 		t.Fatal(r.Text(0), r.Text(3))
 	}
 	if _, err := CheckEndpoint("https://u:p@gw/mcp"); err == nil {

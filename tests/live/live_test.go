@@ -11,6 +11,7 @@ package live
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -110,4 +111,28 @@ func TestLiveModel(t *testing.T) {
 			t.Logf("final: %q", resp2.Message.Content)
 		})
 	}
+}
+
+// D40: the OpenAI-compatible endpoint refuses a request that cannot fit its context window, and the adapter tells
+// that refusal apart from any other 400. A server whose wording model.ClassifyBody does not know shows up here
+// (the reference host's did). The request is 2 MiB of numbers; nothing is generated.
+func TestLiveRequestTooLongIsToldApart(t *testing.T) {
+	mdl, base := os.Getenv("IDP_LIVE_MODEL"), os.Getenv("IDP_LIVE_OPENAI_URL")
+	if mdl == "" || base == "" {
+		t.Skip("IDP_LIVE_MODEL and IDP_LIVE_OPENAI_URL not set")
+	}
+	hc, _ := model.NewHTTPClient(2*time.Minute, "")
+	p, err := openai.New(openai.Config{Name: "live-openai", BaseURL: base, APIKey: os.Getenv("IDP_LIVE_API_KEY"), HTTP: hc, UsageInStream: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	long := strings.Repeat("31415 92653 58979 ", (2<<20)/18)
+	_, err = p.Complete(ctx, model.Request{Model: mdl, MaxOutputTokens: 16, Messages: []agui.Message{{ID: "u1", Role: agui.RoleUser, Content: long}}}, nil)
+	var me *model.Error
+	if !errors.As(err, &me) || me.Code != model.CodeContextLength {
+		t.Fatalf("a request of %d bytes was answered with %v, not with the code %s", len(long), err, model.CodeContextLength)
+	}
+	t.Logf("%d bytes: %v (HTTP %d)", len(long), me, me.Status)
 }

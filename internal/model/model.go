@@ -105,17 +105,24 @@ func (r *Registry) Names() []string {
 	return out
 }
 
+// CodeContextLength is the code of a request the provider refused because it does not fit the model's context
+// window (D40).
+const CodeContextLength = "context_length"
+
 // Error is a provider failure safe to record and show: a code, never the provider's raw body.
 type Error struct {
-	Code      string // transport, status, decode, schema, canceled
-	Status    int    // HTTP status when Code is "status"
+	Code      string // transport, status, context_length, decode, schema, canceled
+	Status    int    // HTTP status when Code is "status" or "context_length"
 	Retryable bool
 }
 
 // Error implements error.
 func (e *Error) Error() string {
-	if e.Code == "status" {
+	switch e.Code {
+	case "status":
 		return fmt.Sprintf("model provider answered HTTP %d", e.Status)
+	case CodeContextLength:
+		return "the request does not fit the model's context window"
 	}
 	return "model provider error: " + e.Code
 }
@@ -165,4 +172,24 @@ func NewHTTPClient(headerTimeout time.Duration, caFile string) (*http.Client, er
 // Classify turns an HTTP status into a provider error.
 func Classify(status int) *Error {
 	return &Error{Code: "status", Status: status, Retryable: status == 408 || status == 429 || status >= 500}
+}
+
+// contextMarkers is how OpenAI-compatible servers name a request that does not fit the model's context window:
+// OpenAI's error code, the message of OpenAI and vLLM, llama.cpp's error type and its message, and the message of
+// the Strata server the platform is tried with ("prompt (N tokens) + max tokens (M) exceeds the context (W)").
+var contextMarkers = []string{"context_length_exceeded", "maximum context length", "exceed_context_size_error", "exceeds the available context size", "exceeds the context"}
+
+// ClassifyBody is Classify for a refusal whose body was read (D40): a 400 that says the request does not fit the
+// model's context window gets its own code, because the caller can do something about that one. Only the code
+// leaves this function; the body is neither kept nor shown.
+func ClassifyBody(status int, body []byte) *Error {
+	if status == http.StatusBadRequest {
+		text := strings.ToLower(string(body))
+		for _, marker := range contextMarkers {
+			if strings.Contains(text, marker) {
+				return &Error{Code: CodeContextLength, Status: status}
+			}
+		}
+	}
+	return Classify(status)
 }

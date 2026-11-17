@@ -2,7 +2,8 @@
 // model request from the release and the thread, calls the model, turns the model's tool calls
 // into gateway calls (after the release's allow list and confirmation policy), records every step,
 // message, tool call and usage as events, and ends the turn as completed, failed, canceled or
-// waiting for the owner. It never executes a tool itself and never holds business state.
+// waiting for the owner. It holds no business state. The one call it makes without the model is
+// D41: at the step limit it delivers a validated office file still sitting in a sandbox workspace.
 package harness
 
 import (
@@ -101,8 +102,12 @@ type Harness struct {
 
 	DeltaFlush      time.Duration // how often streamed text is persisted (default 50 ms)
 	ToolTimeout     time.Duration // per tool call (default 60 s)
-	ToolResultLimit int           // bytes of tool output handed to the model (default 64 KiB)
-	NewMessageID    func() string
+	ToolResultLimit int           // bytes of one tool result handed to the model (default 16 KiB, D40)
+	// D40: the model reads the last KeepToolResults tool results whole (default 6); an older one longer than
+	// OldToolResultBytes (default 1200) is shown as its head and tail. Skill resources are never shortened.
+	KeepToolResults    int
+	OldToolResultBytes int
+	NewMessageID       func() string
 }
 
 func (h *Harness) defaults() {
@@ -112,8 +117,14 @@ func (h *Harness) defaults() {
 	if h.ToolTimeout == 0 {
 		h.ToolTimeout = 60 * time.Second
 	}
+	if h.KeepToolResults == 0 {
+		h.KeepToolResults = 6
+	}
+	if h.OldToolResultBytes == 0 {
+		h.OldToolResultBytes = 1200
+	}
 	if h.ToolResultLimit == 0 {
-		h.ToolResultLimit = 64 << 10
+		h.ToolResultLimit = 16 << 10
 	}
 	if h.NewMessageID == nil {
 		h.NewMessageID = model.NewMessageID
@@ -149,6 +160,9 @@ type turn struct {
 	fileProps       map[string]map[string]string         // gateway tool -> property -> fileAttachment | fileDelivery (D37)
 	cred            *credential.Token                    // the run's delegated gateway credential, as last loaded or renewed (D38)
 	tickets         *run.FileTickets                     // loaded at the first file-taking call
+	step            int                                  // the model step in progress (D41)
+	salvageN        int                                  // host-initiated calls made while salvaging a file at the step limit
+	lastResult      *mcpclient.CallResult                // the gateway result of the call execute just finished
 }
 
 // Formats a gateway tool's input schema gives a property that takes a member's file (D37): the model writes
@@ -685,6 +699,7 @@ func (t *turn) answer(tc run.ToolCall, state, result, errText string) error {
 // call whose result is recorded.
 func (t *turn) execute(tc run.ToolCall) (bool, error) {
 	h := t.h
+	t.lastResult = nil
 	if _, ok := t.subagents[tc.Tool]; ok {
 		return true, t.delegate(tc)
 	}
@@ -734,6 +749,7 @@ func (t *turn) execute(tc run.ToolCall) (bool, error) {
 		return false, t.answer(tc, run.CallFailed, "", "tool call failed: "+t.toolCallError(err))
 	}
 	text := t.redactTickets(res.Text(h.ToolResultLimit))
+	t.lastResult = res
 	if res.IsError {
 		outcome = "tool_error"
 	}
@@ -832,7 +848,13 @@ func (t *turn) loop() error {
 		primary := t.def.Model
 		step, cancelRequested, err := h.Store.StartStep(t.ctx, t.claim, t.def.Limits.MaxSteps, t.def.Limits.MaxTokensPerRun, primary.Provider, primary.Model)
 		if errors.Is(err, run.ErrStepLimit) {
-			return h.fail(t.ctx, t.claim, run.FailStepLimit, fmt.Sprintf("the run reached its limit of %d steps", t.def.Limits.MaxSteps))
+			// D41: a validated office file can still be in the workspace. Deliver it before the run is failed,
+			// while the write ticket is still there. A store or credential error already finished the run.
+			n, serr := t.salvage()
+			if serr != nil {
+				return serr
+			}
+			return h.fail(t.ctx, t.claim, run.FailStepLimit, stepLimitMessage(t.def.Limits.MaxSteps, n))
 		}
 		var f *run.Failure
 		if errors.As(err, &f) { // a budget decision (D15)
@@ -841,6 +863,7 @@ func (t *turn) loop() error {
 		if err != nil {
 			return err
 		}
+		t.step = step
 		if cancelRequested {
 			return t.canceled()
 		}
@@ -867,7 +890,12 @@ func (t *turn) loop() error {
 			if h.Metrics != nil {
 				h.Metrics.StepFinished(st.Provider, st.Model, "error", st.Latency, model.Usage{})
 			}
-			return h.fail(t.ctx, t.claim, run.FailModel, "model call failed: "+st.ErrorCode)
+			message := "model call failed: " + st.ErrorCode
+			if st.ErrorCode == model.CodeContextLength {
+				// D40: the thread itself is what does not fit, so the same request would be refused again
+				message = "the conversation no longer fits the model's context window; start a new conversation, or ask for less at a time"
+			}
+			return h.fail(t.ctx, t.claim, run.FailModel, message)
 		}
 		if h.Metrics != nil {
 			h.Metrics.StepFinished(st.Provider, st.Model, st.StopReason, st.Latency, resp.Usage)
@@ -890,6 +918,10 @@ func (t *turn) loop() error {
 		}
 		t.messages = append(t.messages, resp.Message)
 		if len(resp.Message.ToolCalls) == 0 {
+			if resp.StopReason == model.StopLength {
+				// D40: an answer the model could not finish is not an answer; say why instead of ending as completed
+				return h.fail(t.ctx, t.claim, run.FailModel, fmt.Sprintf("the model's answer was cut off: its context window or output limit is full (%d input tokens at step %d)", resp.Usage.PromptTokens, step))
+			}
 			return t.complete()
 		}
 		rest, err := t.dispatch(step, resp.Message)
@@ -1002,15 +1034,17 @@ func (t *turn) callModel(step int) (*model.Response, run.Step, error) {
 	if err != nil {
 		return nil, st, err
 	}
+	// D41: the last steps of a run that can deliver a file are offered only the delivery tools
+	tools := t.modelTools()
 	// D29: the router decides the attempt order from the call's needs and what it observed
 	parts := []string{t.def.Instructions}
 	for _, m := range msgs {
 		parts = append(parts, m.Content)
 	}
-	for _, tool := range t.tools {
+	for _, tool := range tools {
 		parts = append(parts, tool.Description, string(tool.Parameters))
 	}
-	needs := model.Needs{Tools: len(t.tools) > 0, EstimatedInput: model.EstimateTokens(parts...), MaxOutputTokens: t.def.Model.MaxOutputTokens}
+	needs := model.Needs{Tools: len(tools) > 0, EstimatedInput: model.EstimateTokens(parts...), MaxOutputTokens: t.def.Model.MaxOutputTokens}
 	refs, decisions := h.Router.Order(t.def.Model, needs)
 	if len(refs) == 0 {
 		st.ErrorCode = "no_candidate"
@@ -1035,7 +1069,7 @@ func (t *turn) callModel(step int) (*model.Response, run.Step, error) {
 		mctx, cancel := context.WithCancel(t.ctx)
 		s := &streamer{t: t, msgID: msgID, last: h.Now(), cancel: cancel, out: t.output, strict: t.def.Guards.Output.Strict}
 		start := h.Now()
-		resp, err := p.Complete(mctx, model.Request{Model: ref.Model, Instructions: t.def.Instructions, Messages: msgs, Tools: t.tools,
+		resp, err := p.Complete(mctx, model.Request{Model: ref.Model, Instructions: t.def.Instructions, Messages: msgs, Tools: tools,
 			Temperature: t.def.Model.Temperature, MaxOutputTokens: t.def.Model.MaxOutputTokens}, s.delta)
 		cancel()
 		st.Latency = h.Now().Sub(start)
@@ -1110,6 +1144,9 @@ func (t *turn) dispatch(step int, msg agui.Message) (string, error) {
 		case i >= t.def.Limits.MaxToolCallsPerStep:
 			tc.State = run.CallDenied
 			events = append(events, agui.Custom(agui.CustomToolDenied, map[string]any{"toolCallId": tc.ID, "tool": tc.Tool, "reason": "too many tool calls in one step"}))
+		case t.wrappingUp() && !t.delivers(tc.Tool):
+			tc.State = run.CallDenied
+			events = append(events, agui.Custom(agui.CustomToolDenied, map[string]any{"toolCallId": tc.ID, "tool": tc.Tool, "reason": "the run is wrapping up; only file delivery is available"}))
 		case t.frontend[tc.Tool]:
 			tc.State = run.CallFrontend
 		case !t.visible[tc.Tool] && !t.hostTool(tc.Tool):
@@ -1138,6 +1175,8 @@ func (t *turn) dispatch(step int, msg agui.Message) (string, error) {
 			reason := "tool not available to this agent"
 			if len(records) > t.def.Limits.MaxToolCallsPerStep {
 				reason = "too many tool calls in one step"
+			} else if t.wrappingUp() && !t.delivers(tc.Tool) {
+				reason = "the run is wrapping up; only file delivery is available"
 			}
 			if err := t.answer(tc, run.CallDenied, "", reason); err != nil {
 				return "", err
@@ -1210,7 +1249,11 @@ func (t *turn) guardedMessages() ([]agui.Message, error) {
 	if note := t.filesNote(); note != "" {
 		msgs = append(msgs, agui.Message{ID: "files", Role: agui.RoleDeveloper, Content: note})
 	}
+	old := t.oldToolResults()
 	for _, m := range t.messages {
+		if old[m.ID] {
+			m.Content = shortenOld(m.Content, t.h.OldToolResultBytes)
+		}
 		if m.Role == agui.RoleTool && m.Content != "" && in.ToolResults != guard.ModeOff { // an error-only result is the HOST's own text
 			content, findings := guard.Apply(in.ToolResults, "tool_result", m.Content)
 			report("tool:"+m.ID, "tool_result", m.ToolCallID, findings, in.ToolResults == guard.ModeBlock)
@@ -1218,12 +1261,57 @@ func (t *turn) guardedMessages() ([]agui.Message, error) {
 		}
 		msgs = append(msgs, m)
 	}
+	if t.step > 0 { // D41: last, so the thread before it stays a stable prefix; not stored
+		msgs = append(msgs, agui.Message{ID: "budget", Role: agui.RoleDeveloper, Content: t.budgetNote()})
+	}
 	if len(events) > 0 {
 		if err := t.h.Store.AppendEvents(t.ctx, t.claim, events); err != nil {
 			return nil, err
 		}
 	}
 	return msgs, nil
+}
+
+// oldToolResults names the tool messages the model reads shortened (D40): all but the last KeepToolResults, never
+// a skill resource (the model was told to read a reference once) and never an error.
+func (t *turn) oldToolResults() map[string]bool {
+	resource := map[string]bool{}
+	for _, m := range t.messages {
+		for _, c := range m.ToolCalls {
+			if c.Function.Name == agent.ResourceReadTool {
+				resource[c.ID] = true
+			}
+		}
+	}
+	out := map[string]bool{}
+	seen := 0
+	for i := len(t.messages) - 1; i >= 0; i-- {
+		m := t.messages[i]
+		if m.Role != agui.RoleTool {
+			continue
+		}
+		seen++
+		if seen > t.h.KeepToolResults && !resource[m.ToolCallID] && m.Error == "" && len(m.Content) > t.h.OldToolResultBytes {
+			out[m.ID] = true
+		}
+	}
+	return out
+}
+
+// shortenOld keeps the head and the tail of an old tool result and says what was left out.
+func shortenOld(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	head, tail := limit*2/3, limit/3
+	for head > 0 && !utf8.RuneStart(s[head]) {
+		head--
+	}
+	start := len(s) - tail
+	for start < len(s) && !utf8.RuneStart(s[start]) {
+		start++
+	}
+	return s[:head] + fmt.Sprintf("\n[… %d bytes of this earlier result are not shown; run the command again, narrowed, if you need them …]\n", start-head) + s[start:]
 }
 
 // filesNote tells the model about the member's files and where its own files can go (D37): names, types and sizes,
