@@ -1024,6 +1024,96 @@ func TestHostEndToEnd(t *testing.T) {
 		e.must(422, "POST", "/v1/agents/filer/runs", "carol", bad, "Idempotency-Key", "f2")
 	})
 
+	t.Run("attachments-above-the-ceiling", func(t *testing.T) {
+		// D43: a file classified above the tenant's ceiling does not go to a run whose release may use an external model.
+		// The environment declares no provider local, so "fake" counts as external; the ceiling defaults to internal.
+		ticket := func(kind, n string) string { return "eyJhbGciOiJFUzI1NiJ9.eyJraW5kIjoi" + kind + "In0." + n }
+		att := func(ref, name, sensitivity, n string) map[string]any {
+			m := map[string]any{"ref": ref, "name": name, "mediaType": "text/plain", "size": 12, "sha256": strings.Repeat("ef", 32), "ticket": ticket("read", n)}
+			if sensitivity != "" {
+				m["sensitivity"] = sensitivity
+			}
+			return m
+		}
+		props := func() map[string]any {
+			return map[string]any{"idp.host/attachments": []any{att("file-secret", "并购方案.txt", "confidential", "c2VjcmV0"), att("file-plain", "notes.txt", "", "cGxhaW4")},
+				"idp.host/delivery": map[string]any{"ticket": ticket("write", "d3JpdGU")}}
+		}
+		start := func(thread, key string) (string, string) {
+			body := runBody(thread, "edit shell: tr a-z A-Z < in.txt > out.txt")
+			body["forwardedProps"] = props()
+			id := e.must(202, "POST", "/v1/agents/filer/runs", "carol", body, "Idempotency-Key", key)["runId"].(string)
+			conn, err := pgx.Connect(context.Background(), e.ownerURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close(context.Background())
+			var input string
+			if err := conn.QueryRow(context.Background(), `SELECT input::text FROM runs WHERE id = $1`, id).Scan(&input); err != nil {
+				t.Fatal(err)
+			}
+			return id, input
+		}
+		id, input := start("thr-ceiling-1", "c1")
+		if strings.Contains(input, "eyJ") || strings.Contains(input, "file-secret") || !strings.Contains(input, "file-plain") ||
+			!strings.Contains(input, api.ContextAttachmentsWithheld) || !strings.Contains(input, "并购方案.txt") {
+			t.Fatalf("the stored input: %s", input)
+		}
+		calls := len(e.mcp.Calls())
+		e.drive()
+		if got := e.must(200, "GET", "/v1/runs/"+id, "carol", nil); got["status"] != run.StatusCompleted {
+			t.Fatalf("%v", got)
+		}
+		var imported bool
+		for _, c := range e.mcp.Calls()[calls:] {
+			raw, _ := json.Marshal(c.Args)
+			if strings.Contains(string(raw), ticket("read", "c2VjcmV0")) {
+				t.Fatalf("the withheld file's ticket reached the gateway: %s %s", c.Name, raw)
+			}
+			// what the model calls attachment:1 is now the file it was given
+			imported = imported || c.Name == "sandbox_import_file" && c.Args["source"] == ticket("read", "cGxhaW4")
+		}
+		if !imported {
+			t.Fatalf("the file below the ceiling was not imported: %+v", e.mcp.Calls()[calls:])
+		}
+		_, events, _ := e.sse("GET", "/v1/runs/"+id+"/events", "carol", nil)
+		raw, _ := json.Marshal(events)
+		if !strings.Contains(string(raw), agui.CustomAttachmentWithheld) || !strings.Contains(string(raw), `"sensitivity":"confidential"`) ||
+			!strings.Contains(string(raw), `"ceiling":"internal"`) || !strings.Contains(string(raw), `"externalModels":["fake"]`) || strings.Contains(string(raw), "eyJ") {
+			t.Fatalf("events: %s", raw)
+		}
+		// the model was told the file's name and that it was withheld, and nothing else of it
+		var told bool
+		for _, turn := range e.model.History() {
+			for _, m := range turn {
+				told = told || strings.Contains(m.Content, "NOT given to you") && strings.Contains(m.Content, "并购方案.txt") && strings.Contains(m.Content, "confidential")
+			}
+		}
+		if !told {
+			t.Fatal("the model was not told which file was withheld")
+		}
+		// a tenant whose ceiling is confidential, and a release whose only provider is the enterprise's own, get the file
+		defer func(p api.FilePolicy) { e.host.Files = p }(e.host.Files)
+		e.host.Files = api.FilePolicy{Ceiling: func(tenant string) string {
+			if tenant == e.tenantA {
+				return "confidential"
+			}
+			return "internal"
+		}}
+		if _, input := start("thr-ceiling-2", "c2"); !strings.Contains(input, "file-secret") || strings.Contains(input, api.ContextAttachmentsWithheld) {
+			t.Fatalf("a tenant with a higher ceiling: %s", input)
+		}
+		e.host.Files = api.FilePolicy{Local: map[string]bool{"fake": true}}
+		if _, input := start("thr-ceiling-3", "c3"); !strings.Contains(input, "file-secret") || strings.Contains(input, api.ContextAttachmentsWithheld) {
+			t.Fatalf("a release that only uses the enterprise's own model: %s", input)
+		}
+		e.drive()
+		// a level the contract does not know is refused
+		bad := runBody("thr-ceiling-4", "x")
+		bad["forwardedProps"] = map[string]any{"idp.host/attachments": []any{att("f", "a.txt", "secret", "eA")}}
+		e.must(422, "POST", "/v1/agents/filer/runs", "carol", bad, "Idempotency-Key", "c4")
+	})
+
 	t.Run("subagents", func(t *testing.T) {
 		// ADR-0001 D22: a lead agent delegates to a helper agent; the helper runs as a child run
 		// with its own thread, the lead rests in AWAITING_SUBAGENT and resumes with the helper's answer

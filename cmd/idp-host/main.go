@@ -434,7 +434,14 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 		wg.Wait()
 		return nil
 	}
-	srvAPI := &api.API{Store: store, Auth: verifier, Gateways: gatewayAuth, Providers: registry.Names(), Log: log, Metrics: metrics, Version: version, CMI: cmiClient, CMIKey: cmiKey, CMIToken: cmiToken, CMIAuth: cmiAuth}
+	// D43: the providers the operator declared to be the enterprise's own; files above the ceiling go to no other
+	localProviders := map[string]bool{}
+	for _, p := range cfg.Providers {
+		if !p.IsExternal() {
+			localProviders[p.Name] = true
+		}
+	}
+	srvAPI := &api.API{Files: api.FilePolicy{Local: localProviders, Ceiling: cfg.Files.Ceiling}, Store: store, Auth: verifier, Gateways: gatewayAuth, Providers: registry.Names(), Log: log, Metrics: metrics, Version: version, CMI: cmiClient, CMIKey: cmiKey, CMIToken: cmiToken, CMIAuth: cmiAuth}
 	srv := &http.Server{Addr: env("IDP_HOST_LISTEN", "127.0.0.1:8450"), Handler: observability.HTTPMiddleware(tp, "idp-host/api", srvAPI.Handler()),
 		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 0, IdleTimeout: 120 * time.Second}
 	if cert := env("IDP_HOST_TLS_CERT_FILE", ""); cert != "" {

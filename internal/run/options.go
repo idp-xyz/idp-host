@@ -33,7 +33,22 @@ type Attachment struct {
 	MediaType string `json:"mediaType"`
 	Size      int64  `json:"size"`
 	SHA256    string `json:"sha256"`
-	Ticket    string `json:"ticket,omitempty"`
+	// Sensitivity is how the file's owner system classifies it (public, internal, confidential, restricted; absent =
+	// internal). A file above the tenant's ceiling is not given to a run whose release may use an external model (D43).
+	Sensitivity string `json:"sensitivity,omitempty"`
+	Ticket      string `json:"ticket,omitempty"`
+}
+
+// Sensitivity levels, lowest first (the CMI's, idp-cmi ADR-0001 D29).
+var sensitivityRank = map[string]int{"public": 0, "internal": 1, "confidential": 2, "restricted": 3}
+
+// SensitivityRank orders the levels; an absent level counts as internal. ok is false for anything else.
+func SensitivityRank(level string) (rank int, ok bool) {
+	if level == "" {
+		level = "internal"
+	}
+	rank, ok = sensitivityRank[level]
+	return rank, ok
 }
 
 // Delivery lets a run hand files to its owner: the write ticket the HOST puts in place of output.
@@ -135,6 +150,11 @@ func ParseOptions(raw json.RawMessage) (Options, error) {
 				if err := strict(item, &a); err != nil || !fileRef.MatchString(a.Ref) || !validName(a.Name) || !mediaRE.MatchString(a.MediaType) ||
 					a.Size < 0 || a.Size > 1<<31 || !sha256RE.MatchString(a.SHA256) || !validTicket(a.Ticket) || seen[a.Ref] {
 					return o, fmt.Errorf("%s[%d] must be {ref, name, mediaType, size, sha256, ticket} with a distinct ref, a one-line name and a signed ticket", key, i)
+				}
+				var given map[string]json.RawMessage
+				_ = json.Unmarshal(item, &given)
+				if _, ok := sensitivityRank[a.Sensitivity]; given["sensitivity"] != nil && !ok { // present, and not a level (null and "" included)
+					return o, fmt.Errorf("%s[%d].sensitivity must be public, internal, confidential or restricted", key, i)
 				}
 				seen[a.Ref] = true
 				o.Attachments = append(o.Attachments, a)

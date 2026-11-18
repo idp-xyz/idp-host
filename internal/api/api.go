@@ -49,6 +49,8 @@ type API struct {
 	Auth      Verifier
 	Gateways  map[string]GatewayAuth // by gateway name as the release refers to it
 	Providers []string
+	// Files decides which attachments a run gets when its release may use an external model (D43).
+	Files FilePolicy
 	// CMI resolves context packages for runs whose release asks for them (D32); nil disables.
 	CMI     *cmiclient.Client
 	CMIAuth GatewayAuth // how the HOST obtains the caller's CMI credential; APIKey when static
@@ -594,6 +596,11 @@ func (a *API) createRun(r *http.Request, p authorization.Principal, ref, key str
 			}
 		}
 	}
+	// D43: a file classified above the tenant's ceiling does not go to a run whose release may use an external model.
+	// Its ticket is dropped here, before anything is stored: the run cannot fetch it, and the model is told only its name.
+	var withheld []run.Attachment
+	ceiling := ""
+	opts.Attachments, withheld, ceiling = a.Files.screen(p.Tenant, doc, opts.Attachments)
 	tickets := opts.Tickets()
 	if tickets != nil {
 		// D37: a member's files go to the sandbox through tool calls the HOST executes, with tickets it keeps sealed
@@ -616,10 +623,18 @@ func (a *API) createRun(r *http.Request, p authorization.Principal, ref, key str
 	if input.Context == nil {
 		input.Context = []agui.Context{}
 	}
+	if len(withheld) > 0 {
+		input.Context = append(input.Context, agui.Context{Description: ContextAttachmentsWithheld, Value: withheldNote(withheld, ceiling)})
+	}
 	// D32: context from the CMI, resolved for the caller before the run is queued
 	packageID, extra, err := a.resolveContext(r, p, doc, in, &input)
 	if err != nil {
 		return nil, false, err
+	}
+	if len(withheld) > 0 {
+		external := a.Files.externalModels(doc)
+		a.Log.Info("attachments withheld from a run that may use an external model", "tenant", p.Tenant, "agent", ag.ID, "files", len(withheld), "ceiling", ceiling, "external", external)
+		extra = append(extra, withheldEvents(withheld, ceiling, external)...)
 	}
 	out, replayed, err := a.Store.CreateRun(r.Context(), p.Tenant, postgres.CreateRunInput{ThreadID: in.ThreadID, RunID: in.RunID, AgentRef: ag.ID, Owner: p.Subject,
 		IdempotencyKey: key, Messages: in.Messages, Input: input, Credential: cred, FileTickets: tickets, TraceID: observability.TraceID(r.Context()),

@@ -106,3 +106,40 @@ func TestFileOptions(t *testing.T) {
 		t.Errorf("%d attachments accepted", len(many))
 	}
 }
+
+// D43: an attachment may say how it is classified; an absent level is internal, an unknown one is refused.
+func TestAttachmentSensitivity(t *testing.T) {
+	sum := strings.Repeat("ab", 32)
+	att := func(extra string) string {
+		return `{"idp.host/attachments":[{"ref":"r","name":"a.txt","mediaType":"text/plain","size":1,"sha256":"` + sum + `","ticket":"` + testTicket + `"` + extra + `}]}`
+	}
+	for level, rank := range map[string]int{"public": 0, "internal": 1, "confidential": 2, "restricted": 3} {
+		o, err := ParseOptions(json.RawMessage(att(`,"sensitivity":"` + level + `"`)))
+		if err != nil || o.Attachments[0].Sensitivity != level {
+			t.Fatalf("%s: %+v %v", level, o.Attachments, err)
+		}
+		if got, ok := SensitivityRank(level); !ok || got != rank {
+			t.Errorf("rank of %s: %d %v", level, got, ok)
+		}
+	}
+	o, err := ParseOptions(json.RawMessage(att("")))
+	if err != nil || o.Attachments[0].Sensitivity != "" {
+		t.Fatalf("%+v %v", o.Attachments, err)
+	}
+	if rank, ok := SensitivityRank(""); !ok || rank != 1 {
+		t.Errorf("an absent level is internal: %d %v", rank, ok)
+	}
+	if _, ok := SensitivityRank("secret"); ok {
+		t.Error("an unknown level has a rank")
+	}
+	for _, bad := range []string{`,"sensitivity":"secret"`, `,"sensitivity":""`, `,"sensitivity": ""`, `,"sensitivity":"Confidential"`, `,"sensitivity":3`, `,"sensitivity":null`} {
+		if _, err := ParseOptions(json.RawMessage(att(bad))); err == nil {
+			t.Errorf("accepted %s", bad)
+		}
+	}
+	// the level stays with the description the run keeps; the ticket does not
+	o, _ = ParseOptions(json.RawMessage(att(`,"sensitivity":"restricted"`)))
+	if tk := o.Tickets(); tk == nil || len(tk.Read) != 1 {
+		t.Fatalf("%+v", tk)
+	}
+}

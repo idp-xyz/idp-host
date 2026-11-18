@@ -344,4 +344,7 @@ const (
 	CustomGuardBlocked = "idp.host/guard.blocked"
 	// a run delivered a file to its owner (D37): {toolCallId, ref, name, mediaType, size, sha256}
 	CustomFileDelivered = "idp.host/file.delivered"
+	// CustomAttachmentWithheld: a file the member attached was not given to the run, because it is classified above
+	// what may reach an external model and the release may use one (D43).
+	CustomAttachmentWithheld = "idp.host/attachment.withheld"
 )

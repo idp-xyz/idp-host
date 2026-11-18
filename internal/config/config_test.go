@@ -166,3 +166,40 @@ func TestRememberMode(t *testing.T) {
 		}
 	}
 }
+
+// D43: a provider is outside the enterprise unless the operator says otherwise, and the ceiling on what may reach one
+// is internal unless set, for all tenants or for one.
+func TestProvidersAreExternalUnlessDeclaredAndTheFileCeiling(t *testing.T) {
+	f, err := load(t, `
+providers:
+  - {name: cloud, kind: openai, baseUrl: "https://api.example/v1", apiKey: k}
+  - {name: onprem, kind: openai, baseUrl: "https://llm.corp.example/v1", apiKey: k, external: false}
+  - {name: stated, kind: openai, baseUrl: "https://api2.example/v1", apiKey: k, external: true}
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !f.Providers[0].IsExternal() || f.Providers[1].IsExternal() || !f.Providers[2].IsExternal() {
+		t.Fatalf("%+v", f.Providers)
+	}
+	if f.Files.Ceiling("any") != "internal" {
+		t.Fatalf("the default ceiling is %q", f.Files.Ceiling("any"))
+	}
+	var none *Files
+	if none.Ceiling("any") != "internal" {
+		t.Fatal("a host without a configuration file has no ceiling")
+	}
+	f, err = load(t, `
+files:
+  externalModelCeiling: public
+  tenants: {"7a1b": confidential}
+`)
+	if err != nil || f.Files.Ceiling("7a1b") != "confidential" || f.Files.Ceiling("other") != "public" {
+		t.Fatalf("%+v %v", f.Files, err)
+	}
+	for _, bad := range []string{"files: {externalModelCeiling: secret}", `files: {tenants: {"7a1b": top}}`, `files: {tenants: {"": internal}}`} {
+		if _, err := load(t, bad); err == nil || !strings.Contains(err.Error(), "files:") {
+			t.Errorf("%s: %v", bad, err)
+		}
+	}
+}

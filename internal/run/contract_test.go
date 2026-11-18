@@ -31,7 +31,7 @@ var update = flag.Bool("update", false, "regenerate api/contracts/examples.json 
 
 const (
 	contractDir = "../../api/contracts"
-	contractID  = "urn:idp:telos:host:1.8.0"
+	contractID  = "urn:idp:telos:host:1.9.0"
 )
 
 type noLoader struct{}
@@ -175,6 +175,12 @@ func exampleOptions(digest string) []run.Options {
 		// a Workspace member's request with a file to edit and a file to deliver (D37)
 		{Attachments: []run.Attachment{{Ref: "6f1c2a9e-8d4b-4c3a-9e21-0b7d5f3a8c41", Name: "报价单.docx", MediaType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 			Size: 48213, SHA256: strings.Repeat("3b", 32), Ticket: exampleTicket}}, Delivery: &run.Delivery{Ticket: exampleTicket}},
+		// 1.9.0: files with the level their owner system gave them (D43)
+		{Attachments: []run.Attachment{
+			{Ref: "0c9d4e7a-51b2-4f6e-8a3d-2e6b9c1f7d05", Name: "并购方案.xlsx", MediaType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+				Size: 91822, SHA256: strings.Repeat("7c", 32), Sensitivity: "confidential", Ticket: exampleTicket},
+			{Ref: "a41f6b20-7e9c-4d18-b5a3-9f2c8e6d1b77", Name: "公开年报.pdf", MediaType: "application/pdf", Size: 204811, SHA256: strings.Repeat("9d", 32),
+				Sensitivity: "public", Ticket: exampleTicket}}},
 	}
 }
 
@@ -227,7 +233,7 @@ func buildExamples(t *testing.T) []byte {
 		add("RunOptions", o)
 	}
 	b, err := json.MarshalIndent(examplesFile{
-		Description: "idp.telos.host 1.8.0 的示例：每一个都是 idp-host 实际产出或原样接受的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录，RunOptions 经 run.ParseOptions 解析后原样往返）。",
+		Description: "idp.telos.host 1.9.0 的示例：每一个都是 idp-host 实际产出或原样接受的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录，RunOptions 经 run.ParseOptions 解析后原样往返）。",
 		GeneratedBy: "go test ./internal/run -run TestContract -update",
 		Examples:    out,
 	}, "", "  ")
@@ -569,6 +575,9 @@ func TestContractRejectsWhatOpenRejects(t *testing.T) {
 		"attachment name two lines": {run.OptAttachments, []any{map[string]any{"ref": "f1", "name": "a\nb.txt", "mediaType": "text/plain", "size": 1, "sha256": strings.Repeat("0a", 32), "ticket": exampleTicket}}},
 		"attachment extra field":    {run.OptAttachments, []any{map[string]any{"ref": "f1", "name": "a.txt", "mediaType": "text/plain", "size": 1, "sha256": strings.Repeat("0a", 32), "ticket": exampleTicket, "path": "/x"}}},
 		"eleven attachments":        {run.OptAttachments, elevenAttachments()},
+		"attachment unknown level":  {run.OptAttachments, []any{map[string]any{"ref": "f1", "name": "a.txt", "mediaType": "text/plain", "size": 1, "sha256": strings.Repeat("0a", 32), "ticket": exampleTicket, "sensitivity": "secret"}}},
+		"attachment empty level":    {run.OptAttachments, []any{map[string]any{"ref": "f1", "name": "a.txt", "mediaType": "text/plain", "size": 1, "sha256": strings.Repeat("0a", 32), "ticket": exampleTicket, "sensitivity": ""}}},
+		"attachment level a number": {run.OptAttachments, []any{map[string]any{"ref": "f1", "name": "a.txt", "mediaType": "text/plain", "size": 1, "sha256": strings.Repeat("0a", 32), "ticket": exampleTicket, "sensitivity": 2}}},
 		"delivery without ticket":   {run.OptDelivery, map[string]any{}},
 		"delivery ticket malformed": {run.OptDelivery, map[string]any{"ticket": "a.b"}},
 	}

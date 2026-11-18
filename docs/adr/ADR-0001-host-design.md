@@ -408,3 +408,22 @@ office 档位能读写 PDF 了（idp-sandbox D17），成员也会要 Markdown�
 
 **在真实网关与沙箱上触发了一次**（2026-11-17，compose 平台，真实模型）：bob 上传一份 Markdown，让 office-assistant 排成 PDF、另写一份摘要，放在 `out/`，先不交付；运行完成，没有交付。随后给 office-assistant 发布一个步数上限为 2 的发布件（短于 3 步的运行没有收尾段），bob 在同一会话追问一件需要三次运行的事。模型走完两步后，harness 依次调用 `sandbox_list_files`、`sandbox_export_file`（摘要，不检查）、`sandbox_run`（`pdftext --check 'out/派送价格说明.pdf'`，退出码 0）、`sandbox_export_file`（PDF）；运行以 `STEP_LIMIT` 结束，消息是"…2 files were delivered from the workspace as they stood"，两个 `file.delivered`，收件箱是"failed"并列出两个文件，bob 下载到的两个文件与记录的 SHA-256 一致，导入的那份 Markdown 没有被交回，运行结束后票据已清除。之后把原来的发布件重新设为当前。这也是 D41 的兜底第一次在真实平台上运行；此前只有对假网关的单元测试。
 
+
+## 25. D43：高于上限的附件不交给可能使用外部模型的发布件（2026-11-17，契约 1.9.0，平台 ADR-0002 F8）
+
+D37 让成员的文件经票据进出运行：字节不经过模型。但 agent 用 `officecli view`、`pdftext` 读出来的内容照样作为工具结果进入模型上下文，模型在企业外面时就跟着出去了。平台 ADR-0002 第 7 节写过：这一条必须和文件通道一起上线，或者先只允许本地模型的发布件使用附件。此前两样都没做。
+
+| # | 决策 | 理由 |
+|---|---|---|
+| D43 | **附件带敏感级别；发布件可能把内容送到企业之外时，级别高于租户上限的附件不给这次运行。** ① `FileAttachment` 增可选的 `sensitivity`（`public`、`internal`、`confidential`、`restricted`，与 idp-cmi 的级别相同；省略即 `internal`；别的值 422）。② 配置里 provider 增 `external`，**省略即 `true`**：只有运维写了 `external: false` 的 provider 才算企业自有。③ 配置增 `files.externalModelCeiling`（缺省 `internal`）与 `files.tenants`（按租户 id 覆盖）。④ 创建运行时，HOST 看这个发布件可能用到的 provider：模型、回退、路由候选；引用了远端 A2A 子 agent 的也算。其中有一个不是企业自有，级别高于上限的附件就扣下：票据当场丢弃（不进 `runs.file_tickets`），运行的 input 里没有它，`attachment:N` 只给留下的文件编号；调用方 context 里加一条 `idp.host/attachments.withheld`，告诉模型哪些文件名、什么级别没有给它，让它如实告诉用户而不是去找；事件流每个文件记一条 `idp.host/attachment.withheld {ref, name, sensitivity, ceiling, externalModels}`，日志记一行 | 拦在票据这里，是因为没有票据沙箱就取不到文件，内容也就读不出来、进不了模型：不需要去识别工具结果里哪些字来自哪个文件。provider 缺省算外部：漏写一行的后果应当是少给文件，而不是把机密文件送出去。回退和路由候选都算：一次运行最后落在哪个模型上，创建时不知道。远端 A2A 子 agent 算外部：委派时父 agent 会把读到的内容写进任务里。上限放在 HOST 的配置而不是去问 CMI 的租户策略（idp-cmi D29 的 `externalModelCeiling`）：HOST 创建运行时不该多一次对 CMI 的依赖；两处现在要运维各配一次 |
+
+**契约**：`idp.telos.host` 1.8.0 → **1.9.0**，只有向后兼容的新增（FileAttachment 的可选 `sensitivity`）。OpenAPI 同步。一致性测试新增带级别的示例与 3 种拒绝（未知级别、空字符串、数字）。只认识 1.8.0 的 HOST 会拒绝带 `sensitivity` 的附件；idp-workspace 因此只在级别不是 `internal` 时发送（idp-workspace D28）。
+
+**没有做的**：
+- **本地子 agent 不查**：发布件引用的本地子 agent 用什么模型，创建父运行时没有去读它的发布件。父 agent 读了机密文件再委派给一个用外部模型的本地子 agent，内容会跟着任务文字过去。子 agent 运行本身拿不到票据（D37）。
+- **沙箱工作区跨运行存在**：同一个成员在同一个线程里先用本地模型的 agent 导入了机密文件，30 分钟内再让一个用外部模型的 agent 接着用同一个工作区，文件还在。工作区 id 只在那个线程的对话里。
+- **对话记忆的事实抽取**（D34）用的 provider 不在检查之内：它读的是用户消息，不读工具结果。
+- 没有界面：成员怎么给文件定级见 idp-workspace D28（上传时的参数）。
+- 上限没有和 CMI 的租户策略打通。
+
+**验证**：`internal/api` 的 `TestFilesAboveTheCeilingAreWithheldFromExternalModels`（外部模型、自有模型、自有模型加外部回退、加外部路由候选、加远端 A2A 子 agent、什么都没声明、上限 public 与 restricted、按租户的上限；告诉模型的话里只有文件名与级别）；`internal/run` 的 `TestAttachmentSensitivity`；`internal/config` 的 `TestProvidersAreExternalUnlessDeclaredAndTheFileCeiling`；`TestHostEndToEnd/attachments-above-the-ceiling`（PostgreSQL：存下的 input 里没有被扣下的文件，它的票据没有出现在任何一次网关调用里，模型写的 `attachment:1` 换成的是留下那个文件的票据，事件与模型读到的说明都在；租户上限调到 confidential、或把 provider 声明为自有之后同一个请求两个文件都给）。平台 compose 的 `host.yaml` 给本机模型写了 `external: false`；整套验收没有重跑。

@@ -21,6 +21,33 @@ type File struct {
 	Classifiers []Classifier `yaml:"classifiers"` // external output classifiers (ADR-0001 D28)
 	A2APeers    []A2APeer    `yaml:"a2aPeers"`    // remote A2A agents this HOST may delegate to (ADR-0001 D30)
 	CMI         *CMI         `yaml:"cmi"`         // the context infrastructure runs may draw context from (ADR-0001 D32)
+	Files       *Files       `yaml:"files"`       // which of a member's files may reach an external model (ADR-0001 D43)
+}
+
+// Files is the ceiling on the sensitivity of the files a run may be given when its release can use an external model
+// (D43; the CMI's externalModelCeiling, idp-cmi D29, for attachments). Tenants overrides it per tenant id.
+type Files struct {
+	ExternalModelCeiling string            `yaml:"externalModelCeiling"` // public | internal | confidential | restricted; default internal
+	Tenants              map[string]string `yaml:"tenants"`
+}
+
+// Ceiling is the level that applies to a tenant.
+func (f *Files) Ceiling(tenant string) string {
+	if f == nil {
+		return "internal"
+	}
+	if c, ok := f.Tenants[tenant]; ok {
+		return c
+	}
+	return f.ExternalModelCeiling
+}
+
+func validSensitivity(s string) bool {
+	switch s {
+	case "public", "internal", "confidential", "restricted":
+		return true
+	}
+	return false
 }
 
 // CMI is the idp-cmi endpoint and how the HOST authenticates to it on the caller's behalf: the same
@@ -93,7 +120,13 @@ type Provider struct {
 	CAFile         string `yaml:"caFile"`
 	// Insecure allows plain http to a non-loopback host; honored only in development mode.
 	Insecure bool `yaml:"insecure"`
+	// External says whether what is sent to this provider leaves the enterprise (D43). Absent means it does: a provider
+	// is the enterprise's own only when the operator says so (external: false).
+	External *bool `yaml:"external"`
 }
+
+// IsExternal: unless declared otherwise, a provider is outside the enterprise.
+func (p Provider) IsExternal() bool { return p.External == nil || *p.External }
 
 // Gateway is one MCP Infrastructure gateway.
 type Gateway struct {
@@ -179,6 +212,20 @@ func Load(path string) (*File, error) {
 		}
 		if c.APIKey, err = secret(c.APIKey, c.APIKeyFile); err != nil {
 			return nil, fmt.Errorf("classifier %s: %w", c.Name, err)
+		}
+	}
+	if f.Files == nil {
+		f.Files = &Files{}
+	}
+	if f.Files.ExternalModelCeiling == "" {
+		f.Files.ExternalModelCeiling = "internal"
+	}
+	if !validSensitivity(f.Files.ExternalModelCeiling) {
+		return nil, errors.New("files: externalModelCeiling must be public, internal, confidential or restricted")
+	}
+	for tenant, level := range f.Files.Tenants {
+		if tenant == "" || !validSensitivity(level) {
+			return nil, fmt.Errorf("files: tenants[%q] must be public, internal, confidential or restricted", tenant)
 		}
 	}
 	if c := f.CMI; c != nil {
