@@ -363,6 +363,11 @@ const (
 	// wrapped as untrusted anyway (D44): {configured, applied, reason}.
 	CustomInputGuardRaised = "idp.host/guard.raised"
 
+	// CustomContextView: what the model read of the thread at a step when the model's context window is configured (D52):
+	// {step, windowTokens, markTokens, estimateTokens, rawEstimateTokens, factor, level, shortened, hint, items | itemsAsBefore}.
+	// items are [kind (result|arguments), id (tool message | tool call), bytes, limit, shown].
+	CustomContextView = "idp.host/context.view"
+
 	// CustomRunSources is written once when a run that has sources, or that was dropping entries, completes: the full list
 	// of the run's web sources with the counts of what was not recorded (D49).
 	CustomRunSources = "idp.host/run.sources"

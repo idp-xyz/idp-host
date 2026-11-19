@@ -44,6 +44,7 @@ func (t *turn) budgetNote() string {
 		}
 		fmt.Fprintf(&b, " The run ends at %s (%s left).", d.UTC().Format(time.RFC3339), humanRemain(remain))
 	}
+	b.WriteString(t.hint) // D52: set by guardedMessages when the context is filling; empty otherwise
 	if t.wrappingUp() {
 		b.WriteString(" Wrap-up: only file delivery is available now. Deliver each file the user should receive, with target output. Do not inspect, edit or run code.")
 	}

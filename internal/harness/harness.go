@@ -26,6 +26,7 @@ import (
 	"idp-host/internal/canonical"
 	"idp-host/internal/cmiclient"
 	"idp-host/internal/credential"
+	"idp-host/internal/ctxwin"
 	"idp-host/internal/guard"
 	"idp-host/internal/mcpclient"
 	"idp-host/internal/model"
@@ -136,14 +137,20 @@ type Harness struct {
 	// CancelPoll is how often a run in progress asks the store whether its owner asked to cancel it (default 1 s, D46).
 	CancelPoll time.Duration
 
-	DeltaFlush      time.Duration // how often streamed text is persisted (default 50 ms)
-	ToolTimeout     time.Duration // per tool call (default 60 s)
-	ToolResultLimit int           // bytes of one tool result handed to the model (default 16 KiB, D40)
-	// D40: the model reads the last KeepToolResults tool results whole (default 6); an older one longer than
-	// OldToolResultBytes (default 1200) is shown as its head and tail. Skill resources are never shortened.
+	DeltaFlush  time.Duration // how often streamed text is persisted (default 50 ms)
+	ToolTimeout time.Duration // per tool call (default 60 s)
+	// D40, D52: ToolResultLimit is the bytes of one tool result handed to the model (default 16 KiB), the model reads the
+	// last KeepToolResults tool results whole (default 6), an older one longer than OldToolResultBytes (default 1200) is
+	// shown as its head and tail. Left zero, they are derived from the model's context window when the configuration gives
+	// one (ModelContext), otherwise they are D40's numbers; a value set here wins over the derived one, a value the operator
+	// sets for a model wins over both.
+	ToolResultLimit    int
 	KeepToolResults    int
 	OldToolResultBytes int
-	NewMessageID       func() string
+	// ModelContext is what the operator says about each model's context window and thresholds (D52), by "provider/model".
+	// A model without an entry keeps D40's behaviour exactly.
+	ModelContext map[string]ctxwin.Settings
+	NewMessageID func() string
 }
 
 func (h *Harness) defaults() {
@@ -155,15 +162,6 @@ func (h *Harness) defaults() {
 	}
 	if h.ToolTimeout == 0 {
 		h.ToolTimeout = 60 * time.Second
-	}
-	if h.KeepToolResults == 0 {
-		h.KeepToolResults = 6
-	}
-	if h.OldToolResultBytes == 0 {
-		h.OldToolResultBytes = 1200
-	}
-	if h.ToolResultLimit == 0 {
-		h.ToolResultLimit = 16 << 10
 	}
 	if h.NewMessageID == nil {
 		h.NewMessageID = model.NewMessageID
@@ -215,6 +213,13 @@ type turn struct {
 	step       int                                  // the model step in progress (D41)
 	salvageN   int                                  // host-initiated calls made while salvaging a file at the step limit
 	lastResult *mcpclient.CallResult                // the gateway result of the call execute just finished
+	limits     ctxwin.Limits                        // the thresholds of the model this run asks, from its window (D52)
+	corr       ctxwin.Correction                    // the estimate's correction by the provider's usage reports (D52)
+	lastView   string                               // the items shortened at the previous step, to record only a change
+	sticky     map[string]int                       // the limit each item was cut to at an earlier step of this run (D52)
+	viewRaw    float64                              // the raw estimate of the request now being sent
+	viewFixed  float64                              // ... and corrected
+	hint       string                               // what the budget note adds about the context this step
 }
 
 // Formats a gateway tool's input schema gives a property that takes a member's file (D37): the model writes
@@ -273,6 +278,7 @@ func (h *Harness) Run(ctx context.Context, c *run.Claim) error {
 		t.def.Model.MaxOutputTokens = m
 	}
 	t.flagged = map[string]bool{}
+	t.limits = h.limitsFor(t.def)
 	defer t.watch()()
 	out, err := guard.NewOutput(rc.BlockedPatterns, t.def.Guards.Output.Patterns, t.def.Guards.Output.Redact)
 	if err != nil {
@@ -1074,7 +1080,8 @@ func (t *turn) execute(tc run.ToolCall) (bool, error) {
 		}
 		return false, t.answer(tc, run.CallFailed, "", "tool call failed: "+t.toolCallError(err))
 	}
-	text := t.redactTickets(res.Text(h.ToolResultLimit))
+	t.ensureLimits()
+	text := t.redactTickets(res.Text(t.limits.ToolResultBytes))
 	t.lastResult = res
 	if res.IsError {
 		outcome = "tool_error"
@@ -1457,6 +1464,13 @@ func (t *turn) callModel(step int) (*model.Response, run.Step, error) {
 	if err != nil {
 		return nil, st, err
 	}
+	if t.refuseUnfit(t.viewFixed) {
+		// D52: the estimate says the request cannot fit the window even with everything shortened that may be: the model is
+		// not called, since the answer would be D40's refusal, paid for
+		st.ErrorCode = model.CodeContextLength
+		h.Log.Warn("request cannot fit the model's context window; not sent", "run", t.claim.RunID, "step", step, "estimateTokens", int(t.viewFixed), "window", t.limits.Window)
+		return nil, st, &model.Error{Code: model.CodeContextLength}
+	}
 	// D41: the last steps of a run that can deliver a file are offered only the delivery tools
 	tools := t.modelTools()
 	// D29: the router decides the attempt order from the call's needs and what it observed
@@ -1514,6 +1528,7 @@ candidates:
 				resp.Message.ID = msgID
 				st.ErrorCode = "" // an earlier attempt or candidate failed (D45); the step did not
 				st.PromptTokens, st.CompletionTokens, st.StopReason = resp.Usage.PromptTokens, resp.Usage.CompletionTokens, resp.StopReason
+				t.corr.Observe(t.viewRaw, resp.Usage.PromptTokens) // D52
 				if gerr := t.guardOutput(resp); gerr != nil {
 					st.ErrorCode = "guard_blocked"
 					if errors.Is(gerr, errInterrupted) {
@@ -1894,20 +1909,44 @@ func (t *turn) guardedMessages() ([]agui.Message, error) {
 	if note := t.filesNote(); note != "" {
 		msgs = append(msgs, agui.Message{ID: "files", Role: agui.RoleDeveloper, Content: note})
 	}
-	old := t.oldToolResults()
+	t.ensureLimits()
+	tools := t.modelTools()
+	// D52: what is not the thread, estimated; then what the model reads of the thread is decided against the water mark
+	base := requestTokens(t.def.Instructions, msgs, tools)
+	wrapTokens := 0.0
+	if in.ToolResults != guard.ModeOff {
+		wrapTokens = ctxwin.Tokens(guard.Wrap("tool_result", ""))
+	}
+	view := t.shape(base, wrapTokens)
 	for _, m := range t.messages {
-		if old[m.ID] {
-			m.Content = shortenOld(m.Content, t.h.OldToolResultBytes)
+		body := m.Content
+		if s, ok := view.results[m.ID]; ok {
+			body = s
 		}
+		m = view.withShownArguments(m)
 		if m.Role == agui.RoleTool && m.Content != "" && in.ToolResults != guard.ModeOff { // an error-only result is the HOST's own text
-			content, findings := guard.Apply(in.ToolResults, "tool_result", m.Content)
+			// the controls look at the whole result; what is shortened is what is shown inside the wrapper (D52)
+			content, findings := guard.ApplyView(in.ToolResults, "tool_result", m.Content, body)
 			report("tool:"+m.ID, "tool_result", m.ToolCallID, findings, in.ToolResults == guard.ModeBlock)
 			m.Content = content
+		} else {
+			m.Content = body
 		}
 		msgs = append(msgs, m)
 	}
+	t.hint, t.viewRaw = "", requestTokens(t.def.Instructions, msgs, tools)
+	t.viewFixed = t.viewRaw * t.corr.Factor()
+	if t.limits.Window > 0 && t.viewFixed >= float64(t.limits.Hint) { // D52: the context is filling; say so, where the budget hint is
+		t.hint = contextHint(int(t.viewFixed), t.limits.Window)
+	}
 	if t.step > 0 { // D41: last, so the thread before it stays a stable prefix; not stored
-		msgs = append(msgs, agui.Message{ID: "budget", Role: agui.RoleDeveloper, Content: t.budgetNote()})
+		note := agui.Message{ID: "budget", Role: agui.RoleDeveloper, Content: t.budgetNote()}
+		msgs = append(msgs, note)
+		t.viewRaw += msgTokens(note)
+		t.viewFixed = t.viewRaw * t.corr.Factor()
+	}
+	if t.limits.Window > 0 {
+		events = append(events, t.viewEvent(t.step, view, t.viewRaw, t.viewFixed, t.hint != ""))
 	}
 	if len(events) > 0 {
 		if err := t.h.Store.AppendEvents(t.ctx, t.claim, events); err != nil {
@@ -1917,46 +1956,11 @@ func (t *turn) guardedMessages() ([]agui.Message, error) {
 	return msgs, nil
 }
 
-// oldToolResults names the tool messages the model reads shortened (D40): all but the last KeepToolResults, never
-// a skill resource (the model was told to read a reference once) and never an error.
-func (t *turn) oldToolResults() map[string]bool {
-	resource := map[string]bool{}
-	for _, m := range t.messages {
-		for _, c := range m.ToolCalls {
-			if c.Function.Name == agent.ResourceReadTool {
-				resource[c.ID] = true
-			}
-		}
+// ensureLimits resolves the thresholds for a turn that was built without them.
+func (t *turn) ensureLimits() {
+	if t.limits.ToolResultBytes == 0 {
+		t.limits = t.h.limitsFor(t.def)
 	}
-	out := map[string]bool{}
-	seen := 0
-	for i := len(t.messages) - 1; i >= 0; i-- {
-		m := t.messages[i]
-		if m.Role != agui.RoleTool {
-			continue
-		}
-		seen++
-		if seen > t.h.KeepToolResults && !resource[m.ToolCallID] && m.Error == "" && len(m.Content) > t.h.OldToolResultBytes {
-			out[m.ID] = true
-		}
-	}
-	return out
-}
-
-// shortenOld keeps the head and the tail of an old tool result and says what was left out.
-func shortenOld(s string, limit int) string {
-	if len(s) <= limit {
-		return s
-	}
-	head, tail := limit*2/3, limit/3
-	for head > 0 && !utf8.RuneStart(s[head]) {
-		head--
-	}
-	start := len(s) - tail
-	for start < len(s) && !utf8.RuneStart(s[start]) {
-		start++
-	}
-	return s[:head] + fmt.Sprintf("\n[… %d bytes of this earlier result are not shown; run the command again, narrowed, if you need them …]\n", start-head) + s[start:]
 }
 
 // filesNote tells the model about the member's files and where its own files can go (D37): names, types and sizes,

@@ -289,10 +289,14 @@ func (i idleReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// contextMarkers is how OpenAI-compatible servers name a request that does not fit the model's context window:
-// OpenAI's error code, the message of OpenAI and vLLM, llama.cpp's error type and its message, and the message of
-// the Strata server the platform is tried with ("prompt (N tokens) + max tokens (M) exceeds the context (W)").
-var contextMarkers = []string{"context_length_exceeded", "maximum context length", "exceed_context_size_error", "exceeds the available context size", "exceeds the context", "prompt is too long"}
+// contextMarkers is how model servers name a request that does not fit the model's context window:
+//   - OpenAI-compatible: OpenAI's error code, the message of OpenAI and vLLM, llama.cpp's error type and its message, and
+//     the message of the Strata server the platform is tried with ("prompt (N tokens) + max tokens (M) exceeds the context (W)");
+//   - Anthropic (HTTP 400, error type invalid_request_error): "prompt is too long: N tokens > M maximum", and, for models
+//     that count the output limit too, "input length and `max_tokens` exceed context limit: N + M > W" (D52);
+//   - Gemini (HTTP 400, status INVALID_ARGUMENT): "The input token count (N) exceeds the maximum number of tokens allowed (M)" (D52).
+var contextMarkers = []string{"context_length_exceeded", "maximum context length", "exceed_context_size_error", "exceeds the available context size", "exceeds the context", "prompt is too long",
+	"exceed context limit", "exceeds the maximum number of tokens allowed"}
 
 // ClassifyBody is Classify for a refusal whose body was read (D40): a 400 that says the request does not fit the
 // model's context window gets its own code, because the caller can do something about that one. Only the code

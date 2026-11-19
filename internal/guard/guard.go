@@ -136,14 +136,21 @@ func Blocked(source string, findings []Finding) string {
 // Apply runs an input policy over text: the (possibly wrapped or replaced) text the model sees and
 // the findings. ModeOff returns the text unchanged with no scan.
 func Apply(mode, source, text string) (string, []Finding) {
+	return ApplyView(mode, source, text, text)
+}
+
+// ApplyView is Apply for text that is shown to the model shortened (D52): the policy is decided on the whole text, the
+// findings are the whole text's, and what is shown is view, inside the same wrapper. The wrapper is put around the
+// shortened text, never cut out of it, so shortening cannot move content out of an untrusted block.
+func ApplyView(mode, source, text, view string) (string, []Finding) {
 	if mode == ModeOff || mode == "" {
-		return text, nil
+		return view, nil
 	}
 	findings := ScanInput(text)
 	if mode == ModeBlock && len(findings) > 0 {
 		return Wrap(source, Blocked(source, findings)), findings
 	}
-	return Wrap(source, text), findings
+	return Wrap(source, view), findings
 }
 
 // Output filters model output.

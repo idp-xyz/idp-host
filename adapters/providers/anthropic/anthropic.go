@@ -219,8 +219,8 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-		return nil, model.ClassifyHTTP(resp.StatusCode, resp.Header, nil, time.Now())
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10)) // read to classify it (D40, D52), never kept
+		return nil, model.ClassifyHTTP(resp.StatusCode, resp.Header, body, time.Now())
 	}
 	watch := model.NewIdleWatch(p.idle(), cancelReq)
 	defer watch.Stop()
@@ -343,7 +343,7 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 		reason = model.StopToolCalls
 	case stop == "end_turn" || stop == "stop_sequence":
 		reason = model.StopEnd
-	case stop == "max_tokens":
+	case stop == "max_tokens" || stop == "model_context_window_exceeded": // the window ran out in the middle of the answer (D52)
 		reason = model.StopLength
 	}
 	return &model.Response{Message: msg, StopReason: reason, Usage: usage, Reasoning: reasoning.String()}, nil

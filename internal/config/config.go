@@ -14,6 +14,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"idp-host/internal/ctxwin"
 	"idp-host/internal/model"
 )
 
@@ -132,6 +133,74 @@ type Provider struct {
 	// IdleTimeoutSeconds is how long a response may stay silent between two chunks before the call fails as a retryable
 	// transport error (D46); 0 means 60. It does not bound a call that is still sending.
 	IdleTimeoutSeconds float64 `yaml:"idleTimeoutSeconds"`
+	// Models says what the host knows about the models this provider serves (D52): their context window and, if the
+	// defaults derived from it do not suit, the thresholds. A model not listed keeps the behaviour of D40.
+	Models []Model `yaml:"models"`
+}
+
+// Model is what the operator says about one model of a provider (D52). Without contextWindow the host does not know the
+// window: nothing of D52 applies to the model (D40's numbers stay, arguments are not shortened, there is no hint and no
+// refusal before the call); the other fields then only override D40's numbers.
+type Model struct {
+	Name          string `yaml:"name"`
+	ContextWindow int    `yaml:"contextWindow"` // tokens, the most one request and its answer may hold
+	Context       struct {
+		WaterMarkShare  float64 `yaml:"waterMarkShare"`  // (0.2, 0.9]; default 0.6: above it, older content is shortened further
+		HintShare       float64 `yaml:"hintShare"`       // (0.3, 0.95]; default 0.8: above it, the model is told the context is filling; above the water mark
+		ToolResultBytes int     `yaml:"toolResultBytes"` // 1 KiB to 1 MiB; default an eighth of the window in bytes, 4 KiB to 64 KiB (16 KiB at 131,072)
+		KeepToolResults int     `yaml:"keepToolResults"` // 1 to 50; default 6
+		OldResultBytes  int     `yaml:"oldResultBytes"`  // 200 bytes to 1 MiB; default 1,200 at 131,072 tokens, scaled with the window within 512 to 4,096
+		ArgumentBytes   int     `yaml:"argumentBytes"`   // 200 bytes to 1 MiB; default OldResultBytes
+	} `yaml:"context"`
+}
+
+// Settings are the model's settings as the harness uses them.
+func (m Model) Settings() ctxwin.Settings {
+	c := m.Context
+	return ctxwin.Settings{Window: m.ContextWindow, MarkShare: c.WaterMarkShare, HintShare: c.HintShare, ToolResultBytes: c.ToolResultBytes,
+		KeepResults: c.KeepToolResults, OldBytes: c.OldResultBytes, ArgumentBytes: c.ArgumentBytes}
+}
+
+func (m Model) validate() error {
+	c := m.Context
+	inRange := func(v, lo, hi int) bool { return v == 0 || (v >= lo && v <= hi) }
+	shareOK := func(v, lo, hi float64) bool { return v == 0 || (v > lo && v <= hi) }
+	switch {
+	case m.Name == "":
+		return errors.New("a model needs a name")
+	case m.ContextWindow < 0 || (m.ContextWindow > 0 && (m.ContextWindow < 4096 || m.ContextWindow > 16<<20)):
+		return errors.New("contextWindow must be within [4096, 16777216] tokens")
+	case !shareOK(c.WaterMarkShare, 0.2, 0.9):
+		return errors.New("context.waterMarkShare must be within (0.2, 0.9]")
+	case !shareOK(c.HintShare, 0.3, 0.95):
+		return errors.New("context.hintShare must be within (0.3, 0.95]")
+	case c.WaterMarkShare > 0 && c.HintShare > 0 && c.WaterMarkShare >= c.HintShare:
+		return errors.New("context.waterMarkShare must be below context.hintShare")
+	case c.WaterMarkShare > 0 && c.HintShare == 0 && c.WaterMarkShare >= ctxwin.DefaultHintShare:
+		return errors.New("context.waterMarkShare must be below the default hintShare of 0.8; set hintShare too")
+	case c.HintShare > 0 && c.WaterMarkShare == 0 && c.HintShare <= ctxwin.DefaultMarkShare:
+		return errors.New("context.hintShare must be above the default waterMarkShare of 0.6; set waterMarkShare too")
+	case !inRange(c.ToolResultBytes, 1<<10, 1<<20):
+		return errors.New("context.toolResultBytes must be within [1024, 1048576]")
+	case !inRange(c.KeepToolResults, 1, 50):
+		return errors.New("context.keepToolResults must be within [1, 50]")
+	case !inRange(c.OldResultBytes, 200, 1<<20):
+		return errors.New("context.oldResultBytes must be within [200, 1048576]")
+	case !inRange(c.ArgumentBytes, 200, 1<<20):
+		return errors.New("context.argumentBytes must be within [200, 1048576]")
+	}
+	return nil
+}
+
+// ModelContext is the context settings of every model that has an entry, by "provider/model" (D52).
+func (f *File) ModelContext() map[string]ctxwin.Settings {
+	out := map[string]ctxwin.Settings{}
+	for _, p := range f.Providers {
+		for _, m := range p.Models {
+			out[p.Name+"/"+m.Name] = m.Settings()
+		}
+	}
+	return out
 }
 
 // Retry is the retry policy toward one provider (D45). Zero values take the defaults in internal/model.
@@ -158,6 +227,16 @@ func (p Provider) validate() error {
 		return errors.New("retry.maxBackoffSeconds must not be below retry.backoffSeconds")
 	case p.IdleTimeoutSeconds < 0 || p.IdleTimeoutSeconds > 3600:
 		return errors.New("idleTimeoutSeconds must be within (0, 3600] (0 = default 60)")
+	}
+	names := map[string]bool{}
+	for _, m := range p.Models {
+		if err := m.validate(); err != nil {
+			return fmt.Errorf("models[%q]: %w", m.Name, err)
+		}
+		if names[m.Name] {
+			return fmt.Errorf("models[%q]: listed twice", m.Name)
+		}
+		names[m.Name] = true
 	}
 	return nil
 }

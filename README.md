@@ -57,7 +57,19 @@ CI 与 `deploy/e2e.sh` 里的第三方镜像（PostgreSQL、Keycloak、trivy）�
 
 ```yaml
 providers:
-  - {name: local, kind: openai, baseUrl: http://127.0.0.1:8080/v1}
+  - name: local
+    kind: openai
+    baseUrl: http://127.0.0.1:8080/v1
+    models:                          # D52: what the host knows about the models this provider serves (key: the release's model name)
+      - name: qwen3.8-flash-next-iq3_xxs
+        contextWindow: 131072        # tokens. REQUIRED for D52 to apply to this model (see below); without it nothing changes
+        context:                     # all optional; the defaults below are derived from the window
+          waterMarkShare: 0.6        #   (0.2, 0.9]  above this share of the window older content is shortened further, oldest first
+          hintShare: 0.8             #   (0.3, 0.95] above this share the budget hint tells the model the context is filling
+          toolResultBytes: 16384     #   the most of one tool result the model is given; default window/8 in bytes, within 4 KiB..64 KiB
+          keepToolResults: 6         #   the newest tool results (and the calls that asked for them) that are shown whole; default 6
+          oldResultBytes: 1200       #   an older result longer than this is shown as head and tail; default 1200 at 131,072 (scaled, 512..4096)
+          argumentBytes: 1200        #   the same for a string value in an older tool call's arguments; default oldResultBytes
   - {name: claude, kind: anthropic, baseUrl: https://api.anthropic.com, apiKeyFile: /run/secrets/anthropic,
      idleTimeoutSeconds: 60,        # D46: a response silent this long between two reads is cut and counts as a transport error (default 60)
      retry: {attempts: 3,           # D45: requests in all per candidate model before the next candidate or failure, 1..10 (default 3; 1 = never retry)
@@ -98,6 +110,8 @@ cmi:   # optional (ADR-0001 D32): releases with context.cmi = true resolve a Con
     auth: {mode: static, apiKeyFile: /etc/idp/cmi-writer.key}   # the WRITER identity (CMI role cmi-writer); required when enabled; static | delegation, same shape as cmi.auth;
                                                                 # a static key file is read on every write, so a refreshed token is picked up
 ```
+
+**模型的上下文窗口（ADR D52）。** 要让长任务不撞窗口，部署必须给用到的每个模型配 `contextWindow`（provider 条目下的 `models[]`，键是 `provider` 名加发布件里的模型名）。配了以后：HOST 每次调用前按 token 估算输入，用上一步模型服务报告的用量校正；估算超过水位（`waterMarkShare`，缺省 0.6）时把更早的工具结果与更早的工具调用参数继续缩短（最老的先缩，一次缩到水位的六分之五以下，之后的步骤里已缩短的不再变长）；超过 `hintShare`（缺省 0.8）时在每步的预算提示里告诉模型窗口已用多少、该收尾；估算说即使缩到底也装不下时，不调用模型，直接以 D40 的消息结束运行。没有 `contextWindow` 的模型一切照旧，与 D40 逐字节相同：三个数字用 16 KiB、6、1,200 字节，参数不缩短，没有提示，也不会在调用前拒绝；这样的模型在窗口满时仍然只能靠模型服务报错（三家适配器现在都认得）。三个阈值的缺省值都按窗口推出，131,072 token 时恰是 D40 的数字；设置放在 HOST 配置而不在发布件里：发布件不能给自己放宽运维定的上限。其余字段的范围见 `internal/config`，写错的值在启动时被拒。平台的 compose（`deploy/compose/e2e.sh` 生成的 `host.yaml`）与 kind（`deploy/kubernetes/kind/kustomization.yaml` 里的 `host.yaml`）目前没有 `models`，要得到这个行为，需要在 `local` 条目下加所用模型的条目与 `contextWindow`。
 
 provider 的 `retry` 与 `idleTimeoutSeconds`（ADR D45、D46）都可以不配：可重试的错误（HTTP 408、429、5xx、传输失败、流静默超时）先对同一个候选模型重试，等待从 1 秒起翻倍、封顶 20 秒、带抖动，提供者的 `Retry-After` 更长时取它（超过 `maxRetryAfterSeconds` 就不等：换下一个候选或失败）；已经流出文字之后不重试；等待随运行的期限与取消结束。设置放在 provider 条目而不在发布件里：限流策略是运维知道的事，发布件作者不应能为自己的 agent 多烧预算。运行的期限与取消也到达进行中的模型与工具调用：期限到了运行在约一秒内以 `RUN_TIMEOUT` 结束，所有者取消的运行在约一秒内（每秒向库询问一次）以 `CANCELED` 结束。
 

@@ -873,3 +873,91 @@ D37 让成员的文件经票据进出运行：字节不经过模型。但 agent 
 - **在创建时为会话绑定网关续期凭据**（见上）。
 - **在界面上说明"为什么这个运行读不到机密内容"**：`via` 在事件流里，idp-workspace 的展示另议。
 - **标记之外的上游信息**（上游自己的 `_meta`、注解）仍不被信任，也没有用到。
+
+## 34. D52：上下文的账算对——窗口在配置里，按 token 估算，水位之上更早的内容逐步缩短，工具调用参数也缩短，快满时告诉模型（2026-11-19 决策与实施，依据 idp-host-context-management-proposal 阶段 A）
+
+修订 D40（三个写死的数字按窗口推出，可配置；缩短不再只看工具结果）、D41（预算提示增加上下文一项）；沿用 D27、D44、D47、D49 的其余部分。契约不变（没有新的 REST 字段；事件 `idp.host/context.view` 与 D45 的事件一样不在契约里列举）。不改变模型被告知的意思：不摘要、不删除任何一轮，只是更早的、模型已经读过并据此行动的内容给它看得更短。
+
+**测过什么**（基线：`.local/long-eval/baseline-eeaafeb-20261119`，15 次用例运行、21 轮、658 次有用量的模型调用，窗口 131,072 token；运行库转储恢复到临时库，按存下的消息重建每一步的请求）：
+
+- **晚期请求里的东西**：输入超过 60,000 token 的 223 步里，估算的 token 构成是工具结果 54.7%、**模型自己写的工具调用参数 44.5%**、用户与助手的文字 0.8%。L2 第三轮第 33 步（126,514 token，窗口的 96.5%）：参数 173 KB、结果 157 KB（D40 缩短之后）、文字 4.5 KB。D40 缩短了结果而没有碰参数，所以参数是剩下的最大一块，每步原样重发。
+- **密度**（每字节 token，按字节类别，在 Qwen 的分词上）：数字最贵，约一个字节一个 token（它把数字逐位切开）；字母、空格、标点约 0.25；多字节字符（中文、制表符号）每字节约 0.38。结果里数字多，所以 D40 记的 "0.27 到 0.85 token/字节" 是同一件事的两头。
+- **每步增长**：相邻两步输入的增加占窗口的比例，中位数 0.5%，p90 2.4%，p99 7.9%，最大 9.9%（一个 16 KiB 的数字表）。L2 第三轮里超过窗口 80% 的两次：一次在 23 步的第 11 步（还剩 13 步），一次在 33 步的第 6 步（还剩 28 步）。
+- **基线的第三轮**：85%、50%、97%（见提案 4.1）；第一、二轮 63%、71%、69%、76%。
+
+**决策**
+
+| # | 决策 | 数字从哪里来 |
+|---|---|---|
+| D52-1 | **窗口在 HOST 配置里。** provider 条目下 `models[]`（`name`、`contextWindow` 以 token 计，可选 `context:`），键是 `provider/模型名`。**没有 `contextWindow` 的模型，D52 的一切都不适用**：请求与 D40 逐字节相同（见下面的测试），参数不缩短，没有提示，没有调用前的拒绝，不写 `context.view` 事件；该条目里写的阈值只覆盖 D40 的三个数字。丢掉的是：窗口满时不能提前拒绝，也就是把一次必败的调用交给模型服务去拒，并且长会话仍旧只能靠 D40 的头尾缩短撑着。发布件里没有这些设置：发布件不可变而 HOST 配置不是；放在发布件里要升契约，而且要保证发布件不能超过运维允许的，不如不开这个口子。**按租户覆盖没有做**（HOST 配置没有租户维度，只有 `files` 有；窗口是模型的属性，不是租户的）。一个发布件有回退模型时，用候选里**已知窗口里最小的**（一个请求要装得下任何一个可能回答它的模型）；没有条目的候选不算，不会因为一个没配的回退把机制关掉 | 窗口只有运维知道 |
+| D52-2 | **输入按 token 估算，不依赖分词器。** 每个字节按类别计：ASCII 字母与符号 0.275，数字 1.25，非 ASCII 字节 0.42；每条消息另加 34，每个请求加 20；指令、消息正文、工具调用的名字与参数、工具说明与参数 schema 都算。**这几个数是基线 658 个请求的拟合值再各加 10%**：拟合是按相对误差加权的非负最小二乘，特征是三类字节数（所有内容合并）与消息条数，请求按存下的消息重建（D40 当时的缩短规则、守卫的包裹），固定部分（工具说明）取每个会话第一个请求的用量与估算之差；按会话留一交叉验证，未放大的拟合值误差 p5 −11.8%、p95 +16%（所有步）。放大 10% 是为了估算多半高于而不是低于模型服务的计数。**只在一个模型的分词上测过**；别的分词多半更省（数字不逐位切），估算偏高，这是安全的一边，上一步的用量会把它校正回来。**误差**（回放测试 `TestReplayTheBaselineUnderTheRulesOfD52`，D40 当时发出的请求，658 步）：未校正，所有步 p5 −1.2%、中位数 +6.6%、p95 +26.0%、最大 +40.5%（小请求偏高：固定部分占比大）；输入超过 60,000 token 的 223 步 +0.1% 到 +15.7%（中位数 +12.1%）。**按上一步的用量校正后**：所有步 p1 −4.9%、p5 −2.1%、中位数 +0.3%、p95 +5.9%、p99 +16.3%、最大 +26.2%；超过 60,000 token 的 223 步 p1 −1.8%、中位数 +0.2%、p95 +3.3%、最大 +15.5% | 上面的拟合与误差 |
+| D52-3 | **用上一步的用量校正，且校正有界。** 每步结束后，用模型服务报告的 prompt token 数与这一步发出的请求的**未校正**估算相比：比值先夹在 [0.5, 2]，因子取"旧因子与这个比值的平均"，再夹在 **[0.7, 1.5]**。因子初始为 1（一个运行的第一步没有校正）。报告为 0 的不算。所以一次怪的报告（0、百倍、没算缓存的计数）最多把因子推动 0.75，永远出不了 [0.7, 1.5]：估算不会被当成它自己的 0.7 倍以下，也不会超过 1.5 倍，水位与拒绝都不会因此失效。阶段 B 注意：Anthropic 开缓存后 `input_tokens` 不含缓存读取的部分，适配器的用量要把它加回去，否则因子会落到 0.7 的下限 | 误差分布；有界是为了不被一次怪报告关掉 |
+| D52-4 | **阈值按窗口推出，131,072 token 时恰是 D40 的数字，都可以按模型配置。** 单个结果上限 = 窗口的 1/8 字节（131,072 → 16,384；夹在 4 KiB 到 64 KiB，64 KiB 是 D40 之前的上限）；最近保持原样的结果数 = 6（上限随窗口走，所以最坏情形（密度 0.85 token/字节）的 6 个结果约占窗口的 64%，与窗口无关）；更早的结果与参数里的字符串超过多少字节只留头尾 = 窗口 × 75/8192（131,072 → 1,200；夹在 512 到 4,096）；水位 = 窗口的 **0.6**；提示 = 窗口的 **0.8**。优先级：运维为这个模型写的值，其次 `Harness` 里显式给的值（测试与嵌入用），其次推出的值。配置校验：窗口 4,096 到 16,777,216；水位 (0.2, 0.9]，提示 (0.3, 0.95]，水位低于提示；结果上限 1 KiB 到 1 MiB；保留个数 1 到 50；缩短阈值 200 字节到 1 MiB | 16 KiB、6、1,200 是 D40 在一个 131,072 的窗口上调出来的，这里只把它们按窗口放缩，**1,200 不是从测量得来的数**；0.6 的水位：回放里第三轮不到水位就停（见下表），并留下 20 个百分点给估算误差与一步的增长（p99 7.9%）；0.8 的提示见下 |
+| D52-5 | **逐步缩短的规则**（`shape`）。每步从存下的线程出发重算，不改线程。**不动的**：系统部分（指令、守卫前言）、调用方的上下文条目与文件说明（它们不是线程）、每一条用户消息、助手的文字、出错的工具结果（那是 HOST 自己的话）。**"最新的"**：最近 `keepToolResults`（6）个工具结果，以及要了它们的那些调用的参数；一个还没有结果的调用算最新。可缩短的是工具结果与工具调用参数里的字符串值。顺序：<br>**0 级（D40 的规则，与窗口无关）**：不在最新 6 个之内、超过 `oldResultBytes` 的结果只留头 2/3 与尾 1/3（D40 的原样字节）；**有窗口时**，同样位置、同样规则，参数里超过 `argumentBytes` 的字符串值也如此。<br>**水位**：算出的估算（乘校正因子）高于水位时，依次做以下各级，每一级都从最老的一项做起，**估算降到低水位（水位的 5/6，即窗口的 50%）以下就停**，低于低水位不再多做：1 级，更早的项缩到 `oldResultBytes`/2；2 级，缩到 /4；3 级，缩到 /6（至少 128 字节）；4 级，**最新 6 个之中除最新 2 个以外的**项缩到 `oldResultBytes`，并且技能的参考文档（`resource__read`）也可以缩了；5 级，同一批缩到 /6。**底线**：最新的 2 个工具结果与它们的调用永远原样；每一项缩短后至少留 128 字节的头尾，并带标记；一级里没有一项能再缩（已经够短）就进下一级；5 级之后没有可缩的了，请求照常发出（估算若仍装不下，走 D52-8）。<br>**缩过的不再变长**：一个运行里，一项在某一步缩到多少，之后的步骤里不会比这更长；所以水位触发一次，往下缩到低水位，接下来的若干步（每步通常增长 0.5% 到 2.4%）请求中新缩的项之前的部分不变 | 低水位的目的是阶段 B：一步一缩、从最老的项缩起，每步都会改动请求的最前面，前缀缓存每步失效；一次缩到位，两次缩短之间前缀不变（`TestWhatAStepCutStaysCutAtTheNextSteps`）。代价：触发时多缩 10 个百分点的窗口。最新 2 个的底线：模型正在用的结果不动 |
+| D52-6 | **工具调用的参数怎么缩短，才仍是每个提供者要的请求。** 各适配器发出的形式：OpenAI 兼容是 `arguments` 的 JSON 字符串；Anthropic 是 `tool_use.input`，适配器把参数 `Unmarshal` 成对象，不是 JSON 就拒发；Gemini 是 `functionCall.args`，同样 `Unmarshal` 成对象。所以缩短后的参数必须仍是合法的 JSON 对象。做法：逐个 token 重写，**键与值的顺序不变**，只把长于限额的字符串值（任意嵌套层）换成头 2/3、尾 1/3 加一句标记，其余值（数字按原文、布尔、null、短字符串）原样；HTML 字符不转义（`<`、`&` 不变成 `<`）；输入不是合法 JSON、末尾有多余数据、没有可缩的字符串、缩了也不更小，就原样返回。标记在字符串值里面：`[… N bytes of this earlier argument value are not shown. The call was made with the whole value; only this view of it is shortened, so do not take what is left for what was sent …]`，**说的是 N 字节没有显示，调用是用完整的值做的，看到的只是缩短的样子**，模型不会以为那次调用就是用缩短的值发的。每家适配器各有一个测试，把缩短后的消息交给它的 `body` 再解码，查 JSON 合法、是对象、键都在、标记在 | 三家的形式各查过适配器代码；"不会以为调用是用缩短的参数做的"是标记的第二句 |
+| D52-7 | **记什么（G3）。** 存下来的线程、工具调用记录（`tool_calls.arguments`）、事件、来源都不动：缩短只发生在发给模型的视图上，视图由 `shape` 每步重算，复制了消息与调用的切片再改。**每一步**，有窗口的模型写一条事件 `idp.host/context.view {step, windowTokens, markTokens, estimateTokens（校正后）, rawEstimateTokens, factor, level（这一步最深做到几级）, shortened, hint, items}`，`items` 是 `[kind（result｜arguments）, id（工具消息 id｜工具调用 id）, bytes（原长）, limit（缩到的限额）, shown（给模型的长度）]`；这一步缩短的项与上一步相同时写 `itemsAsBefore: true` 代替列表。有存下的线程和这一条，每一步的视图可以重建：`Shorten(原文, limit)` 与 `ShortenArguments(原文, limit)` 的结果就是模型读到的（`TestTheRecordOfAStepRebuildsWhatTheModelRead` 逐项核对）。D40 原来不记缩短（"存下来的会话与事件不变"），没有窗口的模型仍不记 | G3 要求"模型看到的是什么有记录"，D40 没有记；最小的记法是每步一条 |
+| D52-8 | **告诉模型，并在调用之前拒绝装不下的请求。** (a) 估算（校正后）达到提示线（窗口的 80%）时，预算提示（D41，最后一条开发者消息，每步变，不在线程里）加一句："Context: this conversation fills about N% of the model's context window (about X of W tokens); the run fails when the window is full and cannot go on. Do not start new work: finish what is under way, deliver what exists, say plainly what is not done, and suggest that the user start a new conversation for the rest."。它放在预算提示里已有的位置，**没有新增会变的消息，也没有进稳定前缀**：Anthropic 与 Gemini 的适配器仍把开发者消息并进 system，所以那里整个 system 每步变，这一点没有改好也没有变坏，留给阶段 B 第 1 项。(b) 逐级缩到底之后，若校正后的估算仍高于 `窗口 − max(最大输出 token, 256)` 的 1.05 倍（5% 是估算自己的余量，防止偏高的估算结束本来装得下的运行），**不调用模型**：这一步记为 `context_length`，运行以 `MODEL_ERROR` 结束，消息是 D40 的那句（"the conversation no longer fits the model's context window; start a new conversation, or ask for less at a time"），HOST 日志一行 Warn | 提示线 80%：基线里相邻两步的增长中位数 0.5%、p90 2.4%、p99 7.9%、最大 9.9%；从 80% 到满有 20 个百分点，典型情形（p90）约 8 步，够模型交付；**两个连续的最大步（各约 10%）只够 2 步，不够**。但提示是最后一道：水位 60% 之下的请求不会走到这里，回放里水位以下就停了（最高 59.5%）；所以保持 0.8，运维可调。没有测过模型收到这句话后怎么做 |
+| D52-9 | **上下文窗口错误三家都认得，流式与非流式。** 原来 Anthropic 与 Gemini 适配器非 200 时丢弃正文，所以非流式的 400 永远是 `status_400`；现在三家都读（至多 64 KiB，只用来分类，不记录、不交给任何人）。各家文档里的形式：OpenAI 兼容——`context_length_exceeded`、"maximum context length"、llama.cpp 的 `exceed_context_size_error`（原有）；Anthropic——400 `invalid_request_error`，"prompt is too long: N tokens > M maximum"（原有标记），"input length and `max_tokens` exceed context limit: N + M > W"（新）；Gemini——400 `INVALID_ARGUMENT`，"The input token count (N) exceeds the maximum number of tokens allowed (M)"（新）。流里的错误事件（200 之后）走 D50 的 `ClassifyStreamError`，用同一张标记表。Anthropic 流以 `stop_reason: model_context_window_exceeded` 结束的算被窗口截断（`StopLength`），D40 ③ 照常以失败结束而不是记为完成。**只按文档写出的形式测过，没有抓到各家的真实样本** | 三个适配器各有 `TestContextWindowErrorsAreRecognisedStreamedAndNot` |
+
+**G4（每条一个测试）**：缩短发生在发给模型的视图上，在 D27 的包裹、D44/D48/D51 的筛选之后，从不把内容移出包裹，从不去掉标记，从不碰 D49 的来源。
+
+| 对象 | 怎么保证 | 测试 |
+|---|---|---|
+| D27 包裹 | 守卫 `ApplyView` 对**整个结果**扫描、判定、报告发现，被缩短的文字放进同一个包裹里；缩短后的结果仍以 `<untrusted source="tool_result">` 开头、以 `</untrusted>` 结尾，各只出现一次，缩短标记在包裹里面 | `TestAShortenedResultStaysInsideItsUntrustedBlock` |
+| D27 发现 | 被缩短掉的中段里的注入语句仍被发现并报告一次；`block` 模式下仍被扣住（D40 的写法先缩再扫，中段里的语句扫不到；现在扫整份，这是行为上唯一的差别，只在中段含注入语句且被缩短时可见，方向是更严） | `TestAPhraseInTheCutMiddleIsStillFlaggedAndBlocked` |
+| D44 | 发布件说 `off` 但运行有对外工具时仍包裹，缩短后也包裹 | `TestResultsStayWrappedWhenTheRunHasExternalToolsAndTheyAreShortened` |
+| D44、D48、D51 的筛选 | 筛选在运行创建时做（`api`），发生在线程与上下文条目到达 harness 之前；harness 对上下文条目与文件说明一概不缩短，有窗口与没有窗口的请求里这一部分逐字节相同 | `TestContextEntriesAndTheFilesNoteAreNeverShortened` |
+| D49 | 来源取自网关结果的 `structuredContent`，在缩短之前、与缩短无关；9 个长结果被缩短之后 9 个来源都在，答案里的 `[1]`、`[9]` 核对通过 | `TestSourcesAreCollectedFromTheWholeResultNotTheShortenedView` |
+| 请求重放与幂等 | 请求哈希来自运行的输入，视图不参与；同一线程两次得到同样的请求，运行的输入不变 | `TestTheViewIsDeterministicAndLeavesTheRunInputAlone` |
+| D47 续跑 | 重发的调用用存下的 `tool_calls.arguments`，从不用视图；构建视图不改线程 | `TestResumeSendsTheStoredArgumentsNeverTheShortenedView` |
+
+**回放预测**（`TestReplayTheBaselineUnderTheRulesOfD52`；数据目录由 `tests/replay/export_baseline.sh` 从基线的转储导出，在仓库之外，环境变量 `IDP_CONTEXT_REPLAY_DIR`，没有它就跳过）：对基线三个 L2 会话的每一步，用存下的消息重建 D40 当时发出的请求，再按新规则重建，用代码里的 `guardedMessages`；校正因子按基线上一步的用量算，估算的偏差按那一步自己的"实际 / D40 估算"折回 token。下表是每一轮的最大输入占窗口的比例：
+
+| 会话 | 轮 | 记录的 | + 参数缩短 | + 逐步缩短（默认，水位 0.6） | 水位 0.5 | 水位 0.7 |
+|---|---|---|---|---|---|---|
+| L2 第 1 遍 | 1 / 2 / **3** | 62.9 / 70.8 / **85.2** | 51.0 / 57.0 / 68.0 | 51.0 / 57.0 / **54.8** | 46.6 / 44.1 / 47.6 | 51.0 / 57.0 / 68.0 |
+| L2 第 2 遍 | 1 / 2 / **3** | 2.3 / 22.1 / **49.9** | 2.3 / 21.9 / 44.0 | 2.3 / 21.9 / **44.0** | 同左 | 同左 |
+| L2 第 3 遍 | 1 / 2 / **3** | 68.8 / 75.7 / **96.5** | 54.6 / 60.0 / 76.7 | 54.6 / 49.5 / **59.5** | 48.6 / 42.2 / 49.7 | 54.6 / 60.0 / 70.6 |
+
+第三轮三遍中的最大值：**记录 96.5%；只加参数缩短 76.7%（−19.8 个百分点）；再加逐步缩短 59.5%（再 −17.2 个百分点）**。判据是不高于 80%。参数缩短单独就让最大值落到 80% 以下，逐步缩短让它停在水位附近，并为估算误差留出余量。L1 的三个单轮运行 48.9 / 68.3 / 55.2 降到 41.2 / 55.3 / 46.8；L0 的 26.9 / 27.6 降到 24.1 / 21.0；L5、L6 基本不变（≤10%，没有多少参数可缩）。
+
+**这是预测，不是测量。** 模型看到缩短的内容后会做不同的事：步数、用的脚本、读不读文件都会变，上面每一步的内容是基线的，后面的步骤并不会照着发生。基线只有三轮，**五轮的版本回放不出来**；稳态的推断（水位把请求拉在 50% 到 60%，不可缩的部分是用户消息、助手的文字、最新 2 个结果，几轮之内增长很慢）要靠真实模型验证。尤其是"列出前面各轮做过的每一处修改"那一轮：模型靠的是助手的文字和缩短后的头尾，它被缩短的脚本已经说明了"调用是用完整的值做的"，但会不会因此漏掉或重做，只有重复调用这一项指标能回答。
+
+**拿掉一个控制、看测试失败**（每一行都是先改代码、跑测试、记下哪些测试失败、再还原）：
+
+| 拿掉的控制 | 失败的测试 |
+|---|---|
+| 参数不缩短（`shape` 不把参数当可缩短项） | `TestOlderToolCallArgumentsAreShortenedAndStillValidJSON`、`TestOneOddUsageReportCannotSwitchTheMechanismOff`、`TestAShortenedResultStaysInsideItsUntrustedBlock`、`TestAnErrorResultIsNeverShortened`、`TestASkillResourceIsShortenedOnlyAtTheDeepestLevels`、`TestContextEntriesAndTheFilesNoteAreNeverShortened`、`TestResultsStay…` 等 |
+| 水位被忽略（不触发逐步缩短） | `TestProgressiveShorteningGoesOldestFirst…`、`TestProgressiveShorteningStopsWhenNothingIsLeftToShorten`、`TestTheModelIsToldWhenTheContextIsFilling`、`TestResumeSends…`、`TestASkillResource…`、`TestContextEntries…` |
+| 从最新的项缩起，不是最老的 | `TestProgressiveShorteningGoesOldestFirstUntilTheEstimateIsUnderTheMark`（原来的 40,000 窗口上缩到同一个限额，查不出来，所以这个测试改用 55,000：一部分项停在 256、一部分在 128） |
+| 没有底线（最新 2 个也可缩） | `TestProgressiveShorteningStopsWhenNothingIsLeftToShorten` |
+| 预算提示里不加上下文一句 | `TestTheModelIsToldWhenTheContextIsFilling` |
+| 调用之前不拒绝 | `TestARequestThatCannotFitIsRefusedBeforeTheModelIsCalled` |
+| 校正没有上下限 | `TestTheCorrectionFollowsUsageAndIsBounded`、`TestOneOddUsageReportCannotSwitchTheMechanismOff` |
+| 参数标记去掉 | `TestShortenedArgumentsStayValidJSON`（三个子测试）、`TestArgumentsThatCannotOrNeedNotBeShortened…`、`TestOlderToolCallArgumentsAreShortenedAndStillValidJSON` |
+| 参数按原始字节截断（不再是合法 JSON） | `TestShortenedArgumentsStayValidJSON`、`TestShortenedArgumentsMakeAValidRequest`（OpenAI、Anthropic、Gemini 三个适配器各一个）、`TestOlderToolCallArguments…` |
+| 守卫扫描缩短后的视图而不是整个结果（G4 D27） | `TestAPhraseInTheCutMiddleIsStillFlaggedAndBlocked` |
+| 缩短过的结果不再包裹（G4 D27、D44） | `TestAShortenedResultStaysInsideItsUntrustedBlock`、`TestResultsStayWrappedWhenTheRunHasExternalToolsAndTheyAreShortened`、`TestWithoutAContextWindowTheRequestsAreThoseOfD40` |
+| 上下文条目也被缩短（G4 D44、D48、D51） | `TestContextEntriesAndTheFilesNoteAreNeverShortened` |
+| 视图直接写进消息、不复制调用切片（线程被改，G3、D47） | `TestOlderToolCallArgumentsAreShortenedAndStillValidJSON`（存下的线程变了）、`TestResumeSendsTheStoredArgumentsNeverTheShortenedView`、`TestWhatAStepCutStaysCutAtTheNextSteps` |
+| 来源改取自缩短后的结果（G4 D49；这条没有自然的一行改法，改的是：结果超过 1,200 字节就不读它的 `structuredContent`） | `TestSourcesAreCollectedFromTheWholeResultNotTheShortenedView` |
+| 缩过的下一步又变长（没有粘性） | `TestWhatAStepCutStaysCutAtTheNextSteps` |
+| 只看主模型的窗口，不看回退 | `TestTheSmallestKnownWindowOfTheCandidatesApplies` |
+| 没有窗口也缩短参数 | `TestWithoutAContextWindowTheRequestsAreThoseOfD40`（与 D51 的请求逐字节比较） |
+| 记录写错限额 | `TestTheRecordOfAStepRebuildsWhatTheModelRead` |
+| Anthropic 适配器不读 400 的正文 | `TestContextWindowErrorsAreRecognisedStreamedAndNot`（anthropic） |
+| Gemini 适配器不读 400 的正文 | `TestContextWindowErrorsAreRecognisedStreamedAndNot`（gemini） |
+| 标记表里去掉 Anthropic 与 Gemini 的新标记 | `TestContextWindowErrorsAreRecognisedStreamedAndNot`（anthropic、gemini） |
+| 按窗口推出的数字改了（131,072 不再给 1,200） | `TestThresholdsAreDerivedFromTheWindow` |
+
+没有对应测试可拿掉的两项：D47 的"重发用存下的记录"是结构性的（`execute` 读记录，视图只在 `guardedMessages` 里存在），所以测试靠"线程不被改"那一行（上表"视图直接写进消息"一行）卡住；请求哈希在 `api`，不经过本代码，测试只证明视图确定、运行输入不变。每个被拿掉的控制都至少有一个测试失败，逐个做过，全部还原后 `make test` 与 `make test-integration` 通过。
+
+**没有做的**：
+- **提示词缓存**（阶段 B）：Anthropic 的缓存断点、缓存用量、稳定前缀与变化部分的分离（含把预算提示移出 system）都没有做；D52 只做了它的前提，一次缩短之后前缀不变。
+- **摘要式压缩**（阶段 C）：没有。
+- **真正的分词器**：估算只有一个模型的数据；换模型要重新拟合密度。
+- **按发布件、按租户覆盖阈值**：见 D52-1。
+- **提供者报告上下文窗口错误后的自动收缩重试**：D40 的失败照旧；估算与实际差得多时（因子到了上下限）会走到这里。
+- **五轮 L2 与真实模型的测量**：由评测者运行。
+- **各家上下文错误的真实样本**：只按文档形式测。
+- **平台的 compose 与 kind 配置**要加 `models` 条目才得到这个行为（见 README），本仓库不含这些文件。
