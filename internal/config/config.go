@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	pathpkg "path"
 	"regexp"
 	"strings"
 	"time"
@@ -134,6 +135,13 @@ type Gateway struct {
 	Endpoint string      `yaml:"endpoint"`
 	CAFile   string      `yaml:"caFile"`
 	Auth     GatewayAuth `yaml:"auth"`
+	// ExternalTools are patterns (path.Match syntax, over the exposed tool names such as "web__*") of the tools whose
+	// calls send content outside the enterprise. A release that may use one of them is screened like one that may use an
+	// external model (D44; platform ADR-0003 D7).
+	ExternalTools []string `yaml:"externalTools"`
+	// ConfirmTools are patterns of the tools whose calls always wait for the member's confirmation, whatever the release's
+	// confirmation policy says (D44; platform ADR-0003 D8): control that does not depend on the release's author.
+	ConfirmTools []string `yaml:"confirmTools"`
 }
 
 // GatewayAuth is how the HOST authenticates to the gateway on the user's behalf.
@@ -380,6 +388,13 @@ func Load(path string) (*File, error) {
 			}
 		default:
 			return nil, fmt.Errorf("gateway %s: auth.mode must be delegation or static", g.Name)
+		}
+		for key, patterns := range map[string][]string{"externalTools": g.ExternalTools, "confirmTools": g.ConfirmTools} {
+			for _, pat := range patterns {
+				if _, err := pathpkg.Match(pat, ""); pat == "" || err != nil {
+					return nil, fmt.Errorf("gateway %s: %s pattern %q is not a valid tool name pattern", g.Name, key, pat)
+				}
+			}
 		}
 	}
 	return &f, nil

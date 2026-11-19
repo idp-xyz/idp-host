@@ -1654,8 +1654,8 @@ func TestHostEndToEnd(t *testing.T) {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = fmt.Fprint(w, `{"packageId":"pkg_it_1","digest":"sha256:`+strings.Repeat("ab", 32)+`","package":{"items":[
-			{"kind":"knowledge","id":"k1","source":"ops-handbook","trust":"authoritative","ref":"handbook#returns","title":"Returns policy","excerpt":"Returns are accepted within 30 days.","observedAt":"2026-11-01T00:00:00Z","tokens":9},
-			{"kind":"memory","id":"m1","source":"host","trust":"informational","ref":"thread:ctx-1","excerpt":"The user prefers metric units.","observedAt":"2026-11-02T00:00:00Z","tokens":7}],
+			{"kind":"knowledge","id":"k1","source":"ops-handbook","trust":"authoritative","ref":"handbook#returns","title":"Returns policy","excerpt":"Returns are accepted within 30 days.","observedAt":"2026-11-01T00:00:00Z","sensitivity":"internal","tokens":9},
+			{"kind":"memory","id":"m1","source":"host","trust":"informational","ref":"thread:ctx-1","excerpt":"The user prefers metric units.","observedAt":"2026-11-02T00:00:00Z","sensitivity":"internal","tokens":7}],
 			"budget":{"usedTokens":16}}}`)
 		}))
 		defer cmi.Close()
@@ -1745,7 +1745,7 @@ func TestHostEndToEnd(t *testing.T) {
 			switch {
 			case r.URL.Path == "/v1/context/resolve":
 				_, _ = fmt.Fprint(w, `{"packageId":"pkg_v1","digest":"sha256:`+strings.Repeat("cd", 32)+`","package":{"items":[
-				{"kind":"knowledge","id":"k9","source":"ops-handbook","trust":"authoritative","ref":"handbook#sum","title":"Sums","excerpt":"Always add carefully.","observedAt":"2026-11-01T00:00:00Z","tokens":4}],"budget":{"usedTokens":4}}}`)
+				{"kind":"knowledge","id":"k9","source":"ops-handbook","trust":"authoritative","ref":"handbook#sum","title":"Sums","excerpt":"Always add carefully.","observedAt":"2026-11-01T00:00:00Z","sensitivity":"internal","tokens":4}],"budget":{"usedTokens":4}}}`)
 			case strings.HasSuffix(r.URL.Path, "/verify"):
 				if r.Header.Get("Authorization") != "Bearer cmi-reader-key" {
 					http.Error(w, "nope", 401)
@@ -1814,6 +1814,160 @@ func TestHostEndToEnd(t *testing.T) {
 		}
 		if !refreshed {
 			t.Fatal("stale package not refreshed")
+		}
+	})
+
+	t.Run("cmi-above-the-ceiling", func(t *testing.T) {
+		// ADR-0001 D44: CMI context entries above the ceiling, or without a valid level, do not reach a run that may use an
+		// external model or call an external tool; the model is told counts only; replays of the same request still match;
+		// a child run is not handed entries nobody screened
+		items := `[{"kind":"knowledge","id":"k1","source":"ops-handbook","trust":"authoritative","ref":"h#1","title":"Open","excerpt":"BODY-OPEN","observedAt":"2026-11-01T00:00:00Z","sensitivity":"internal","tokens":3},
+		{"kind":"knowledge","id":"k2","source":"ops-handbook","trust":"authoritative","ref":"h#2","title":"Deal","excerpt":"BODY-DEAL","observedAt":"2026-11-01T00:00:00Z","sensitivity":"confidential","tokens":3},
+		{"kind":"memory","id":"m1","source":"host","trust":"informational","ref":"thread:x","excerpt":"BODY-UNLABELLED","observedAt":"2026-11-02T00:00:00Z","tokens":3}]`
+		cmi := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"packageId":"pkg_d44","digest":"sha256:`+strings.Repeat("ef", 32)+`","package":{"items":`+items+`,"budget":{"usedTokens":9}}}`)
+		}))
+		defer cmi.Close()
+		client := &cmiclient.Client{Endpoint: cmi.URL, HTTP: cmi.Client()}
+		e.host.CMI, e.host.CMIKey = client, "cmi-reader-key"
+		e.harness.CMI, e.harness.CMIKey = client, "cmi-reader-key"
+		defer func(p api.FilePolicy, ext []string) {
+			e.host.CMI, e.harness.CMI, e.host.Files = nil, nil, p
+			e.harness.Gateways["edge"].ExternalTools = ext
+		}(e.host.Files, e.harness.Gateways["edge"].ExternalTools)
+		withCMI := func(tools []string, subs ...agent.SubagentRef) agent.Definition {
+			d := definition("edge", tools, nil)
+			d.Context = agent.ContextPolicy{CMI: true}
+			d.Subagents = subs
+			return d
+		}
+		eventsOf := func(id string) (map[string]map[string]any, string) {
+			_, events, _ := e.sse("GET", "/v1/runs/"+id+"/events", "carol", nil)
+			byName := map[string]map[string]any{}
+			for _, ev := range events {
+				if n, _ := ev["name"].(string); n != "" {
+					byName[n], _ = ev["value"].(map[string]any)
+				}
+			}
+			raw, _ := json.Marshal(events)
+			return byName, string(raw)
+		}
+		cmiSeen := func(from int) string {
+			var seen []string
+			for _, turn := range e.model.History()[from:] {
+				for _, m := range turn {
+					if (m.Role == "developer" || m.Role == "system") && (strings.HasPrefix(m.Content, "CMI ") || strings.Contains(m.Content, "NOT given to you")) {
+						seen = append(seen, m.Content)
+					}
+				}
+			}
+			return strings.Join(seen, "\n")
+		}
+		// 1. a model outside the enterprise (no provider declared its own): the confidential and the unlabelled entry stay out
+		e.host.Files = api.FilePolicy{}
+		e.publish("guarded", withCMI([]string{"sum"}))
+		before := len(e.model.History())
+		r := e.must(202, "POST", "/v1/agents/guarded/runs", "carol", runBody("d44-1", "what is the deal?"), "Idempotency-Key", "d1")
+		e.drive()
+		id := r["runId"].(string)
+		if got := e.must(200, "GET", "/v1/runs/"+id, "carol", nil); got["status"] != run.StatusCompleted {
+			t.Fatalf("%v", got)
+		}
+		seen := cmiSeen(before)
+		if !strings.Contains(seen, "BODY-OPEN") || strings.Contains(seen, "BODY-DEAL") || strings.Contains(seen, "BODY-UNLABELLED") || !strings.Contains(seen, "2 context entries") || !strings.Contains(seen, "1 confidential") || !strings.Contains(seen, "1 unknown") {
+			t.Fatalf("the model saw %q", seen)
+		}
+		ev, raw := eventsOf(id)
+		if ev[agui.CustomContextResolved]["items"] != float64(3) || ev[agui.CustomContextResolved]["appended"] != float64(2) ||
+			ev[agui.CustomContextWithheld]["count"] != float64(2) || ev[agui.CustomContextWithheld]["ceiling"] != "internal" || ev[agui.CustomContextWithheld]["trigger"] != "external-model" || strings.Contains(raw, "BODY-DEAL") {
+			t.Fatalf("%s", raw)
+		}
+		// the same request replays the same run, also when the CMI answers differently the second time: the store compares the
+		// request without the entries at the tail, and the tail is now the kept entries and a note
+		again := e.must(200, "POST", "/v1/agents/guarded/runs", "carol", runBody("d44-1", "what is the deal?"), "Idempotency-Key", "d1")
+		if again["runId"] != id {
+			t.Fatal("replay returned another run")
+		}
+		items = `[{"kind":"knowledge","id":"k1","source":"ops-handbook","trust":"authoritative","ref":"h#1","excerpt":"BODY-OPEN","observedAt":"2026-11-01T00:00:00Z","sensitivity":"public","tokens":3}]`
+		if again = e.must(200, "POST", "/v1/agents/guarded/runs", "carol", runBody("d44-1", "what is the deal?"), "Idempotency-Key", "d1"); again["runId"] != id {
+			t.Fatal("replay after the CMI answered differently returned another run")
+		}
+		e.must(409, "POST", "/v1/agents/guarded/runs", "carol", runBody("d44-1", "another question"), "Idempotency-Key", "d1")
+		items = `[{"kind":"knowledge","id":"k1","source":"ops-handbook","trust":"authoritative","ref":"h#1","title":"Open","excerpt":"BODY-OPEN","observedAt":"2026-11-01T00:00:00Z","sensitivity":"internal","tokens":3},
+		{"kind":"knowledge","id":"k2","source":"ops-handbook","trust":"authoritative","ref":"h#2","title":"Deal","excerpt":"BODY-DEAL","observedAt":"2026-11-01T00:00:00Z","sensitivity":"confidential","tokens":3},
+		{"kind":"memory","id":"m1","source":"host","trust":"informational","ref":"thread:x","excerpt":"BODY-UNLABELLED","observedAt":"2026-11-02T00:00:00Z","tokens":3}]`
+		// 2. the enterprise's own model and no external tool: nothing is screened, as before D44
+		e.host.Files = api.FilePolicy{Local: map[string]bool{"fake": true}, ExternalTools: map[string][]string{"edge": {"su*"}}}
+		e.publish("internal-only", withCMI([]string{"echo"}))
+		before = len(e.model.History())
+		r = e.must(202, "POST", "/v1/agents/internal-only/runs", "carol", runBody("d44-2", "what is the deal?"), "Idempotency-Key", "d2")
+		e.drive()
+		if seen = cmiSeen(before); !strings.Contains(seen, "BODY-DEAL") || !strings.Contains(seen, "BODY-UNLABELLED") || strings.Contains(seen, "NOT given to you") {
+			t.Fatalf("the model saw %q", seen)
+		}
+		if ev, _ = eventsOf(r["runId"].(string)); ev[agui.CustomContextWithheld] != nil {
+			t.Fatalf("%v", ev)
+		}
+		// 3. the enterprise's own model but an external tool: the same screen, for the other trigger
+		e.publish("with-external-tool", withCMI([]string{"sum"}))
+		before = len(e.model.History())
+		r = e.must(202, "POST", "/v1/agents/with-external-tool/runs", "carol", runBody("d44-3", "what is the deal?"), "Idempotency-Key", "d3")
+		e.drive()
+		if seen = cmiSeen(before); strings.Contains(seen, "BODY-DEAL") || strings.Contains(seen, "BODY-UNLABELLED") || !strings.Contains(seen, "BODY-OPEN") {
+			t.Fatalf("the model saw %q", seen)
+		}
+		if ev, _ = eventsOf(r["runId"].(string)); ev[agui.CustomContextWithheld]["trigger"] != "external-tools" {
+			t.Fatalf("%v", ev)
+		}
+		// 4. a child run: the parent has no external tool and was not screened; the child has one, so it is given none of the
+		// parent's CMI entries, only the count
+		e.harness.Gateways["edge"].ExternalTools = []string{"su*"}
+		e.publish("xhelper", definition("edge", []string{"sum"}, nil))
+		e.publish("xlead", withCMI([]string{"echo"}, agent.SubagentRef{Name: "xhelper", Description: "Helps."}))
+		e.model.Script = func(msgs []fakemodel.Message, tools []string) fakemodel.Turn {
+			last := msgs[len(msgs)-1]
+			if last.Role == "user" && strings.Contains(last.Content, "delegate") {
+				return fakemodel.Turn{ToolCalls: []fakemodel.Call{{Name: "agent__xhelper", Args: `{"input":"child task"}`}}}
+			}
+			return fakemodel.DefaultScript(msgs, tools)
+		}
+		defer func() { e.model.Script = fakemodel.DefaultScript }()
+		before = len(e.model.History())
+		r = e.must(202, "POST", "/v1/agents/xlead/runs", "carol", runBody("d44-4", "please delegate"), "Idempotency-Key", "d4")
+		e.drive()
+		parent := r["runId"].(string)
+		if got := e.must(200, "GET", "/v1/runs/"+parent, "carol", nil); got["status"] != run.StatusCompleted {
+			t.Fatalf("%v", got)
+		}
+		var parentSaw, childSaw string
+		for _, turn := range e.model.History()[before:] {
+			var text []string
+			child := false
+			for _, m := range turn {
+				child = child || m.Role == "user" && m.Content == "child task"
+				if (m.Role == "developer" || m.Role == "system") && (strings.HasPrefix(m.Content, "CMI ") || strings.Contains(m.Content, "NOT given to you")) {
+					text = append(text, m.Content)
+				}
+			}
+			if child {
+				childSaw += strings.Join(text, "\n")
+			} else {
+				parentSaw += strings.Join(text, "\n")
+			}
+		}
+		if !strings.Contains(parentSaw, "BODY-DEAL") {
+			t.Fatalf("the parent has no external tool and gets everything: %q", parentSaw)
+		}
+		if strings.Contains(childSaw, "BODY-") || !strings.Contains(childSaw, "3 context entries") {
+			t.Fatalf("the child saw %q", childSaw)
+		}
+		children := e.must(200, "GET", "/v1/runs/"+parent+"/subruns", "carol", nil)["runs"].([]any)
+		if len(children) != 1 {
+			t.Fatalf("%v", children)
+		}
+		if ev, _ = eventsOf(children[0].(map[string]any)["runId"].(string)); ev[agui.CustomContextWithheld]["count"] != float64(3) || ev[agui.CustomContextWithheld]["inherited"] != true {
+			t.Fatalf("%v", ev)
 		}
 	})
 

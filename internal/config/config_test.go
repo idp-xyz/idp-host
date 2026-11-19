@@ -203,3 +203,26 @@ files:
 		}
 	}
 }
+
+// D44: gateways name the tools that send content outside the enterprise and the tools that always need the member's
+// confirmation; the patterns are checked when the file is loaded, not when a run first meets them.
+func TestGatewayToolPatternsAreValidatedAtLoad(t *testing.T) {
+	gw := func(extra string) string {
+		return "gateways:\n  - {name: web, endpoint: \"https://gw/mcp\", auth: {mode: static, apiKey: k}" + extra + "}\n"
+	}
+	f, err := load(t, gw(`, externalTools: ["web__*"], confirmTools: ["web__web_open_url"]`))
+	if err != nil || len(f.Gateways[0].ExternalTools) != 1 || f.Gateways[0].ConfirmTools[0] != "web__web_open_url" {
+		t.Fatalf("%+v %v", f.Gateways, err)
+	}
+	if f, err = load(t, gw("")); err != nil || f.Gateways[0].ExternalTools != nil {
+		t.Fatalf("both are optional: %v", err)
+	}
+	for _, bad := range []string{`externalTools: ["web__["]`, `confirmTools: ["["]`, `externalTools: [""]`} {
+		if _, err := load(t, gw(", "+bad)); err == nil || !strings.Contains(err.Error(), "gateway web") || !strings.Contains(err.Error(), "pattern") {
+			t.Errorf("%s: %v", bad, err)
+		}
+	}
+	if _, err := load(t, gw(`, externalTool: ["web__*"]`)); err == nil {
+		t.Error("a misspelt key must be refused, not ignored")
+	}
+}

@@ -109,6 +109,9 @@ type ChildRunInput struct {
 	Agent      agent.EmbeddedSubagent // which agent and which of its releases
 	Input      string                 // the user message the child starts with
 	Gateway    string                 // the parent's effective gateway; the credential is inherited when the child uses the same one
+	// ExternalTools are the gateways' external-tool patterns by gateway name (D44): a child whose release may call one of
+	// them is not given the parent's CMI context unless the parent's was screened.
+	ExternalTools map[string][]string
 }
 
 // ChildOutcome is what a parent learns of a finished (or still running) child run.
@@ -138,6 +141,15 @@ type Input struct {
 	// The member's files for this run, without their tickets (D37), and whether the run may deliver files.
 	Attachments []Attachment `json:"attachments,omitempty"`
 	Delivery    bool         `json:"delivery,omitempty"`
+	// What the HOST decided when the run was created about content leaving the enterprise (D44). Not part of the
+	// contract: the worker reads it so that a refresh of the context applies the rule the run was created under, even if
+	// the configuration changed since.
+	// ContextCeiling is the highest sensitivity a CMI context entry may have to reach this run; "" means the run's context
+	// was not screened. ContextTrigger says why it was screened (the agui.Screen* constants).
+	ContextCeiling string `json:"contextCeiling,omitempty"`
+	ContextTrigger string `json:"contextTrigger,omitempty"`
+	// ExternalTools: the release may call a tool that sends content outside the enterprise.
+	ExternalTools bool `json:"externalTools,omitempty"`
 }
 
 // ToolExecutionCaller: the caller executes every tool. The run offers the model only the caller's

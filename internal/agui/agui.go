@@ -347,4 +347,16 @@ const (
 	// CustomAttachmentWithheld: a file the member attached was not given to the run, because it is classified above
 	// what may reach an external model and the release may use one (D43).
 	CustomAttachmentWithheld = "idp.host/attachment.withheld"
+	// CustomContextWithheld: CMI context entries classified above the ceiling were not given to the run (D44):
+	// {count, byLevel, ceiling, trigger}.
+	CustomContextWithheld = "idp.host/context.withheld"
+	// CustomInputGuardRaised: the release said toolResults off, but the run has external tools, so tool results are
+	// wrapped as untrusted anyway (D44): {configured, applied, reason}.
+	CustomInputGuardRaised = "idp.host/guard.raised"
+)
+
+// Why a run's CMI context is screened against the sensitivity ceiling (D44); both may hold, joined by "+".
+const (
+	ScreenExternalModel = "external-model"
+	ScreenExternalTools = "external-tools"
 )

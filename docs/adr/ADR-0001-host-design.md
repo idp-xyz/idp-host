@@ -427,3 +427,42 @@ D37 让成员的文件经票据进出运行：字节不经过模型。但 agent 
 - 上限没有和 CMI 的租户策略打通。
 
 **验证**：`internal/api` 的 `TestFilesAboveTheCeilingAreWithheldFromExternalModels`（外部模型、自有模型、自有模型加外部回退、加外部路由候选、加远端 A2A 子 agent、什么都没声明、上限 public 与 restricted、按租户的上限；告诉模型的话里只有文件名与级别）；`internal/run` 的 `TestAttachmentSensitivity`；`internal/config` 的 `TestProvidersAreExternalUnlessDeclaredAndTheFileCeiling`；`TestHostEndToEnd/attachments-above-the-ceiling`（PostgreSQL：存下的 input 里没有被扣下的文件，它的票据没有出现在任何一次网关调用里，模型写的 `attachment:1` 换成的是留下那个文件的票据，事件与模型读到的说明都在；租户上限调到 confidential、或把 provider 声明为自有之后同一个请求两个文件都给）。平台 compose 的 `host.yaml` 给本机模型写了 `external: false`；整套验收没有重跑。
+
+
+## 26. D44：对外工具与敏感上限——附件和 CMI 上下文条目都按上限筛，确认由 HOST 配置强制（2026-11-19，契约 1.10.0，平台 ADR-0003 D7、D8）
+
+修订 D43（只筛附件、只看模型）和 D32 的局限说明（"HOST 不再按 sensitivity 过滤"）。
+
+起因：平台要给 agent 一个能上网搜索、读网页的工具（平台 ADR-0003）。这类工具把内容送出企业：搜索词、要读的地址、模型写进参数里的任何东西。D43 只防"附件跟着外部模型出去"，留下三处口子：（1）一个用企业自有模型的发布件，只要允许了对外工具，就和用外部模型一样能把读到的内容送出去，而 D43 不管它；（2）CMI 上下文条目带着 `sensitivity`，HOST 从来没读过它，D32 的局限写着"这由 CMI 的上限与策略负责"，但 CMI 不知道这个运行会不会联网；（3）运行中刷新上下文（`onStale = refresh`）会把所有 CMI 条目整批换掉，不经过任何筛选；子运行还原样继承父运行的 CMI 条目，一个不能联网的父 agent 因此能把机密条目交给能联网的子 agent。另外，`web_open_url` 之类的工具要成员确认，而确认策略写在发布件里，作者漏写，模型就能直接读任意地址，这违反"控制在模型之外"。
+
+| # | 决策 | 理由 |
+|---|---|---|
+| D44-1 | **配置：`gateways[]` 增 `externalTools` 与 `confirmTools`**，值都是工具名模式的列表（`path.Match` 语法，匹配网关暴露的工具名，如 `web__*`）。加载配置时校验：空串或写错的模式使 HOST 起不来；写错的键名照旧被 `KnownFields` 拒绝 | 哪些工具会把内容送出企业，是部署的事实，不是发布件作者的声明；发布件不可变而配置会变，所以放在 HOST 配置里 |
+| D44-2 | **"这个发布件有对外工具"**：取 `doc.Effective().Tools`（含技能带来的工具），其网关的 `externalTools` 中任一模式匹配任一允许的工具名，或允许列表是 `*`。网关由发布件的 `tools.gateway` 决定，别的网关的模式不算 | 创建运行时网关会列出哪些工具还不知道，`*` 只能按最坏情况算（宁可多扣）；技能的工具合并进来才是运行真正能调的 |
+| D44-3 | **筛选的触发条件有两个，对象有两类**：触发 = 可能使用外部模型（D43 的判断，原样）或有对外工具；对象 = 附件（D43）与 CMI 上下文条目（新）。两个触发都成立时，事件里的 `trigger` 写 `external-model+external-tools` | 一个条件成立，内容就可能出企业；筛选的规则对附件和条目应当一致 |
+| D44-4 | **CMI 条目：级别高于上限，或级别为空、不是 CMI 的四个级别之一，一律不给运行。** 上限与附件用同一个（`files.externalModelCeiling`，可按租户）。**与附件不同：条目没有级别不按 `internal` 算。** 不给的条目不进运行的 context，模型只被告知条数与级别，写成和 D43 的 `idp.host/attachments.withheld` 同样做法的一条 context（描述 `idp.host/cmi.withheld`）；未知级别的字符串不抄进说明（它来自外面，会进入模型读的文字）。`SensitivityRank` 对未知级别返回 0（当成 public），所以筛选自己先判断 `ok` | 附件的级别来自所有者系统，缺省 `internal` 是约定；CMI 条目缺级别或级别不认识是 CMI 一侧出了错，放行就是把错误变成泄露 |
+| D44-5 | **刷新也筛，用创建运行时记下的上限。** 运行的 input（不属于契约）增 `contextCeiling`、`contextTrigger`、`externalTools`；`contextCeiling` 为空表示这个运行没有筛过。`verifyContext` 刷新时用同一个上限，并换掉上一次的说明条目，不叠加；刷新带来的扣下同样记 `idp.host/context.withheld` | 运行中途改配置不应改变已创建运行的规则；刷新是放行的第二条路，不堵就等于没堵 |
+| D44-6 | **重放的幂等不变。** 存储层按 `context.resolved` 事件的 `items` 从重放请求的哈希里去掉末尾的 CMI 条目；筛选后末尾是"保留的条目加一条说明"。事件增 `appended`（末尾实际追加的条数），存储层优先读它，没有时（D44 之前的运行）回退到 `items`。`items` 仍是 CMI 返回的条数，idp-workspace 在显示它 | 同一个请求重放得到同一个运行；CMI 每次取到的条目可能不同，筛选后的条数也随之不同，哈希必须比较去掉末尾之后的请求 |
+| D44-7 | **事件 `idp.host/context.withheld {count, byLevel, ceiling, trigger}`**；`byLevel` 的键是四个级别和 `unknown`。常量在 `internal/agui` | 审计要能回答"为什么这个运行没读到这些条目"，又不重复条目的内容 |
+| D44-8 | **`toolResults: off` 在有对外工具的运行里按 `wrap` 处理**，运行写一条 `idp.host/guard.raised {configured, applied, reason}`（每个 turn 一次）。`Normalize` 已把缺省定为 `wrap`，所以这只影响作者显式写了 `off` 的发布件。在运行时覆盖而不是发布时拒绝：发布件不可变，HOST 配置会变，一个今天合法的发布件明天可能因配置加了 `externalTools` 而带上对外工具 | 对外工具读回来的内容是最不可信的一类；"关掉防护"不应当是发布件作者能对它做的事 |
+| D44-9 | **强制确认**：分发工具调用时，网关工具名匹配该网关 `confirmTools` 的调用一律进入 `PENDING_CONFIRMATION`，不看发布件的 `confirmation`。`confirmation.required` 事件多一个 `requiredBy: "host"`。只对网关工具生效：调用方的前端工具和 HOST 的保留工具不是网关的 | 控制在模型之外，也在发布件作者之外 |
+| D44-10 | **子运行**：`CreateChildRun` 原样继承父运行的 context。子运行的发布件有对外工具、而父运行的 context 没有筛过（`contextCeiling` 为空）时，继承来的、描述以 `CMI ` 开头的条目全部去掉，加一条只写条数的说明，子运行的流上记 `idp.host/context.withheld {inherited: true, byLevel: {unknown: n}}`。条目的文字里不带级别，所以只能全部扣下。父运行筛过的，条目都在上限以下，不再处理。存储层不认识网关配置，由 harness 把各网关的 `externalTools` 随 `ChildRunInput` 交过去 | 不能联网的父 agent 不应成为机密条目走向能联网的子 agent 的路 |
+
+**契约**：`idp.telos.host` 1.9.0 → **1.10.0，只改描述**，没有任何形状变化。D32 之后 `ContextPolicy` 的描述只说取上下文，现在写明按敏感级别筛选与新事件；事件名与事件字段本来就不属于 schema（自定义事件）。因为文件不再与已发布的 1.9.0 逐字节相同，所以发新版本。`$id`、`contractID`、示例（只有描述行变）、OpenAPI 文字、README 同步；idp-contracts 加 1.10.0 目录与注册表条目，`tools/validate.py` 37 项不变量通过（含 1.10.0 对所有旧版本的"只增不减"检查）。原计划写的"schema 里有一处描述说 HOST 不按 sensitivity 过滤"并不在 schema 里，而在本文 D32 的局限里；schema 里改的是 `ContextPolicy` 的描述。
+
+**取舍与边界**：
+- **所有对外工具一视同仁。** `externalTools` 不区分"搜索词出去"和"整页内容出去"；筛的是运行读到的内容，不是工具的参数。
+- **宁可多扣。** `*` 算对外；没有级别算超限；子运行的继承条目全部扣下。运维要放开，就在配置里不列 `externalTools`。
+- **`toolExecution: caller` 的运行也照筛。** 调用方自己的工具不碰网关，但创建运行时不为此改规则：多扣的代价小于漏判的代价。
+- **子运行只看对外工具，不看模型。** 子运行的发布件用外部模型、父运行没筛过时，仍照 D43 的局限不查（本地子 agent 的模型）。
+- 任务文字带出数据（父 agent 把读到的内容写进委派给子 agent 的任务）的缺口仍在，留到阶段 2（平台 ADR-0003 附录 C 第 2 节）。
+- 附件的 `idp.host/attachment.withheld` 事件多了 `trigger`；说明文字改为"模型或工具"。
+
+**实施**：`internal/config`（`Gateway.ExternalTools`、`ConfirmTools`、加载时校验）；`internal/agent`（`ToolPolicy.MatchesAny`、`MatchesTool`）；`internal/cmiclient/screen.go`（`Screen`、`Screening`、`DropInherited`）；`internal/api`（`FilePolicy.ExternalTools`、`hasExternalTools`、`trigger`，`createRun` 记录 input，`resolveContext` 筛选）；`internal/run`（`Input.ContextCeiling`、`ContextTrigger`、`ExternalTools`；`ChildRunInput.ExternalTools`）；`internal/harness`（`Gateway.ExternalTools/ConfirmTools`、`dispatch`、`guardedMessages`、`verifyContext`）；`adapters/store/postgres`（`contextItems` 读 `appended`；`CreateChildRun`）；`cmd/idp-host`。
+
+**验证**：`internal/config` 的 `TestGatewayToolPatternsAreValidatedAtLoad`；`internal/agent` 的 `TestToolPolicyMatchesExternalToolPatterns`；`internal/cmiclient` 的 `TestScreenWithholdsAboveTheCeilingAndFailsClosedOnUnknownLevels`、`TestScreeningTellsTheModelCountsAndLevelsOnly`、`TestDropInheritedRemovesEveryCMIEntryAndSaysHowMany`；`internal/api` 的 `TestTheTriggerIsAnExternalModelOrAnExternalTool`、`TestFilesAboveTheCeilingAreWithheldFromRunsWithExternalTools`、`TestResolveContextScreensCMIEntriesOfAnExternalRun`；`adapters/store/postgres` 的 `TestContextItemsReadsTheNumberOfEntriesAppended`；`internal/harness` 的 `TestHostConfigurationForcesConfirmationOfNamedTools`、`TestToolResultsAreWrappedWhenTheRunHasExternalToolsWhateverTheReleaseSays`、`TestRefreshedContextIsScreenedWithTheCeilingRecordedAtCreation`、`TestChildRunsAreCreatedWithTheGatewaysExternalToolPatterns`；`TestHostEndToEnd/cmi-above-the-ceiling`（PostgreSQL：外部模型与外部工具两种触发、自有模型且无对外工具时不筛、同一请求重放得到同一个运行，包括 CMI 第二次答得不同的情形，子运行得不到父运行的条目）。每条规则去掉一次、看对应测试失败的记录见实施时的报告。D43 的测试没有改动。集成测试里 `cmi-context` 与 `cmi-verify-at-steps` 的假 CMI 条目补了 `sensitivity: internal`，否则新规则会把它们当成没有级别而扣下。
+
+**没有做的**：
+- 平台 compose 与 kind 上的验收（`host.yaml` 的 `externalTools`、`confirmTools`，PATH M、N）不在这一步。
+- 没有界面：被扣下的条数只在事件流与模型的回答里。
+- idp-web 侧的每次运行调用上限做不到（调用者断言里没有运行号），由步数上限兜底（平台 ADR-0003 附录 C 第 2 节第 4 条）。

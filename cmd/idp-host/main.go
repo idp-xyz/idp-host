@@ -309,7 +309,7 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 		if err != nil {
 			return fmt.Errorf("gateway %s: %w", g.Name, err)
 		}
-		gw := &harness.Gateway{Name: g.Name, Endpoint: endpoint, Client: &mcpclient.Client{HTTP: mcpclient.NewHTTPClient(60*time.Second, tlsCfg), Info: mcpclient.ClientInfo{Name: "idp-host", Version: version}}}
+		gw := &harness.Gateway{Name: g.Name, Endpoint: endpoint, ExternalTools: g.ExternalTools, ConfirmTools: g.ConfirmTools, Client: &mcpclient.Client{HTTP: mcpclient.NewHTTPClient(60*time.Second, tlsCfg), Info: mcpclient.ClientInfo{Name: "idp-host", Version: version}}}
 		auth := api.GatewayAuth{}
 		switch g.Auth.Mode {
 		case "static":
@@ -435,13 +435,19 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 		return nil
 	}
 	// D43: the providers the operator declared to be the enterprise's own; files above the ceiling go to no other
+	externalTools := map[string][]string{} // D44: tools that send content outside the enterprise, by gateway
+	for _, g := range cfg.Gateways {
+		if len(g.ExternalTools) > 0 {
+			externalTools[g.Name] = g.ExternalTools
+		}
+	}
 	localProviders := map[string]bool{}
 	for _, p := range cfg.Providers {
 		if !p.IsExternal() {
 			localProviders[p.Name] = true
 		}
 	}
-	srvAPI := &api.API{Files: api.FilePolicy{Local: localProviders, Ceiling: cfg.Files.Ceiling}, Store: store, Auth: verifier, Gateways: gatewayAuth, Providers: registry.Names(), Log: log, Metrics: metrics, Version: version, CMI: cmiClient, CMIKey: cmiKey, CMIToken: cmiToken, CMIAuth: cmiAuth}
+	srvAPI := &api.API{Files: api.FilePolicy{Local: localProviders, Ceiling: cfg.Files.Ceiling, ExternalTools: externalTools}, Store: store, Auth: verifier, Gateways: gatewayAuth, Providers: registry.Names(), Log: log, Metrics: metrics, Version: version, CMI: cmiClient, CMIKey: cmiKey, CMIToken: cmiToken, CMIAuth: cmiAuth}
 	srv := &http.Server{Addr: env("IDP_HOST_LISTEN", "127.0.0.1:8450"), Handler: observability.HTTPMiddleware(tp, "idp-host/api", srvAPI.Handler()),
 		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 0, IdleTimeout: 120 * time.Second}
 	if cert := env("IDP_HOST_TLS_CERT_FILE", ""); cert != "" {

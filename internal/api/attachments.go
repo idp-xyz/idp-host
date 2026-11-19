@@ -18,6 +18,9 @@ type FilePolicy struct {
 	Local map[string]bool
 	// Ceiling returns the highest sensitivity that may reach an external model for a tenant; nil means internal.
 	Ceiling func(tenant string) string
+	// ExternalTools are the gateways' external-tool patterns by gateway name (D44): a release that may call one of them is
+	// screened like one that may use an external model.
+	ExternalTools map[string][]string
 }
 
 // ContextAttachmentsWithheld is the caller-context entry that tells the model which files it was not given, so that it
@@ -56,14 +59,34 @@ func (p FilePolicy) externalModels(doc *agent.Document) []string {
 	return out
 }
 
+// hasExternalTools reports whether the release may call a tool that sends content outside the enterprise (D44; platform
+// ADR-0003 D7): any tool of its effective policy (skills included) matches the externalTools patterns of its gateway, or
+// the policy allows "*", because the gateway's catalogue is not known when the run is created.
+func (p FilePolicy) hasExternalTools(doc *agent.Document) bool {
+	tools := doc.Effective().Tools
+	return tools.MatchesAny(p.ExternalTools[tools.Gateway])
+}
+
+// trigger says why the run's content is screened against the ceiling: "" when it is not (D44).
+func (p FilePolicy) trigger(doc *agent.Document) string {
+	var why []string
+	if len(p.externalModels(doc)) > 0 {
+		why = append(why, agui.ScreenExternalModel)
+	}
+	if p.hasExternalTools(doc) {
+		why = append(why, agui.ScreenExternalTools)
+	}
+	return strings.Join(why, "+")
+}
+
 // screen splits the attachments of a run of doc into those it gets and those it does not. Nothing is withheld from a
-// release that only uses the enterprise's own models, or below the ceiling.
+// release that only uses the enterprise's own models and no external tool, or below the ceiling.
 func (p FilePolicy) screen(tenant string, doc *agent.Document, atts []run.Attachment) (kept, withheld []run.Attachment, ceiling string) {
 	ceiling = "internal"
 	if p.Ceiling != nil {
 		ceiling = p.Ceiling(tenant)
 	}
-	if len(atts) == 0 || len(p.externalModels(doc)) == 0 {
+	if len(atts) == 0 || p.trigger(doc) == "" {
 		return atts, nil, ceiling
 	}
 	limit, _ := run.SensitivityRank(ceiling)
@@ -78,11 +101,11 @@ func (p FilePolicy) screen(tenant string, doc *agent.Document, atts []run.Attach
 }
 
 // withheldEvents records each withheld file on the run's stream: which file, how it is classified, and the ceiling.
-func withheldEvents(withheld []run.Attachment, ceiling string, external []string) []agui.Event {
+func withheldEvents(withheld []run.Attachment, ceiling string, external []string, trigger string) []agui.Event {
 	var out []agui.Event
 	for _, a := range withheld {
 		out = append(out, agui.Custom(agui.CustomAttachmentWithheld, map[string]any{"ref": a.Ref, "name": a.Name, "sensitivity": levelOf(a),
-			"ceiling": ceiling, "externalModels": external}))
+			"ceiling": ceiling, "externalModels": external, "trigger": trigger}))
 	}
 	return out
 }
@@ -97,7 +120,7 @@ func levelOf(a run.Attachment) string {
 // withheldNote is what the model is told: names and levels only.
 func withheldNote(withheld []run.Attachment, ceiling string) string {
 	var b strings.Builder
-	b.WriteString("The user attached files that were NOT given to you, because they are classified above what may be sent to the model this agent uses (the limit is ")
+	b.WriteString("The user attached files that were NOT given to you, because they are classified above what may be sent outside the enterprise by the model or tools this agent uses (the limit is ")
 	b.WriteString(ceiling)
 	b.WriteString("). You cannot read them and they are not among attachment:N. Tell the user which files were withheld and why; do not guess their content:\n")
 	for _, a := range withheld {

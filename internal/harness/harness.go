@@ -60,6 +60,11 @@ type Gateway struct {
 	StaticBearer string
 	// Refresh renews a session-bound delegated credential (D38); nil when the gateway's credential is not renewable.
 	Refresh func(ctx context.Context, refreshToken string) (*credential.Token, error)
+	// ExternalTools are patterns of the tools whose calls send content outside the enterprise (D44); the API screens runs
+	// by them at creation and a child run is created under them. ConfirmTools are patterns of the tools whose calls
+	// always wait for the member, whatever the release's confirmation policy says (D44; platform ADR-0003 D8).
+	ExternalTools []string
+	ConfirmTools  []string
 }
 
 // credentialLeeway: a delegated credential this close to its expiry is renewed before a gateway call.
@@ -646,7 +651,7 @@ func (t *turn) delegate(tc run.ToolCall) error {
 		}
 		return t.answer(tc, run.CallDone, res.Text, "")
 	}
-	if _, err := t.h.Store.CreateChildRun(t.ctx, t.claim, run.ChildRunInput{ToolCallID: tc.ID, Agent: sub, Input: args.Input, Gateway: t.def.Tools.Gateway}); err != nil {
+	if _, err := t.h.Store.CreateChildRun(t.ctx, t.claim, run.ChildRunInput{ToolCallID: tc.ID, Agent: sub, Input: args.Input, Gateway: t.def.Tools.Gateway, ExternalTools: t.h.externalToolPatterns()}); err != nil {
 		if errors.Is(err, run.ErrFenced) || t.ctx.Err() != nil {
 			return err
 		}
@@ -1152,13 +1157,17 @@ func (t *turn) dispatch(step int, msg agui.Message) (string, error) {
 		case !t.visible[tc.Tool] && !t.hostTool(tc.Tool):
 			tc.State = run.CallDenied
 			events = append(events, agui.Custom(agui.CustomToolDenied, map[string]any{"toolCallId": tc.ID, "tool": tc.Tool, "reason": "tool not available to this agent"}))
-		case t.def.Confirmation.For(tc.Tool) == agent.ConfirmConfirm:
+		case t.def.Confirmation.For(tc.Tool) == agent.ConfirmConfirm || t.hostRequiresConfirmation(tc.Tool):
 			tc.State = run.CallPendingConfirmation
 			tc.ConfirmationExpiresAt = now.Add(time.Duration(t.def.Limits.ConfirmationTimeoutSeconds) * time.Second)
 			if d := t.rc.Run.DeadlineAt; !d.IsZero() && d.Before(tc.ConfirmationExpiresAt) {
 				tc.ConfirmationExpiresAt = d // D35: a decision after the run's deadline could not be used
 			}
-			events = append(events, agui.Custom(agui.CustomConfirmationRequired, map[string]any{"toolCallId": tc.ID, "tool": tc.Tool, "arguments": json.RawMessage(canon), "expiresAt": tc.ConfirmationExpiresAt.UTC().Format(time.RFC3339)}))
+			required := map[string]any{"toolCallId": tc.ID, "tool": tc.Tool, "arguments": json.RawMessage(canon), "expiresAt": tc.ConfirmationExpiresAt.UTC().Format(time.RFC3339)}
+			if t.def.Confirmation.For(tc.Tool) != agent.ConfirmConfirm {
+				required["requiredBy"] = "host" // D44: the HOST's configuration, not the release
+			}
+			events = append(events, agui.Custom(agui.CustomConfirmationRequired, required))
 			interrupts = append(interrupts, map[string]any{"type": "confirmation", "toolCallId": tc.ID, "tool": tc.Tool, "arguments": json.RawMessage(canon), "expiresAt": tc.ConfirmationExpiresAt.UTC().Format(time.RFC3339)})
 		default:
 			tc.State = run.CallConfirmed
@@ -1208,6 +1217,25 @@ func (t *turn) dispatch(step int, msg agui.Message) (string, error) {
 	return "", nil
 }
 
+// externalToolPatterns are the gateways' external-tool patterns by gateway name, for the store to judge a child's release.
+func (h *Harness) externalToolPatterns() map[string][]string {
+	out := map[string][]string{}
+	for name, g := range h.Gateways {
+		if len(g.ExternalTools) > 0 {
+			out[name] = g.ExternalTools
+		}
+	}
+	return out
+}
+
+// hostRequiresConfirmation reports whether the HOST's configuration makes calls of the tool wait for the member
+// whatever the release's confirmation policy says (D44; platform ADR-0003 D8). It applies to gateway tools only: a
+// caller's own tool and the HOST's reserved tools are not the gateway's.
+func (t *turn) hostRequiresConfirmation(tool string) bool {
+	gw := t.h.Gateways[t.def.Tools.Gateway]
+	return gw != nil && t.visible[tool] && agent.MatchesTool(gw.ConfirmTools, tool)
+}
+
 // hostTool reports whether the HOST itself serves the tool in this turn.
 func (t *turn) hostTool(name string) bool {
 	if _, ok := t.subagents[name]; ok {
@@ -1222,10 +1250,20 @@ func (t *turn) hostTool(name string) bool {
 func (t *turn) guardedMessages() ([]agui.Message, error) {
 	in := t.def.Guards.Input
 	var msgs []agui.Message
+	var events []agui.Event
+	// D44: tool results of a run that may call a tool sending content outside the enterprise are always wrapped as
+	// untrusted. A release is immutable while the HOST's configuration is not, so the release's "off" is overridden here
+	// and not refused when the release is published.
+	if t.rc.Run.Input.ExternalTools && in.ToolResults == guard.ModeOff {
+		in.ToolResults = guard.ModeWrap
+		if !t.flagged["raised"] {
+			t.flagged["raised"] = true
+			events = append(events, agui.Custom(agui.CustomInputGuardRaised, map[string]any{"configured": guard.ModeOff, "applied": guard.ModeWrap, "reason": "the run has tools that send content outside the enterprise"}))
+		}
+	}
 	if in.ToolResults != guard.ModeOff || in.Context != guard.ModeOff {
 		msgs = append(msgs, agui.Message{ID: "guard", Role: agui.RoleDeveloper, Content: guard.Preamble})
 	}
-	var events []agui.Event
 	report := func(key, source, id string, findings []guard.Finding, blocked bool) {
 		if len(findings) == 0 || t.flagged[key] {
 			return
@@ -1432,6 +1470,7 @@ func (t *turn) verifyContext() (bool, error) {
 	if mode == "" {
 		mode = "continue"
 	}
+	var refreshEvents []agui.Event
 	event := map[string]any{"packageId": pkgID, "verified": true, "staleItems": v.StaleItems, "redacted": v.Redacted, "onStale": mode}
 	if mode == "fail" {
 		if err := t.h.Store.AppendEvents(t.ctx, t.claim, []agui.Event{agui.Custom(agui.CustomContextStale, event)}); err != nil {
@@ -1456,16 +1495,26 @@ func (t *turn) verifyContext() (bool, error) {
 			if pkg, err := t.h.CMI.Resolve(t.ctx, key, req); err == nil {
 				kept := t.rc.Run.Input.Context[:0:0]
 				for _, c := range t.rc.Run.Input.Context {
-					if !strings.HasPrefix(c.Description, "CMI ") {
+					if !strings.HasPrefix(c.Description, "CMI ") && c.Description != cmiclient.ContextCMIWithheld {
 						kept = append(kept, c)
 					}
 				}
-				t.rc.Run.Input.Context = append(kept, cmiclient.ContextOf(pkg)...)
+				entries := cmiclient.ContextOf(pkg)
+				// D44: the refresh applies the screen the run was created under, with the ceiling recorded then
+				if ceiling := t.rc.Run.Input.ContextCeiling; ceiling != "" {
+					s := cmiclient.Screen(pkg.Items, ceiling)
+					entries = s.Context()
+					if s.Withheld > 0 {
+						event["refreshedWithheld"] = s.Withheld
+						refreshEvents = append(refreshEvents, s.Event(t.rc.Run.Input.ContextTrigger))
+					}
+				}
+				t.rc.Run.Input.Context = append(kept, entries...)
 				event["refreshedPackageId"], event["refreshedItems"] = pkg.PackageID, len(pkg.Items)
 			} else {
 				event["refreshError"] = sanitize(err)
 			}
 		}
 	}
-	return false, t.h.Store.AppendEvents(t.ctx, t.claim, []agui.Event{agui.Custom(agui.CustomContextStale, event)})
+	return false, t.h.Store.AppendEvents(t.ctx, t.claim, append([]agui.Event{agui.Custom(agui.CustomContextStale, event)}, refreshEvents...))
 }

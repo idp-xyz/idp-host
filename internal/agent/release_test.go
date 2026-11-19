@@ -277,3 +277,36 @@ func TestEvaluationValidationAndJudge(t *testing.T) {
 		}
 	}
 }
+
+// D44: a tool policy "matches" the external-tool patterns when any allowed name matches (path.Match syntax), a skill's
+// tools count, and an allow list of "*" matches because the gateway's catalogue is not known when a run is created.
+func TestToolPolicyMatchesExternalToolPatterns(t *testing.T) {
+	web := []string{"web__*"}
+	for name, c := range map[string]struct {
+		allow    []string
+		patterns []string
+		want     bool
+	}{
+		"a tool of the family":      {[]string{"parcel__get", "web__web_search"}, web, true},
+		"none of them":              {[]string{"parcel__get", "sum"}, web, false},
+		"exact name":                {[]string{"web__web_fetch"}, []string{"web__web_fetch"}, true},
+		"another tool of the same":  {[]string{"web__web_search"}, []string{"web__web_fetch"}, false},
+		"allow all":                 {[]string{AllowAll}, web, true},
+		"allow all, no patterns":    {[]string{AllowAll}, nil, false},
+		"no tools":                  {nil, web, false},
+		"a malformed pattern never": {[]string{"web__x"}, []string{"web__["}, false},
+	} {
+		if got := (ToolPolicy{Gateway: "edge", Allow: c.allow}).MatchesAny(c.patterns); got != c.want {
+			t.Errorf("%s: %v", name, got)
+		}
+	}
+	// the tools skills bring are part of the effective policy
+	d := &Document{Definition: Definition{Tools: ToolPolicy{Gateway: "edge", Allow: []string{"get"}}, Skills: []SkillRef{{Name: "research"}}},
+		Skills: []EmbeddedSkill{{Name: "research", Definition: SkillDefinition{Tools: []string{"web__web_search"}}}}}
+	if !d.Effective().Tools.MatchesAny(web) || d.Definition.Tools.MatchesAny(web) {
+		t.Fatal("a skill's tool must count, and only through the effective definition")
+	}
+	if !MatchesTool(web, "web__web_open_url") || MatchesTool(web, "webby") || MatchesTool(nil, "web__x") {
+		t.Fatal("MatchesTool")
+	}
+}

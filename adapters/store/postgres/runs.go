@@ -12,6 +12,7 @@ import (
 	"idp-host/internal/agent"
 	"idp-host/internal/agui"
 	"idp-host/internal/canonical"
+	"idp-host/internal/cmiclient"
 	"idp-host/internal/credential"
 	"idp-host/internal/run"
 )
@@ -985,9 +986,21 @@ func (s *Store) CreateChildRun(ctx context.Context, c *run.Claim, in run.ChildRu
 					return err
 				}
 			}
-			input := run.Input{Tools: []agui.Tool{}, Context: parent.Input.Context, MaxOutputTokens: parent.Input.MaxOutputTokens}
+			input := run.Input{Tools: []agui.Tool{}, Context: parent.Input.Context, MaxOutputTokens: parent.Input.MaxOutputTokens,
+				ContextCeiling: parent.Input.ContextCeiling, ContextTrigger: parent.Input.ContextTrigger}
 			if input.Context == nil {
 				input.Context = []agui.Context{}
+			}
+			// D44: a child that may call a tool sending content outside the enterprise is not handed CMI entries nobody
+			// screened: its parent may have no such tool.
+			childTools := doc.Effective().Tools
+			input.ExternalTools = childTools.MatchesAny(in.ExternalTools[childTools.Gateway])
+			var childEvents []agui.Event
+			if input.ExternalTools && parent.Input.ContextCeiling == "" {
+				var dropped int
+				if input.Context, dropped = cmiclient.DropInherited(input.Context); dropped > 0 {
+					childEvents = append(childEvents, cmiclient.InheritedEvent(dropped))
+				}
 			}
 			msg := agui.Message{ID: "u_" + childID, Role: agui.RoleUser, Content: in.Input}
 			hash, err := canonical.Digest(map[string]any{"agent": ag.ID, "messages": []agui.Message{msg}, "input": input, "release": releaseID, "executionRef": parent.ExecutionRef})
@@ -1014,7 +1027,7 @@ func (s *Store) CreateChildRun(ctx context.Context, c *run.Claim, in run.ChildRu
 			if _, err := appendMessages(ctx, tx, c.TenantID, childID, childID, []agui.Message{msg}); err != nil {
 				return err
 			}
-			if err := appendEvents(ctx, tx, c.TenantID, childID, []agui.Event{agui.RunStarted(childID, childID)}); err != nil {
+			if err := appendEvents(ctx, tx, c.TenantID, childID, append([]agui.Event{agui.RunStarted(childID, childID)}, childEvents...)); err != nil {
 				return err
 			}
 			if out, err = scanRun(tx.QueryRow(ctx, `SELECT `+runCols+` FROM runs WHERE id = $1`, childID)); err != nil {
@@ -1271,11 +1284,16 @@ func (s *Store) ExpireConfirmations(ctx context.Context) (int, error) {
 	return n, nil
 }
 
-// contextItems is how many context entries the CMI contributed, read from the resolved event.
+// contextItems is how many context entries the CMI contributed at the tail of the context, read from the resolved event:
+// "appended" when the HOST screened the package (the kept entries plus one note, D44), "items" otherwise (and for runs
+// created before D44, whose event has no "appended").
 func contextItems(events []agui.Event) int {
 	for _, e := range events {
 		if e["name"] == agui.CustomContextResolved {
 			if v, ok := e["value"].(map[string]any); ok {
+				if n, ok := v["appended"].(int); ok {
+					return n
+				}
 				if n, ok := v["items"].(int); ok {
 					return n
 				}

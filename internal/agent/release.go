@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path"
 	"regexp"
 	"sort"
 	"strings"
@@ -455,6 +456,36 @@ func (d *Definition) Validate() error {
 func (p ToolPolicy) Allows(tool string) bool {
 	for _, t := range p.Allow {
 		if t == AllowAll || t == tool {
+			return true
+		}
+	}
+	return false
+}
+
+// MatchesAny reports whether the policy may let the agent call a tool whose name matches one of the patterns
+// (path.Match syntax). The catalogue the gateway will show is not known when a run is created, so an allow list of "*"
+// counts as matching whatever the patterns are, as long as there is one: the answer fails closed (D44).
+func (p ToolPolicy) MatchesAny(patterns []string) bool {
+	if len(patterns) == 0 {
+		return false
+	}
+	for _, t := range p.Allow {
+		if t == AllowAll {
+			return true
+		}
+		for _, pat := range patterns {
+			if ok, err := path.Match(pat, t); err == nil && ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// MatchesTool reports whether one tool name matches one of the patterns (path.Match syntax).
+func MatchesTool(patterns []string, tool string) bool {
+	for _, pat := range patterns {
+		if ok, err := path.Match(pat, tool); err == nil && ok {
 			return true
 		}
 	}

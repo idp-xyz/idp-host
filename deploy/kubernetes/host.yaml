@@ -55,6 +55,11 @@ data:
           audience: https://mcp.example.com/mcp
           actorToken: true
           caFile: /etc/idp/identity-ca/ca.crt
+        # D44: patterns (path.Match) of the tools that send content outside the enterprise, and of the tools whose calls always
+        # wait for the member whatever the release says. Releases that may call an external tool are screened against
+        # files.externalModelCeiling.
+        # externalTools: ["web__*"]
+        # confirmTools: ["web__web_open_url"]
 ---
 apiVersion: apps/v1
 kind: Deployment
