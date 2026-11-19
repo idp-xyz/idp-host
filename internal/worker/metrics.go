@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"strconv"
 	"time"
 
 	"idp-host/internal/model"
@@ -10,29 +11,31 @@ import (
 // Metrics implements harness.Metrics on the Prometheus registry. Labels carry providers, models,
 // gateways and outcomes only - never subjects, prompts or arguments (ADR-0001 D12).
 type Metrics struct {
-	steps    *observability.CounterVec
-	modelSec *observability.HistogramVec
-	tokens   *observability.CounterVec
-	tools    *observability.CounterVec
-	toolSec  *observability.HistogramVec
-	runs     *observability.CounterVec
-	guards   *observability.CounterVec
-	Claims   *observability.CounterVec
-	memory   *observability.CounterVec
+	steps       *observability.CounterVec
+	modelSec    *observability.HistogramVec
+	tokens      *observability.CounterVec
+	tools       *observability.CounterVec
+	toolSec     *observability.HistogramVec
+	runs        *observability.CounterVec
+	guards      *observability.CounterVec
+	Claims      *observability.CounterVec
+	memory      *observability.CounterVec
+	interrupted *observability.CounterVec // D47
 }
 
 // NewMetrics registers the worker's instruments.
 func NewMetrics(m *observability.Metrics) *Metrics {
 	return &Metrics{
-		steps:    m.Counter("idp_host_model_steps_total", "Model calls by provider, model and outcome.", "provider", "model", "outcome"),
-		modelSec: m.Histogram("idp_host_model_seconds", "Model call latency by provider.", observability.DurationBuckets, "provider"),
-		tokens:   m.Counter("idp_host_model_tokens_total", "Tokens by provider, model and kind (prompt, completion).", "provider", "model", "kind"),
-		tools:    m.Counter("idp_host_tool_calls_total", "Tool calls by gateway and outcome.", "gateway", "outcome"),
-		toolSec:  m.Histogram("idp_host_tool_seconds", "Tool call latency by gateway.", observability.DurationBuckets, "gateway"),
-		runs:     m.Counter("idp_host_runs_finished_total", "Run turns by resulting status.", "status"),
-		guards:   m.Counter("idp_host_guard_events_total", "Content guard decisions by kind (input, output) and outcome.", "kind", "outcome"),
-		Claims:   m.Counter("idp_host_claims_total", "Claims by result (served, fenced).", "result"),
-		memory:   m.Counter("idp_host_memory_writes_total", "Memory records written to the CMI after completed runs, by outcome (written, replayed, rejected, failed, auth_failed, no_credential).", "outcome"),
+		steps:       m.Counter("idp_host_model_steps_total", "Model calls by provider, model and outcome.", "provider", "model", "outcome"),
+		modelSec:    m.Histogram("idp_host_model_seconds", "Model call latency by provider.", observability.DurationBuckets, "provider"),
+		tokens:      m.Counter("idp_host_model_tokens_total", "Tokens by provider, model and kind (prompt, completion).", "provider", "model", "kind"),
+		tools:       m.Counter("idp_host_tool_calls_total", "Tool calls by gateway and outcome.", "gateway", "outcome"),
+		toolSec:     m.Histogram("idp_host_tool_seconds", "Tool call latency by gateway.", observability.DurationBuckets, "gateway"),
+		runs:        m.Counter("idp_host_runs_finished_total", "Run turns by resulting status.", "status"),
+		guards:      m.Counter("idp_host_guard_events_total", "Content guard decisions by kind (input, output) and outcome.", "kind", "outcome"),
+		Claims:      m.Counter("idp_host_claims_total", "Claims by result (served, fenced).", "result"),
+		interrupted: m.Counter("idp_host_tool_interruptions_total", "Tool calls found cut short (D47) by whether they were sent again (resent) and why (worker_stopped, deadline, canceled).", "resent", "reason"),
+		memory:      m.Counter("idp_host_memory_writes_total", "Memory records written to the CMI after completed runs, by outcome (written, replayed, rejected, failed, auth_failed, no_credential).", "outcome"),
 	}
 }
 
@@ -59,6 +62,11 @@ func (m *Metrics) RunFinished(status string) { m.runs.Inc(status) }
 
 // Guard implements harness.Metrics.
 func (m *Metrics) Guard(kind, outcome string) { m.guards.Inc(kind, outcome) }
+
+// ToolInterrupted implements the harness's interruptionMetrics (D47).
+func (m *Metrics) ToolInterrupted(resent bool, reason string) {
+	m.interrupted.Inc(strconv.FormatBool(resent), reason)
+}
 
 // MemoryWrite counts one remember attempt by outcome (ADR-0001 D33).
 func (m *Metrics) MemoryWrite(outcome string) { m.memory.Inc(outcome) }

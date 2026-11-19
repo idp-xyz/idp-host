@@ -10,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"idp-host/internal/harness"
 	"idp-host/internal/run"
 )
 
@@ -21,20 +20,32 @@ type Store interface {
 	ExpireConfirmations(ctx context.Context) (int, error)
 }
 
+// Runner drives one claimed run's turn; the harness is the one in production.
+type Runner interface {
+	Run(ctx context.Context, c *run.Claim) error
+}
+
 // Worker is the pool.
 type Worker struct {
 	ID          string
 	Store       Store
-	Harness     *harness.Harness
+	Harness     Runner
 	Concurrency int
 	Lease       time.Duration
 	Poll        time.Duration
-	Log         *slog.Logger
+	// StopGrace is how long the runs in progress may go on after Run's context ends (D47): the worker stops claiming at
+	// once, and the harness's calls, a tool call among them, are let finish so that a stop does not interrupt them; after
+	// StopGrace they are cut short, and whoever resumes the run handles a call still EXECUTING as D47 says. It must be
+	// shorter than the termination grace period of the platform that stops the process. Zero cuts them short at once.
+	StopGrace time.Duration
+	Log       *slog.Logger
 
-	busy sync.WaitGroup
+	busy    sync.WaitGroup
+	stopped <-chan struct{}
 }
 
-// Run polls until ctx ends; it returns after every in-flight run has released its claim.
+// Run polls until ctx ends, then claims nothing more and returns after every in-flight run has ended its turn: within
+// StopGrace of ctx ending the runs finish, and past it they are cut short (D47).
 func (w *Worker) Run(ctx context.Context) {
 	if w.Concurrency <= 0 {
 		w.Concurrency = 2
@@ -48,18 +59,43 @@ func (w *Worker) Run(ctx context.Context) {
 	if w.Log == nil {
 		w.Log = slog.Default()
 	}
+	// the runs live on hard, which ends StopGrace after ctx does (the claims are held and heartbeaten until then)
+	hard, cancelHard := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelHard()
+	// stop is closed when ctx ends: the runs in progress are told (run.WithStop) to start nothing new and to hand the run
+	// over at the next boundary, and are cut short only when the grace period is over
+	stopped := make(chan struct{})
+	w.stopped = stopped
+	go func() {
+		select {
+		case <-hard.Done():
+			return
+		case <-ctx.Done():
+		}
+		close(stopped)
+		if w.StopGrace > 0 {
+			w.Log.Info("worker stopping: no new runs; runs in progress have a grace period", "grace", w.StopGrace)
+			select {
+			case <-hard.Done():
+				return
+			case <-time.After(w.StopGrace):
+				w.Log.Warn("grace period over: runs still in progress are cut short")
+			}
+		}
+		cancelHard()
+	}()
 	var wg sync.WaitGroup
 	for i := 0; i < w.Concurrency; i++ {
 		wg.Add(1)
 		go func(n int) {
 			defer wg.Done()
-			w.loop(ctx, n == 0)
+			w.loop(ctx, hard, n == 0)
 		}(i)
 	}
 	wg.Wait()
 }
 
-func (w *Worker) loop(ctx context.Context, sweeper bool) {
+func (w *Worker) loop(ctx, hard context.Context, sweeper bool) {
 	lastSweep := time.Time{}
 	for ctx.Err() == nil {
 		if sweeper && time.Since(lastSweep) > 5*time.Second {
@@ -82,7 +118,7 @@ func (w *Worker) loop(ctx context.Context, sweeper bool) {
 			sleep(ctx, w.Poll)
 			continue
 		}
-		w.serve(ctx, c)
+		w.serve(hard, c)
 	}
 }
 
@@ -103,7 +139,7 @@ func (w *Worker) Once(ctx context.Context) (bool, error) {
 }
 
 func (w *Worker) serve(ctx context.Context, c *run.Claim) {
-	hctx, cancel := context.WithCancel(ctx)
+	hctx, cancel := context.WithCancel(run.WithStop(ctx, w.stopped))
 	defer cancel()
 	stop := make(chan struct{})
 	go func() {

@@ -605,7 +605,7 @@ func TestHostEndToEnd(t *testing.T) {
 		if err := e.store.Heartbeat(ctx, c2, time.Minute); err != nil {
 			t.Fatal(err)
 		}
-		if err := e.worker.Harness.Run(ctx, c2); err != nil {
+		if err := e.harness.Run(ctx, c2); err != nil {
 			t.Fatal(err)
 		}
 		if got := e.must(200, "GET", "/v1/threads/thr-6/runs", "carol", nil)["runs"].([]any); got[0].(map[string]any)["status"] != run.StatusCompleted {
@@ -1573,8 +1573,8 @@ func TestHostEndToEnd(t *testing.T) {
 		e.drive()
 
 		// the HOST as an A2A client: a lead agent delegates to the helper through its agent card
-		e.worker.Harness.A2A = &a2a.Client{HTTP: e.api.Client(), Bearer: func(string) string { return e.tokens["carol"] }}
-		defer func() { e.worker.Harness.A2A = nil }()
+		e.harness.A2A = &a2a.Client{HTTP: e.api.Client(), Bearer: func(string) string { return e.tokens["carol"] }}
+		defer func() { e.harness.A2A = nil }()
 		e.model.Script = func(msgs []fakemodel.Message, tools []string) fakemodel.Turn {
 			last := msgs[len(msgs)-1]
 			if last.Role == "tool" {

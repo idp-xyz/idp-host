@@ -189,6 +189,9 @@ type Gateway struct {
 	// ConfirmTools are patterns of the tools whose calls always wait for the member's confirmation, whatever the release's
 	// confirmation policy says (D44; platform ADR-0003 D8): control that does not depend on the release's author.
 	ConfirmTools []string `yaml:"confirmTools"`
+	// NeverResendTools are patterns of the tools whose call, if it was in progress when a worker stopped, is never sent
+	// again whatever the gateway's annotations say (D47): the operator's way to tighten what the catalog claims.
+	NeverResendTools []string `yaml:"neverResendTools"`
 }
 
 // GatewayAuth is how the HOST authenticates to the gateway on the user's behalf.
@@ -439,7 +442,7 @@ func Load(path string) (*File, error) {
 		default:
 			return nil, fmt.Errorf("gateway %s: auth.mode must be delegation or static", g.Name)
 		}
-		for key, patterns := range map[string][]string{"externalTools": g.ExternalTools, "confirmTools": g.ConfirmTools} {
+		for key, patterns := range map[string][]string{"externalTools": g.ExternalTools, "confirmTools": g.ConfirmTools, "neverResendTools": g.NeverResendTools} {
 			for _, pat := range patterns {
 				if _, err := pathpkg.Match(pat, ""); pat == "" || err != nil {
 					return nil, fmt.Errorf("gateway %s: %s pattern %q is not a valid tool name pattern", g.Name, key, pat)

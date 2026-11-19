@@ -723,8 +723,29 @@ func (s *Store) Context(ctx context.Context, c *run.Claim) (*run.Context, error)
 			return err
 		}
 		out.BlockedPatterns = policy.BlockedPatterns
-		out.ToolCalls, err = runCalls(ctx, tx, c.RunID, []string{run.CallPendingConfirmation, run.CallConfirmed, run.CallRejected, run.CallExpired, run.CallExecuting, run.CallDelegated}, true)
-		return err
+		out.ToolCalls, err = runCalls(ctx, tx, c.RunID, []string{run.CallPendingConfirmation, run.CallConfirmed, run.CallRejected, run.CallExpired, run.CallExecuting, run.CallDelegated, run.CallDenied}, true)
+		if err != nil {
+			return err
+		}
+		// the records of the calls of the last assistant message that has tool calls, in any state (D47)
+		for i := len(out.Messages) - 1; i >= 0; i-- {
+			if m := out.Messages[i]; m.Role == agui.RoleAssistant && len(m.ToolCalls) > 0 {
+				rows, err := tx.Query(ctx, `SELECT `+callCols+` FROM tool_calls WHERE message_id = $1 AND run_id IN (SELECT id FROM runs WHERE thread_id = $2) ORDER BY step, created_at, id`, m.ID, r.ThreadID)
+				if err != nil {
+					return err
+				}
+				defer rows.Close()
+				for rows.Next() {
+					tc, err := scanCall(rows)
+					if err != nil {
+						return err
+					}
+					out.LastCalls = append(out.LastCalls, *tc)
+				}
+				return rows.Err()
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -750,6 +771,25 @@ func (s *Store) AppendMessages(ctx context.Context, c *run.Claim, msgs []agui.Me
 			return err
 		}
 		if _, err := appendMessages(ctx, tx, c.TenantID, r.ThreadID, c.RunID, msgs); err != nil {
+			return err
+		}
+		return appendEvents(ctx, tx, c.TenantID, c.RunID, events)
+	})
+}
+
+// AppendAssistantTurn stores the assistant message of a step together with the records of its tool calls and the events
+// of both, in one transaction (D47): a worker that stops between the two writes can no longer leave a thread whose last
+// message carries tool calls that nothing records and nothing answers.
+func (s *Store) AppendAssistantTurn(ctx context.Context, c *run.Claim, msg agui.Message, calls []run.ToolCall, events []agui.Event) error {
+	return s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
+		r, err := s.owned(ctx, tx, c)
+		if err != nil {
+			return err
+		}
+		if _, err := appendMessages(ctx, tx, c.TenantID, r.ThreadID, c.RunID, []agui.Message{msg}); err != nil {
+			return err
+		}
+		if err := insertToolCalls(ctx, tx, c, calls); err != nil {
 			return err
 		}
 		return appendEvents(ctx, tx, c.TenantID, c.RunID, events)
@@ -830,31 +870,44 @@ func (s *Store) FinishStep(ctx context.Context, c *run.Claim, st run.Step, event
 	})
 }
 
-// RecordToolCalls stores the tool calls of a step in their initial states.
+// RecordToolCalls stores the tool calls of a step in their initial states. The harness uses it for calls that have no
+// assistant message of their own to be written with (the files salvaged at the step limit, D41; calls of a message stored
+// before D47 whose records are missing); AppendAssistantTurn stores a step's message and calls together.
 func (s *Store) RecordToolCalls(ctx context.Context, c *run.Claim, calls []run.ToolCall, events []agui.Event) error {
 	return s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
 		if _, err := s.owned(ctx, tx, c); err != nil {
 			return err
 		}
-		for _, tc := range calls {
-			var exp any
-			if !tc.ConfirmationExpiresAt.IsZero() {
-				exp = tc.ConfirmationExpiresAt
-			}
-			var child any
-			if tc.ChildRunID != "" {
-				child = tc.ChildRunID
-			}
-			if _, err := tx.Exec(ctx, `INSERT INTO tool_calls (tenant_id, run_id, id, step, message_id, tool, arguments, arguments_sha256, state, confirmation_expires_at, child_run_id)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`, c.TenantID, c.RunID, tc.ID, tc.Step, tc.MessageID, tc.Tool, tc.Arguments, tc.ArgumentsSHA256, tc.State, exp, child); err != nil {
-				if isUniqueViolation(err) {
-					return fail("CONFLICT", "tool call id %s repeated", tc.ID)
-				}
-				return err
-			}
+		if err := insertToolCalls(ctx, tx, c, calls); err != nil {
+			return err
 		}
 		return appendEvents(ctx, tx, c.TenantID, c.RunID, events)
 	})
+}
+
+func insertToolCalls(ctx context.Context, tx pgx.Tx, c *run.Claim, calls []run.ToolCall) error {
+	for _, tc := range calls {
+		var exp any
+		if !tc.ConfirmationExpiresAt.IsZero() {
+			exp = tc.ConfirmationExpiresAt
+		}
+		var child any
+		if tc.ChildRunID != "" {
+			child = tc.ChildRunID
+		}
+		var res any // the reason of a call recorded as DENIED (D47)
+		if tc.Result != "" {
+			res = tc.Result
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO tool_calls (tenant_id, run_id, id, step, message_id, tool, arguments, arguments_sha256, state, confirmation_expires_at, child_run_id, result)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`, c.TenantID, c.RunID, tc.ID, tc.Step, tc.MessageID, tc.Tool, tc.Arguments, tc.ArgumentsSHA256, tc.State, exp, child, res); err != nil {
+			if isUniqueViolation(err) {
+				return fail("CONFLICT", "tool call id %s repeated", tc.ID)
+			}
+			return err
+		}
+	}
+	return nil
 }
 
 // UpdateToolCall sets a call's state and result.
@@ -863,16 +916,52 @@ func (s *Store) UpdateToolCall(ctx context.Context, c *run.Claim, id, state, res
 		if _, err := s.owned(ctx, tx, c); err != nil {
 			return err
 		}
-		finished := state == run.CallDone || state == run.CallFailed || state == run.CallDenied || state == run.CallRejected || state == run.CallExpired
-		var res any
-		if result != "" {
-			res = result
-		}
-		if _, err := tx.Exec(ctx, `UPDATE tool_calls SET state = $3, result = $4, is_error = $5, finished_at = CASE WHEN $6 THEN now() ELSE finished_at END WHERE run_id = $1 AND id = $2`,
-			c.RunID, id, state, res, isError, finished); err != nil {
+		if err := updateToolCall(ctx, tx, c, id, state, result, isError); err != nil {
 			return err
 		}
 		return appendEvents(ctx, tx, c.TenantID, c.RunID, events)
+	})
+}
+
+func updateToolCall(ctx context.Context, tx pgx.Tx, c *run.Claim, id, state, result string, isError bool) error {
+	finished := state == run.CallDone || state == run.CallFailed || state == run.CallDenied || state == run.CallRejected || state == run.CallExpired
+	var res any
+	if result != "" {
+		res = result
+	}
+	_, err := tx.Exec(ctx, `UPDATE tool_calls SET state = $3, result = $4, is_error = $5, finished_at = CASE WHEN $6 THEN now() ELSE finished_at END WHERE run_id = $1 AND id = $2`,
+		c.RunID, id, state, res, isError, finished)
+	return err
+}
+
+// AnswerToolCall sets a call's final state and result and appends its tool message and the events, in one transaction
+// (D47): the call and its answer can no longer be separated by a worker that stops between two writes.
+func (s *Store) AnswerToolCall(ctx context.Context, c *run.Claim, id, state, result string, isError bool, msg agui.Message, events []agui.Event) error {
+	return s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
+		r, err := s.owned(ctx, tx, c)
+		if err != nil {
+			return err
+		}
+		if err := updateToolCall(ctx, tx, c, id, state, result, isError); err != nil {
+			return err
+		}
+		if _, err := appendMessages(ctx, tx, c.TenantID, r.ThreadID, c.RunID, []agui.Message{msg}); err != nil {
+			return err
+		}
+		return appendEvents(ctx, tx, c.TenantID, c.RunID, events)
+	})
+}
+
+// Release gives the claim up at once (D47): the lease ends now, so that the next Claim takes the run without waiting for it
+// to run out. The run stays RUNNING and nothing a client reads changes, as when a worker dies; the claim's epoch fences
+// it like every write, and the next Claim raises the epoch.
+func (s *Store) Release(ctx context.Context, c *run.Claim) error {
+	return s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
+		if _, err := s.owned(ctx, tx, c); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `UPDATE runs SET lease_until = now() WHERE id = $1`, c.RunID)
+		return err
 	})
 }
 

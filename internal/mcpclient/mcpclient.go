@@ -214,7 +214,21 @@ type Tool struct {
 	Title       string          `json:"title,omitempty"`
 	Description string          `json:"description,omitempty"`
 	InputSchema json.RawMessage `json:"inputSchema"`
+	// Annotations are the gateway's hints about the tool as it lists it now (MCP tool annotations). The HOST reads
+	// readOnlyHint and idempotentHint to decide whether a call interrupted mid-way may be sent again (D47); a tool that
+	// lists none is treated as neither.
+	Annotations ToolAnnotations `json:"annotations,omitzero"`
 }
+
+// ToolAnnotations are the hints of a tool the HOST uses; an absent hint is false, as in the MCP specification.
+type ToolAnnotations struct {
+	ReadOnlyHint   bool `json:"readOnlyHint,omitempty"`
+	IdempotentHint bool `json:"idempotentHint,omitempty"`
+}
+
+// SafeToRepeat reports whether the tool says that calling it again with the same arguments does no harm: it only reads,
+// or it is idempotent (D47). It is the gateway's statement, pinned in its catalog, not a measurement.
+func (t Tool) SafeToRepeat() bool { return t.Annotations.ReadOnlyHint || t.Annotations.IdempotentHint }
 
 // ListTools pages through tools/list.
 func (c *Client) ListTools(ctx context.Context, endpoint, bearer string) ([]Tool, error) {

@@ -17,6 +17,9 @@ data:
   IDP_HOST_CONFIG: "/etc/idp/config/host.yaml"
   IDP_HOST_WORKERS: "2"
   IDP_HOST_LEASE: "30s"
+  # D47: on SIGTERM the worker claims nothing more and lets calls in progress finish for this long; it must stay below the
+  # Deployment's terminationGracePeriodSeconds, or Kubernetes kills the process first and the calls are interrupted anyway
+  IDP_HOST_STOP_GRACE: "20s"
   IDP_HOST_ISSUER: "https://idp.example.com/realms/idp"
   IDP_HOST_AUDIENCE: "idp-host"
   IDP_HOST_JWKS_URL: "https://idp.example.com/realms/idp/protocol/openid-connect/certs"
@@ -81,6 +84,7 @@ spec:
       labels:
         app.kubernetes.io/component: host
     spec:
+      terminationGracePeriodSeconds: 30   # D47: the default, written down because IDP_HOST_STOP_GRACE (20s) must stay below it
       serviceAccountName: idp-host
       automountServiceAccountToken: false
       securityContext:

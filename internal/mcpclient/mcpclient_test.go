@@ -86,3 +86,24 @@ func TestUnauthorizedIsRecognized(t *testing.T) {
 		t.Fatal("misclassified")
 	}
 }
+
+// D47: ListTools reads readOnlyHint and idempotentHint; a tool that lists neither, or lists them false, is not safe to
+// repeat, and unknown annotations are ignored.
+func TestListToolsReadsTheAnnotationsThatSayACallMayBeRepeated(t *testing.T) {
+	fake := fakemcp.New()
+	fake.Tools[0].Annotations = map[string]any{"readOnlyHint": true, "title": "Sum", "openWorldHint": true}
+	fake.Tools[1].Annotations = map[string]any{"idempotentHint": true, "destructiveHint": true}
+	fake.Tools[2].Annotations = map[string]any{"readOnlyHint": false, "idempotentHint": false}
+	srv := httptest.NewServer(fake.Handler())
+	defer srv.Close()
+	c := &Client{HTTP: NewHTTPClient(5*time.Second, nil), Info: ClientInfo{Name: "idp-host", Version: "test"}}
+	tools, err := c.ListTools(context.Background(), srv.URL+"/mcp", "")
+	if err != nil || len(tools) != 4 {
+		t.Fatal(err, tools)
+	}
+	for i, want := range []bool{true, true, false, false} { // sum, echo, fail, slow (no annotations)
+		if got := tools[i].SafeToRepeat(); got != want {
+			t.Errorf("%s: SafeToRepeat %v, want %v (%+v)", tools[i].Name, got, want, tools[i].Annotations)
+		}
+	}
+}

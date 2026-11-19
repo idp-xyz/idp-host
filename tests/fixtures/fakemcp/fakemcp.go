@@ -17,6 +17,8 @@ type Tool struct {
 	Name        string
 	Description string
 	InputSchema string
+	// Annotations, when set, are listed as the tool's annotations (readOnlyHint, idempotentHint ...).
+	Annotations map[string]any
 	Handle      func(args map[string]any) (text string, isError bool)
 	// Structured, when set, gives the result's structuredContent.
 	Structured func(args map[string]any) any
@@ -145,7 +147,11 @@ func (s *Server) Handler() http.Handler {
 		case "tools/list":
 			var tools []map[string]any
 			for _, t := range s.Tools {
-				tools = append(tools, map[string]any{"name": t.Name, "description": t.Description, "inputSchema": json.RawMessage(t.InputSchema)})
+				entry := map[string]any{"name": t.Name, "description": t.Description, "inputSchema": json.RawMessage(t.InputSchema)}
+				if t.Annotations != nil {
+					entry["annotations"] = t.Annotations
+				}
+				tools = append(tools, entry)
 			}
 			s.write(w, req.ID, map[string]any{"tools": tools, "_meta": info}, nil, 200)
 		case "tools/call":

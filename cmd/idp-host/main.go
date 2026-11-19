@@ -18,6 +18,8 @@
 //	IDP_HOST_WORKERS             worker goroutines (default 2; 0 = API only)
 //	IDP_HOST_INSTANCE            this replica's id (default: hostname); it names the worker's leases
 //	IDP_HOST_LEASE               claim lease (default 30s)
+//	IDP_HOST_STOP_GRACE          on SIGTERM, how long runs in progress may finish before they are cut short (default 20s, D47);
+//	                             keep it below the termination grace period of the platform
 //	IDP_HOST_CREDENTIAL_KEY[_FILE]  32-byte key (64 hex chars) that encrypts delegated gateway tokens
 //	IDP_DEV_MODE                 "true": HS256 development tokens, plaintext model endpoints on loopback
 //	IDP_HOST_ISSUER / IDP_HOST_AUDIENCE   accepted tokens (default idp-host-dev / idp-host)
@@ -311,7 +313,7 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 		if err != nil {
 			return fmt.Errorf("gateway %s: %w", g.Name, err)
 		}
-		gw := &harness.Gateway{Name: g.Name, Endpoint: endpoint, ExternalTools: g.ExternalTools, ConfirmTools: g.ConfirmTools, Client: &mcpclient.Client{HTTP: mcpclient.NewHTTPClient(60*time.Second, tlsCfg), Info: mcpclient.ClientInfo{Name: "idp-host", Version: version}}}
+		gw := &harness.Gateway{Name: g.Name, Endpoint: endpoint, ExternalTools: g.ExternalTools, ConfirmTools: g.ConfirmTools, NeverResendTools: g.NeverResendTools, Client: &mcpclient.Client{HTTP: mcpclient.NewHTTPClient(60*time.Second, tlsCfg), Info: mcpclient.ClientInfo{Name: "idp-host", Version: version}}}
 		auth := api.GatewayAuth{}
 		switch g.Auth.Mode {
 		case "static":
@@ -413,6 +415,10 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 	if err != nil {
 		return fmt.Errorf("IDP_HOST_LEASE: %w", err)
 	}
+	stopGrace, err := time.ParseDuration(env("IDP_HOST_STOP_GRACE", "20s"))
+	if err != nil || stopGrace < 0 {
+		return fmt.Errorf("IDP_HOST_STOP_GRACE: want a duration such as 20s, got %q", env("IDP_HOST_STOP_GRACE", ""))
+	}
 	if !apiEnabled && workers <= 0 {
 		return errors.New("idp-host worker needs IDP_HOST_WORKERS >= 1")
 	}
@@ -422,7 +428,7 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 	defer cancelWorkers()
 	if workers > 0 {
 		h := &harness.Harness{Store: store, Providers: registry, Gateways: gateways, Classifiers: classifiers, A2A: a2aClient, CMI: cmiClient, CMIKey: cmiKey, CMIToken: cmiToken, Remember: remember, Retry: retry, Metrics: worker.NewMetrics(metrics), Log: log}
-		w := &worker.Worker{ID: env("IDP_HOST_INSTANCE", hostname), Store: store, Harness: h, Concurrency: workers, Lease: lease, Log: log}
+		w := &worker.Worker{ID: env("IDP_HOST_INSTANCE", hostname), Store: store, Harness: h, Concurrency: workers, Lease: lease, StopGrace: stopGrace, Log: log}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

@@ -45,6 +45,7 @@ type memStore struct {
 	children map[string]*run.ChildOutcome
 	inputs   map[string]run.ChildRunInput
 	refuse   error
+	released int // how many times the claim was given up (D47)
 }
 
 func newMem(def agent.Definition, msgs []agui.Message, input run.Input) *memStore {
@@ -70,8 +71,18 @@ func (m *memStore) Context(context.Context, *run.Claim) (*run.Context, error) {
 	}
 	rc := m.rc
 	rc.Messages = append([]agui.Message(nil), m.rc.Messages...)
-	rc.ToolCalls = nil
+	rc.ToolCalls, rc.LastCalls = nil, nil
+	lastWithCalls := ""
+	for i := len(m.rc.Messages) - 1; i >= 0; i-- {
+		if msg := m.rc.Messages[i]; msg.Role == agui.RoleAssistant && len(msg.ToolCalls) > 0 {
+			lastWithCalls = msg.ID
+			break
+		}
+	}
 	for _, c := range m.calls {
+		if lastWithCalls != "" && c.MessageID == lastWithCalls {
+			rc.LastCalls = append(rc.LastCalls, *c)
+		}
 		if c.FinishedAt.IsZero() {
 			rc.ToolCalls = append(rc.ToolCalls, *c)
 		}
@@ -105,6 +116,47 @@ func (m *memStore) AppendMessages(_ context.Context, _ *run.Claim, msgs []agui.M
 	}
 	m.rc.Messages = append(m.rc.Messages, msgs...)
 	return m.appendEvents(events)
+}
+
+func (m *memStore) AppendAssistantTurn(_ context.Context, _ *run.Claim, msg agui.Message, calls []run.ToolCall, events []agui.Event) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.check(); err != nil {
+		return err
+	}
+	m.rc.Messages = append(m.rc.Messages, msg)
+	for i := range calls {
+		c := calls[i]
+		m.calls[c.ID] = &c
+	}
+	return m.appendEvents(events)
+}
+
+func (m *memStore) AnswerToolCall(_ context.Context, _ *run.Claim, id, state, result string, isError bool, msg agui.Message, events []agui.Event) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.check(); err != nil {
+		return err
+	}
+	c := m.calls[id]
+	c.State, c.Result, c.IsError = state, result, isError
+	switch state {
+	case run.CallDone, run.CallFailed, run.CallDenied, run.CallRejected, run.CallExpired:
+		c.FinishedAt = time.Now()
+	}
+	m.rc.Messages = append(m.rc.Messages, msg)
+	return m.appendEvents(events)
+}
+
+// Release: the claim is given up at once; the test's next Run on the store is the worker that takes the run.
+func (m *memStore) Release(context.Context, *run.Claim) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.check(); err != nil {
+		return err
+	}
+	m.released++
+	return nil
 }
 
 func (m *memStore) StartStep(_ context.Context, _ *run.Claim, maxSteps int, _ int64, provider, mdl string) (int, bool, error) {

@@ -3,6 +3,7 @@
 package run
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -96,11 +97,30 @@ func (f *Failure) Error() string { return f.Code + ": " + f.Message }
 
 // Context is everything a worker needs to continue a run.
 type Context struct {
-	Run             Run
-	Release         *agent.Document
-	Messages        []agui.Message
-	ToolCalls       []ToolCall // unresolved: pending, confirmed, rejected, expired or delegated but not yet answered
-	BlockedPatterns []string   // the tenant policy's blocked output patterns (D28)
+	Run       Run
+	Release   *agent.Document
+	Messages  []agui.Message
+	ToolCalls []ToolCall // unresolved: pending, confirmed, rejected, expired or delegated but not yet answered
+	// LastCalls are the records, in any state, of the tool calls of the thread's last assistant message that has tool
+	// calls. Data written before D47 (the message and its calls in two transactions, a call's state and its tool message in
+	// two) may lack the records of some of them or the tool messages of finished ones; the harness repairs it from this.
+	LastCalls       []ToolCall
+	BlockedPatterns []string // the tenant policy's blocked output patterns (D28)
+}
+
+type stopKey struct{}
+
+// WithStop returns a context that tells the harness the worker was told to stop (D47) when stop is closed. It is not a
+// cancellation: the call in progress finishes, nothing new is started and the run is handed over. A context without it
+// never stops, so Harness.Run used without a worker behaves as before.
+func WithStop(ctx context.Context, stop <-chan struct{}) context.Context {
+	return context.WithValue(ctx, stopKey{}, stop)
+}
+
+// StopChan is the channel WithStop gave the context, nil (never ready) when there is none.
+func StopChan(ctx context.Context) <-chan struct{} {
+	ch, _ := ctx.Value(stopKey{}).(<-chan struct{})
+	return ch
 }
 
 // ChildRunInput creates a sub-agent run under the parent's claim (D22).

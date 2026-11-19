@@ -162,6 +162,7 @@ services:
     <<: *hardened
     image: ${IDP_HOST_IMAGE:-idp-host:dev}
     command: [worker]
+    stop_grace_period: 30s   # D47: IDP_HOST_STOP_GRACE (default 20s) must stay below it; Docker's default is 10s
     networks: [edge, upstream, data]
     ports: ['127.0.0.1:9466:9466']   # the worker's own metrics (model steps, tool calls, runs)
     environment:

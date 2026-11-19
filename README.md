@@ -75,6 +75,8 @@ gateways:
                                  # call one (or allows "*") is screened against files.externalModelCeiling like one that may use an external
                                  # model: files and CMI context entries above the ceiling, or without a valid level, are not given to the run
     confirmTools: ["web__web_open_url"]   # D44: patterns of the tools whose calls always wait for the member, whatever the release says
+    neverResendTools: ["sandbox_write*"]  # D47: patterns of the tools whose call that was in progress when a worker stopped is never sent again, whatever
+                                          # the gateway's annotations say (see below)
 files:     # D43, D44: what may reach a model or a tool outside the enterprise (providers are external unless they say external: false)
   externalModelCeiling: internal   # public | internal (default) | confidential | restricted
   tenants: {}                      # per-tenant overrides, by tenant id
@@ -93,6 +95,8 @@ cmi:   # optional (ADR-0001 D32): releases with context.cmi = true resolve a Con
 ```
 
 provider 的 `retry` 与 `idleTimeoutSeconds`（ADR D45、D46）都可以不配：可重试的错误（HTTP 408、429、5xx、传输失败、流静默超时）先对同一个候选模型重试，等待从 1 秒起翻倍、封顶 20 秒、带抖动，提供者的 `Retry-After` 更长时取它（超过 `maxRetryAfterSeconds` 就不等：换下一个候选或失败）；已经流出文字之后不重试；等待随运行的期限与取消结束。设置放在 provider 条目而不在发布件里：限流策略是运维知道的事，发布件作者不应能为自己的 agent 多烧预算。运行的期限与取消也到达进行中的模型与工具调用：期限到了运行在约一秒内以 `RUN_TIMEOUT` 结束，所有者取消的运行在约一秒内（每秒向库询问一次）以 `CANCELED` 结束。
+
+**worker 中断时进行中的工具调用（ADR D47，修订 D3）。** worker 停止或崩溃时，HOST 分不清"已经执行完但结果丢了"和"根本没发出去"，所以接手的 turn 对记为 `EXECUTING` 的网关工具调用只在重发无害时才重发：网关现在列出的该工具带 `readOnlyHint` 或 `idempotentHint`（`tools/list` 的 `annotations`），且没有被网关条目的 `neverResendTools`（模式语法与校验同 `externalTools`，匹配即永不重发，不看标注）点名。其余调用（没有标注、标注为假、网关已不再列出该工具、任何子智能体调用）不重发：模型收到一条工具错误，说明调用被中断、结果未知、可能已经做了也可能没有、重做之前先核实；运行的事件流记 `idp.host/tool.interrupted {toolCallId, tool, resent, reason}`（`resent: true` 的是被重发的那次重复；`reason` 为 `worker_stopped`，期限与取消打断的调用为 `deadline`、`canceled`），指标 `idp_host_tool_interruptions_total{resent, reason}` 同样计数。助手消息与它的工具调用记录在同一个事务里写入，工具调用的最终状态与它的工具消息也是；旧数据里缺的记录或工具消息，续跑时补建并照常执行。收到 SIGTERM 的 worker 不再认领运行，进行中的调用（模型调用、工具调用、远程智能体调用）做完，不开始任何新的调用，在下一个边界把运行交还（运行仍是 `RUNNING`，下一个 worker 立刻认领，不等租约过期）；超过 `IDP_HOST_STOP_GRACE`（缺省 `20s`；必须小于平台的终止宽限期：Kubernetes 清单的 `terminationGracePeriodSeconds` 为 30 秒，compose 的 host-worker 为 `stop_grace_period: 30s`）仍在进行的才被中断；`0` 表示立即中断。
 
 `cmi.remember` 是纯配置：运营方打开后，**所有** `context.cmi = true` 的 agent 都会被记住（契约不变；按 agent 退出需要改契约，见 ADR D33）。写入在运行终态之后异步进行，失败只记日志并计入 `idp_host_memory_writes_total{outcome}`（written / replayed / rejected / failed / auth_failed / no_credential），绝不影响运行。
 

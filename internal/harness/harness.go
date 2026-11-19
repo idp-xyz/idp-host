@@ -40,8 +40,16 @@ type Store interface {
 	// CancelRequested reads whether the owner asked to cancel the run, without taking it; run.ErrFenced for a lost claim (D46).
 	CancelRequested(ctx context.Context, c *run.Claim) (bool, error)
 	FinishStep(ctx context.Context, c *run.Claim, st run.Step, events []agui.Event) error
+	// AppendAssistantTurn stores a step's assistant message with the records of its tool calls in one transaction (D47).
+	AppendAssistantTurn(ctx context.Context, c *run.Claim, msg agui.Message, calls []run.ToolCall, events []agui.Event) error
 	RecordToolCalls(ctx context.Context, c *run.Claim, calls []run.ToolCall, events []agui.Event) error
 	UpdateToolCall(ctx context.Context, c *run.Claim, id, state, result string, isError bool, events []agui.Event) error
+	// AnswerToolCall sets a call's final state and result and appends its tool message, with the events, in one
+	// transaction (D47): a stop between the two can no longer leave a finished call whose tool message is missing.
+	AnswerToolCall(ctx context.Context, c *run.Claim, id, state, result string, isError bool, msg agui.Message, events []agui.Event) error
+	// Release gives the claim up at once instead of letting the lease run out (D47): the run stays RUNNING, as when a worker
+	// dies, but the next Claim may take it immediately. Fenced by the claim's epoch like every other write.
+	Release(ctx context.Context, c *run.Claim) error
 	Finish(ctx context.Context, c *run.Claim, status, failureCode, failureMessage string, events []agui.Event) error
 	Credential(ctx context.Context, c *run.Claim) (string, error)
 	FileTickets(ctx context.Context, c *run.Claim) (*run.FileTickets, error) // the member's file tickets (D37)
@@ -67,6 +75,9 @@ type Gateway struct {
 	// always wait for the member, whatever the release's confirmation policy says (D44; platform ADR-0003 D8).
 	ExternalTools []string
 	ConfirmTools  []string
+	// NeverResendTools are patterns of the tools whose call that was in progress when a worker stopped is not sent again
+	// by the worker that resumes the run, whatever the gateway's annotations say (D47).
+	NeverResendTools []string
 }
 
 // credentialLeeway: a delegated credential this close to its expiry is renewed before a gateway call.
@@ -78,6 +89,11 @@ type Metrics interface {
 	ToolCall(gateway, outcome string, latency time.Duration)
 	RunFinished(status string)
 	Guard(kind, outcome string) // kind: input | output; outcome: flagged | blocked | redacted | classifier_error
+}
+
+// interruptionMetrics is implemented by a Metrics that counts tool calls that were cut short (D47).
+type interruptionMetrics interface {
+	ToolInterrupted(resent bool, reason string)
 }
 
 // Harness runs claims.
@@ -176,6 +192,8 @@ type turn struct {
 	tools      []model.ToolSpec
 	frontend   map[string]bool
 	visible    map[string]bool
+	stop       <-chan struct{}                      // closed when the worker was told to stop (D47); nil when there is no worker
+	repeatable map[string]bool                      // gateway tool -> its annotations as listed now say that calling it again does no harm (D47)
 	subagents  map[string]agent.EmbeddedSubagent    // by tool name (D22)
 	resources  map[string]map[string]agent.Resource // on-demand skill resources by skill and name (D23)
 	waiting    bool                                 // a delegated call's child run has not ended yet
@@ -227,7 +245,7 @@ func (h *Harness) Run(ctx context.Context, c *run.Claim) error {
 		// D35: a run claimed after its deadline does nothing more, not even a call its owner confirmed
 		return h.fail(ctx, c, run.FailTimeout, timeoutMessage)
 	}
-	t := &turn{h: h, ctx: ctx, claim: c, rc: rc, def: rc.Release.Effective(), messages: rc.Messages, frontend: map[string]bool{}, visible: map[string]bool{},
+	t := &turn{h: h, ctx: ctx, claim: c, rc: rc, def: rc.Release.Effective(), messages: rc.Messages, stop: run.StopChan(ctx), frontend: map[string]bool{}, visible: map[string]bool{}, repeatable: map[string]bool{},
 		subagents: map[string]agent.EmbeddedSubagent{}, resources: rc.Release.OnDemandResources()}
 	if rc.Run.Input.ToolExecution == run.ToolExecutionCaller {
 		// ADR-0001 D19: the caller executes every tool. No gateway tools are offered (the release's
@@ -265,7 +283,13 @@ func (h *Harness) Run(ctx context.Context, c *run.Claim) error {
 
 // proceed prepares the tools, resolves the decided calls and runs the loop.
 func (t *turn) proceed() error {
+	if t.stopping() {
+		return errStopped // boundary 1 (D47): nothing has been done yet
+	}
 	if err := t.prepareTools(); err != nil {
+		return err
+	}
+	if rest, err := t.repairLastTurn(); err != nil || rest != "" {
 		return err
 	}
 	if err := t.resolveDecided(); err != nil {
@@ -277,6 +301,81 @@ func (t *turn) proceed() error {
 	return t.loop()
 }
 
+// repairLastTurn handles data written before D47, in which a step could stop half written (D47). The thread ends with an
+// assistant message that has tool calls, followed by the tool messages that were written. Two things can be missing:
+//  1. the records of its calls (the message and the records were two transactions): they are created as not started and the
+//     calls are classified and run as dispatch would have run them. Nothing of them was sent anywhere, so running them is
+//     not a repetition. Their TOOL_CALL events were written with the message and are not written again.
+//  2. the tool message of a call that is finished (finished_at set) in a final state (DONE, FAILED, DENIED, REJECTED,
+//     EXPIRED; its state and its message were two transactions): the message is appended from the result stored with the call, so that the next
+//     model request is not refused for a tool call without its answer. A call recorded as DENIED, REJECTED or EXPIRED
+//     that is not finished yet was never answered: resolveDecided answers it, so it is not repaired here too.
+//
+// It returns the status the run was left in, "" to go on.
+func (t *turn) repairLastTurn() (string, error) {
+	// the assistant message is the last one that is not a tool message
+	i := len(t.messages) - 1
+	for i >= 0 && t.messages[i].Role == agui.RoleTool {
+		i--
+	}
+	if i < 0 || t.messages[i].Role != agui.RoleAssistant || len(t.messages[i].ToolCalls) == 0 {
+		return "", nil
+	}
+	msg := t.messages[i]
+	answered := map[string]bool{}
+	for _, m := range t.messages[i+1:] {
+		answered[m.ToolCallID] = true
+	}
+	records := map[string]run.ToolCall{}
+	for _, tc := range t.rc.LastCalls {
+		if tc.MessageID == msg.ID {
+			records[tc.ID] = tc
+		}
+	}
+	var missing []agui.ToolCall
+	for _, call := range msg.ToolCalls {
+		tc, ok := records[call.ID]
+		switch {
+		case !ok:
+			missing = append(missing, call)
+		case !answered[call.ID] && finalState(tc.State) && !tc.FinishedAt.IsZero():
+			content := tc.Result
+			answer := agui.Message{ID: "tool_" + tc.ID, Role: agui.RoleTool, ToolCallID: tc.ID, Content: content}
+			if tc.IsError {
+				answer.Error = "the call did not succeed"
+				if answer.Content == "" {
+					answer.Content = "error: " + answer.Error
+				}
+			}
+			t.h.Log.Warn("a finished tool call had no tool message; it is written from the stored result", "run", t.claim.RunID, "toolCall", tc.ID, "state", tc.State)
+			if err := t.h.Store.AppendMessages(t.ctx, t.claim, []agui.Message{answer}, []agui.Event{agui.ToolCallResult(answer.ID, tc.ID, answer.Content)}); err != nil {
+				return "", err
+			}
+			t.messages = append(t.messages, answer)
+		}
+	}
+	if len(missing) == 0 {
+		return "", nil
+	}
+	msg.ToolCalls = missing
+	t.step = t.rc.Run.StepCount
+	recs, events, interrupts := t.classify(t.step, msg)
+	t.h.Log.Warn("the last assistant message had tool calls without records; they are created and run", "run", t.claim.RunID, "calls", len(recs))
+	if err := t.h.Store.RecordToolCalls(t.ctx, t.claim, recs, events); err != nil {
+		return "", err
+	}
+	return t.dispatch(recs, interrupts)
+}
+
+// finalState: the states a tool call ends in, after which its tool message is due (D47).
+func finalState(state string) bool {
+	switch state {
+	case run.CallDone, run.CallFailed, run.CallDenied, run.CallRejected, run.CallExpired:
+		return true
+	}
+	return false
+}
+
 const timeoutMessage = "the run exceeded its time limit"
 
 // Why the calls of a run in progress were cut short (D46): the causes of t.callCtx.
@@ -286,7 +385,20 @@ var (
 	// errInterrupted is what a step of the turn returns once it has recorded what it had to (the step's row, the call's
 	// state) after t.callCtx ended; settle turns it into the end of the run.
 	errInterrupted = errors.New("a call in progress was cut short")
+	// errStopped is what a step returns when the worker was told to stop and it reached a boundary at which nothing is
+	// half done (D47); settle hands the run over.
+	errStopped = errors.New("the worker was told to stop")
 )
+
+// stopping reports whether the worker was told to stop (D47): nothing new may be started, what is in progress finishes.
+func (t *turn) stopping() bool {
+	select {
+	case <-t.stop:
+		return true
+	default:
+		return false
+	}
+}
 
 // watch gives the turn its call context and returns the function that stops watching (D46). The context ends at the
 // run's deadline (D35: a run that exceeded its time limit does nothing more, so nothing in progress may go on) and when
@@ -334,6 +446,18 @@ func (t *turn) watch() func() {
 // (D35), canceled as the check at the start of a step does, and for a lost claim or a stopped worker nothing more
 // is written (run.ErrFenced, as before).
 func (t *turn) settle(err error) error {
+	if errors.Is(err, errStopped) {
+		// D47: the turn stopped at a boundary and everything it stored is consistent; the claim is given up so that the next
+		// worker takes the run at once. Past the grace period t.ctx is gone and the lease runs out as after a crash.
+		if t.ctx.Err() != nil {
+			return run.ErrFenced
+		}
+		if rerr := t.h.Store.Release(t.ctx, t.claim); rerr != nil {
+			return rerr
+		}
+		t.h.Log.Info("run handed over: the worker was told to stop", "run", t.claim.RunID)
+		return nil
+	}
 	if !errors.Is(err, errInterrupted) {
 		return err
 	}
@@ -367,7 +491,12 @@ func (t *turn) interruptCode() string {
 // errInterrupted; tc is nil for a call that has no record (listing the tools, renewing a credential).
 func (t *turn) interruptedCall(tc *run.ToolCall) error {
 	if tc != nil && t.ours() {
-		if err := t.answer(*tc, run.CallFailed, "", "interrupted: "+t.interruptReason()+" while this call was running; the tool may or may not have completed it"); err != nil {
+		reason := t.interruptCode() // deadline | canceled
+		if m, ok := t.h.Metrics.(interruptionMetrics); ok {
+			m.ToolInterrupted(false, reason)
+		}
+		if err := t.answerWith(*tc, run.CallFailed, "", "interrupted: "+t.interruptReason()+" while this call was running; the tool may or may not have completed it",
+			t.interruptedEvent(*tc, false, reason)); err != nil {
 			return err
 		}
 	}
@@ -436,6 +565,9 @@ func (t *turn) prepareTools() error {
 				continue
 			}
 			t.visible[tool.Name] = true
+			if tool.SafeToRepeat() {
+				t.repeatable[tool.Name] = true
+			}
 			if props := fileProperties(tool.InputSchema); len(props) > 0 {
 				if t.fileProps == nil {
 					t.fileProps = map[string]map[string]string{}
@@ -709,8 +841,21 @@ func sanitize(err error) string {
 func (t *turn) resolveDecided() error {
 	for _, tc := range t.rc.ToolCalls {
 		switch tc.State {
-		case run.CallConfirmed, run.CallExecuting:
+		case run.CallConfirmed:
 			if _, err := t.execute(tc); err != nil {
+				return err
+			}
+		case run.CallExecuting:
+			if err := t.resumeExecuting(tc); err != nil {
+				return err
+			}
+		case run.CallDenied:
+			// recorded as denied, and the worker stopped before it was answered (D47)
+			reason := tc.Result
+			if reason == "" {
+				reason = "tool not available to this agent"
+			}
+			if err := t.answer(tc, run.CallDenied, "", reason); err != nil {
 				return err
 			}
 		case run.CallRejected, run.CallExpired:
@@ -821,6 +966,11 @@ func (t *turn) readResource(tc run.ToolCall) error {
 
 // answer appends the tool message for a call and marks the call resolved.
 func (t *turn) answer(tc run.ToolCall, state, result, errText string) error {
+	return t.answerWith(tc, state, result, errText)
+}
+
+// answerWith is answer with events written in the same transaction as the call's new state.
+func (t *turn) answerWith(tc run.ToolCall, state, result, errText string, events ...agui.Event) error {
 	msg := agui.Message{ID: "tool_" + tc.ID, Role: agui.RoleTool, ToolCallID: tc.ID, Content: result, Error: errText}
 	content := result
 	if errText != "" {
@@ -828,10 +978,8 @@ func (t *turn) answer(tc run.ToolCall, state, result, errText string) error {
 			content = "error: " + errText
 		}
 	}
-	if err := t.h.Store.UpdateToolCall(t.ctx, t.claim, tc.ID, state, content, errText != "", nil); err != nil {
-		return err
-	}
-	if err := t.h.Store.AppendMessages(t.ctx, t.claim, []agui.Message{msg}, []agui.Event{agui.ToolCallResult(msg.ID, tc.ID, content)}); err != nil {
+	// D47: the call's final state and its tool message are one write
+	if err := t.h.Store.AnswerToolCall(t.ctx, t.claim, tc.ID, state, content, errText != "", msg, append(events, agui.ToolCallResult(msg.ID, tc.ID, content))); err != nil {
 		return err
 	}
 	t.messages = append(t.messages, msg)
@@ -843,6 +991,9 @@ func (t *turn) answer(tc run.ToolCall, state, result, errText string) error {
 func (t *turn) execute(tc run.ToolCall) (bool, error) {
 	h := t.h
 	t.lastResult = nil
+	if t.stopping() {
+		return false, errStopped // boundary 5 (D47): no call is started once the worker was told to stop; this one stays as it is
+	}
 	if _, ok := t.subagents[tc.Tool]; ok {
 		return true, t.delegate(tc)
 	}
@@ -1006,6 +1157,9 @@ func (t *turn) loop() error {
 		if run.Overdue(t.rc.Run.DeadlineAt, h.Now()) {
 			return h.fail(t.ctx, t.claim, run.FailTimeout, timeoutMessage)
 		}
+		if t.stopping() {
+			return errStopped // boundary 2 (D47): every earlier step is stored and answered; no step is started
+		}
 		primary := t.def.Model
 		step, cancelRequested, err := h.Store.StartStep(t.ctx, t.claim, t.def.Limits.MaxSteps, t.def.Limits.MaxTokensPerRun, primary.Provider, primary.Model)
 		if errors.Is(err, run.ErrStepLimit) {
@@ -1035,6 +1189,17 @@ func (t *turn) loop() error {
 		}
 		resp, st, err := t.callModel(step)
 		if err != nil {
+			if errors.Is(err, errStopped) {
+				// boundary 3 (D47): the attempt that was in progress failed and no other is started; the step's row is closed
+				// and the next worker starts a new step
+				if ferr := h.Store.FinishStep(t.ctx, t.claim, st, nil); ferr != nil {
+					return ferr
+				}
+				if h.Metrics != nil {
+					h.Metrics.StepFinished(st.Provider, st.Model, st.ErrorCode, st.Latency, model.Usage{})
+				}
+				return err
+			}
 			if errors.Is(err, errInterrupted) {
 				// D46: the deadline or a cancel cut the call short; the step's row says which, and the run ends as
 				// the cause says (settle). A lost claim or a stopped worker writes nothing.
@@ -1114,7 +1279,17 @@ func (t *turn) loop() error {
 		if err := h.Store.FinishStep(t.ctx, t.claim, st, nil); err != nil {
 			return err
 		}
-		if err := h.Store.AppendMessages(t.ctx, t.claim, []agui.Message{resp.Message}, events); err != nil {
+		var calls []run.ToolCall
+		var interrupts []map[string]any
+		if len(resp.Message.ToolCalls) > 0 {
+			// D47: the message and the records of its calls are written in one transaction
+			var classified []agui.Event
+			calls, classified, interrupts = t.classify(step, resp.Message)
+			events = append(events, classified...)
+			if err := h.Store.AppendAssistantTurn(t.ctx, t.claim, resp.Message, calls, events); err != nil {
+				return err
+			}
+		} else if err := h.Store.AppendMessages(t.ctx, t.claim, []agui.Message{resp.Message}, events); err != nil {
 			return err
 		}
 		t.messages = append(t.messages, resp.Message)
@@ -1125,7 +1300,7 @@ func (t *turn) loop() error {
 			}
 			return t.complete()
 		}
-		rest, err := t.dispatch(step, resp.Message)
+		rest, err := t.dispatch(calls, interrupts)
 		if err != nil {
 			return err
 		}
@@ -1322,6 +1497,10 @@ candidates:
 				st.ErrorCode = t.interruptCode()
 				return nil, st, errInterrupted
 			}
+			if t.stopping() {
+				st.ErrorCode = "stopped" // D47: the attempt failed; no retry and no other candidate is started
+				return nil, st, errStopped
+			}
 			lastErr = err
 			var me *model.Error
 			if !errors.As(err, &me) {
@@ -1355,6 +1534,10 @@ candidates:
 				return nil, st, err
 			}
 			if !t.sleep(wait) {
+				if t.callCtx.Err() == nil && t.stopping() {
+					st.ErrorCode = "stopped" // D47: the wait ends, the retry is not made
+					return nil, st, errStopped
+				}
 				st.ErrorCode = t.interruptCode()
 				return nil, st, errInterrupted
 			}
@@ -1394,12 +1577,16 @@ func (t *turn) sleep(d time.Duration) bool {
 		return true
 	case <-t.callCtx.Done():
 		return false
+	case <-t.stop:
+		return false
 	}
 }
 
-// dispatch classifies the step's tool calls, executes the automatic ones and decides how the turn
-// rests. It returns "" to continue the loop, or the status the run was left in.
-func (t *turn) dispatch(step int, msg agui.Message) (string, error) {
+// classify decides the initial state of each tool call of an assistant message (limits, the caller's own tools, the
+// release's allow list, the confirmation policy) without writing anything; the caller stores the records with the message
+// (D47). It returns the records, the events of the decisions (denied, confirmation required) and the confirmations the
+// owner is asked for.
+func (t *turn) classify(step int, msg agui.Message) ([]run.ToolCall, []agui.Event, []map[string]any) {
 	h := t.h
 	var records []run.ToolCall
 	var events []agui.Event
@@ -1418,16 +1605,16 @@ func (t *turn) dispatch(step int, msg agui.Message) (string, error) {
 		tc := run.ToolCall{RunID: t.rc.Run.ID, ID: call.ID, Step: step, MessageID: msg.ID, Tool: call.Function.Name, Arguments: string(canon), ArgumentsSHA256: digest, CreatedAt: now}
 		switch {
 		case i >= t.def.Limits.MaxToolCallsPerStep:
-			tc.State = run.CallDenied
-			events = append(events, agui.Custom(agui.CustomToolDenied, map[string]any{"toolCallId": tc.ID, "tool": tc.Tool, "reason": "too many tool calls in one step"}))
+			tc.State, tc.Result = run.CallDenied, "too many tool calls in one step"
+			events = append(events, agui.Custom(agui.CustomToolDenied, map[string]any{"toolCallId": tc.ID, "tool": tc.Tool, "reason": tc.Result}))
 		case t.wrappingUp() && !t.delivers(tc.Tool):
-			tc.State = run.CallDenied
-			events = append(events, agui.Custom(agui.CustomToolDenied, map[string]any{"toolCallId": tc.ID, "tool": tc.Tool, "reason": "the run is wrapping up; only file delivery is available"}))
+			tc.State, tc.Result = run.CallDenied, "the run is wrapping up; only file delivery is available"
+			events = append(events, agui.Custom(agui.CustomToolDenied, map[string]any{"toolCallId": tc.ID, "tool": tc.Tool, "reason": tc.Result}))
 		case t.frontend[tc.Tool]:
 			tc.State = run.CallFrontend
 		case !t.visible[tc.Tool] && !t.hostTool(tc.Tool):
-			tc.State = run.CallDenied
-			events = append(events, agui.Custom(agui.CustomToolDenied, map[string]any{"toolCallId": tc.ID, "tool": tc.Tool, "reason": "tool not available to this agent"}))
+			tc.State, tc.Result = run.CallDenied, "tool not available to this agent"
+			events = append(events, agui.Custom(agui.CustomToolDenied, map[string]any{"toolCallId": tc.ID, "tool": tc.Tool, "reason": tc.Result}))
 		case t.def.Confirmation.For(tc.Tool) == agent.ConfirmConfirm || t.hostRequiresConfirmation(tc.Tool):
 			tc.State = run.CallPendingConfirmation
 			tc.ConfirmationExpiresAt = now.Add(time.Duration(t.def.Limits.ConfirmationTimeoutSeconds) * time.Second)
@@ -1445,24 +1632,28 @@ func (t *turn) dispatch(step int, msg agui.Message) (string, error) {
 		}
 		records = append(records, tc)
 	}
-	if err := h.Store.RecordToolCalls(t.ctx, t.claim, records, events); err != nil {
-		return "", err
-	}
-	frontend := false
+	return records, events, interrupts
+}
+
+// dispatch executes the automatic calls of a step whose records are stored and decides how the turn rests. It returns
+// "" to continue the loop, or the status the run was left in.
+func (t *turn) dispatch(records []run.ToolCall, interrupts []map[string]any) (string, error) {
+	h := t.h
+	frontend, stopped := false, false
 	for i, tc := range records {
 		switch tc.State {
 		case run.CallDenied:
-			reason := "tool not available to this agent"
-			if len(records) > t.def.Limits.MaxToolCallsPerStep {
-				reason = "too many tool calls in one step"
-			} else if t.wrappingUp() && !t.delivers(tc.Tool) {
-				reason = "the run is wrapping up; only file delivery is available"
-			}
-			if err := t.answer(tc, run.CallDenied, "", reason); err != nil {
+			// the reason was decided by classify and stored with the record (D47), so a worker that finds the record
+			// unanswered answers it the same way
+			if err := t.answer(tc, run.CallDenied, "", tc.Result); err != nil {
 				return "", err
 			}
 		case run.CallConfirmed:
 			if _, err := t.execute(tc); err != nil {
+				if errors.Is(err, errStopped) {
+					stopped = true // boundary 4 (D47): this call and the ones after it stay CONFIRMED for the next worker
+					continue
+				}
 				if errors.Is(err, errInterrupted) {
 					err = t.abandon(records, i)
 				}
@@ -1473,10 +1664,15 @@ func (t *turn) dispatch(step int, msg agui.Message) (string, error) {
 		}
 	}
 	if len(interrupts) > 0 {
+		// calls waiting for the member end the turn as always, also when the worker was told to stop: the stream needs its
+		// interrupt, and a CONFIRMED call that was not started runs when the run resumes after the decisions
 		if err := h.Store.Finish(t.ctx, t.claim, run.StatusAwaitingInput, "", "", []agui.Event{agui.RunFinished(t.rc.Run.ThreadID, t.rc.Run.ID, agui.OutcomeInterrupt, interrupts)}); err != nil {
 			return "", err
 		}
 		return run.StatusAwaitingInput, nil
+	}
+	if stopped {
+		return "", errStopped
 	}
 	if frontend {
 		return run.StatusCompleted, t.complete()
@@ -1823,4 +2019,59 @@ func (t *turn) verifyContext() (bool, error) {
 		}
 	}
 	return false, t.h.Store.AppendEvents(t.ctx, t.claim, append([]agui.Event{agui.Custom(agui.CustomContextStale, event)}, refreshEvents...))
+}
+
+// interruptedEvent is the stream's record that a tool call was cut short (D47): resent says whether it was sent to the
+// tool again or answered to the model as interrupted, reason why it was cut short: worker_stopped (the worker that
+// began it stopped or died; seen by the worker that resumes the run), deadline or canceled (D46).
+func (t *turn) interruptedEvent(tc run.ToolCall, resent bool, reason string) agui.Event {
+	return agui.Custom(agui.CustomToolInterrupted, map[string]any{"toolCallId": tc.ID, "tool": tc.Tool, "resent": resent, "reason": reason})
+}
+
+// mayResend reports whether a call found EXECUTING by the worker that resumes the run may be sent again (D47). The
+// HOST cannot tell a call that was never delivered from one that was done and whose result was lost, so it repeats a call
+// only where repeating does no harm: a gateway tool that, as the gateway lists it now, is read-only or idempotent and that
+// the operator did not name in neverResendTools; the HOST's own resource__read, which only reads the release. A tool the
+// gateway no longer lists (t.repeatable is built from the listing of this turn), or lists without either annotation, is
+// not repeated; neither is a remote agent (A2A), whose
+// work the HOST cannot see or undo. A local sub-agent call is DELEGATED, never EXECUTING; should one be found EXECUTING anyway, it is not sent again
+// (a second child run is not harmless).
+func (t *turn) mayResend(tc run.ToolCall) bool {
+	if _, ok := t.subagents[tc.Tool]; ok {
+		return false // a remote agent's work cannot be seen or undone, and a second child run is not harmless either
+	}
+	if tc.Tool == agent.ResourceReadTool && t.resources != nil {
+		return true
+	}
+	if t.gateway == nil || agent.MatchesTool(t.gateway.NeverResendTools, tc.Tool) {
+		return false
+	}
+	return t.repeatable[tc.Tool]
+}
+
+// resumeExecuting handles a call that was EXECUTING when the worker before this one stopped (D47): sent again when
+// mayResend says repeating does no harm, otherwise answered to the model as a tool error that says the outcome is
+// unknown. Either way the stream gets idp.host/tool.interrupted, so that an operator can see every repetition.
+func (t *turn) resumeExecuting(tc run.ToolCall) error {
+	resend := t.mayResend(tc)
+	ev := t.interruptedEvent(tc, resend, "worker_stopped")
+	t.h.Log.Warn("tool call was in progress when the worker stopped", "run", t.claim.RunID, "toolCall", tc.ID, "tool", tc.Tool, "resent", resend)
+	if resend {
+		if t.stopping() {
+			return errStopped
+		}
+		if m, ok := t.h.Metrics.(interruptionMetrics); ok {
+			m.ToolInterrupted(true, "worker_stopped")
+		}
+		if err := t.h.Store.AppendEvents(t.ctx, t.claim, []agui.Event{ev}); err != nil {
+			return err
+		}
+		_, err := t.execute(tc)
+		return err
+	}
+	if m, ok := t.h.Metrics.(interruptionMetrics); ok {
+		m.ToolInterrupted(false, "worker_stopped")
+	}
+	return t.answerWith(tc, run.CallFailed, "", "interrupted: the turn that was running this call ended while it was running (its worker stopped, died or lost the database); the tool may or may not have completed it, "+
+		"so its outcome is unknown. Check whether it was done before doing it again", ev)
 }

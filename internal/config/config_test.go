@@ -228,6 +228,25 @@ func TestGatewayToolPatternsAreValidatedAtLoad(t *testing.T) {
 	}
 }
 
+// D47: neverResendTools takes the same patterns as externalTools and confirmTools, validated the same way, and is optional.
+func TestNeverResendToolsIsReadAndValidatedAtLoad(t *testing.T) {
+	gw := func(extra string) string {
+		return "gateways:\n  - {name: web, endpoint: \"https://gw/mcp\", auth: {mode: static, apiKey: k}" + extra + "}\n"
+	}
+	f, err := load(t, gw(`, neverResendTools: ["sandbox_*", "web__send"]`))
+	if err != nil || len(f.Gateways[0].NeverResendTools) != 2 || f.Gateways[0].NeverResendTools[1] != "web__send" {
+		t.Fatalf("%+v %v", f.Gateways, err)
+	}
+	if f, err = load(t, gw("")); err != nil || f.Gateways[0].NeverResendTools != nil {
+		t.Fatalf("optional: %v", err)
+	}
+	for _, bad := range []string{`neverResendTools: ["["]`, `neverResendTools: [""]`} {
+		if _, err := load(t, gw(", "+bad)); err == nil || !strings.Contains(err.Error(), "neverResendTools") || !strings.Contains(err.Error(), "pattern") {
+			t.Errorf("%s: %v", bad, err)
+		}
+	}
+}
+
 // D45, D46: a provider that sets nothing gets the defaults, one that sets the retry and idle settings gets them as the
 // harness and the adapters read them, and a setting that makes no sense is refused when the file is loaded.
 func TestProviderRetryAndIdleSettings(t *testing.T) {
