@@ -359,6 +359,10 @@ const (
 	// CustomInputGuardRaised: the release said toolResults off, but the run has external tools, so tool results are
 	// wrapped as untrusted anyway (D44): {configured, applied, reason}.
 	CustomInputGuardRaised = "idp.host/guard.raised"
+
+	// CustomRunSources is written once when a run that has sources, or that was dropping entries, completes: the full list
+	// of the run's web sources with the counts of what was not recorded (D49).
+	CustomRunSources = "idp.host/run.sources"
 )
 
 // Why a run's CMI context is screened against the sensitivity ceiling (D44); both may hold, joined by "+".

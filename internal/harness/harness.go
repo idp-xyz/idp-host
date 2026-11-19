@@ -46,7 +46,14 @@ type Store interface {
 	UpdateToolCall(ctx context.Context, c *run.Claim, id, state, result string, isError bool, events []agui.Event) error
 	// AnswerToolCall sets a call's final state and result and appends its tool message, with the events, in one
 	// transaction (D47): a stop between the two can no longer leave a finished call whose tool message is missing.
-	AnswerToolCall(ctx context.Context, c *run.Claim, id, state, result string, isError bool, msg agui.Message, events []agui.Event) error
+	//
+	// D49: src, when not nil, is what the call's result adds to the run's sources. It is written in the same transaction, so
+	// that a call is answered once and its sources are recorded once, however often a worker stops and the run is resumed.
+	AnswerToolCall(ctx context.Context, c *run.Claim, id, state, result string, isError bool, msg agui.Message, src *run.SourceBatch, events []agui.Event) error
+	// CheckSources compares the citation marks of the final answer with the run's sources, stores the result with the run and
+	// appends idp.host/run.sources, in one transaction (D49). It does nothing, and writes no event, when the run has no
+	// sources and nothing was dropped and the check found no unverified number.
+	CheckSources(ctx context.Context, c *run.Claim, answer string) error
 	// Release gives the claim up at once instead of letting the lease run out (D47): the run stays RUNNING, as when a worker
 	// dies, but the next Claim may take it immediately. Fenced by the claim's epoch like every other write.
 	Release(ctx context.Context, c *run.Claim) error
@@ -889,7 +896,9 @@ func (t *turn) collect(tc run.ToolCall) error {
 	name := strings.TrimPrefix(tc.Tool, agent.SubagentToolPrefix)
 	switch out.Status {
 	case run.StatusCompleted:
-		return t.answer(tc, run.CallDone, out.Output, "")
+		// D49: what the sub-agent found is a source of this run too, so that a number in this run's answer that came from the
+		// sub-agent's text can be looked up here; the sub-agent's own list stays with its run
+		return t.answerSourced(tc, run.CallDone, out.Output, "", out.Sources)
 	case run.StatusCanceled:
 		return t.answer(tc, run.CallFailed, "", "sub-agent "+name+" was canceled")
 	default:
@@ -971,6 +980,11 @@ func (t *turn) answer(tc run.ToolCall, state, result, errText string) error {
 
 // answerWith is answer with events written in the same transaction as the call's new state.
 func (t *turn) answerWith(tc run.ToolCall, state, result, errText string, events ...agui.Event) error {
+	return t.answerSourced(tc, state, result, errText, nil, events...)
+}
+
+// answerSourced is answerWith that also records the sources the call's result carried (D49), in the same transaction.
+func (t *turn) answerSourced(tc run.ToolCall, state, result, errText string, src *run.SourceBatch, events ...agui.Event) error {
 	msg := agui.Message{ID: "tool_" + tc.ID, Role: agui.RoleTool, ToolCallID: tc.ID, Content: result, Error: errText}
 	content := result
 	if errText != "" {
@@ -979,7 +993,7 @@ func (t *turn) answerWith(tc run.ToolCall, state, result, errText string, events
 		}
 	}
 	// D47: the call's final state and its tool message are one write
-	if err := t.h.Store.AnswerToolCall(t.ctx, t.claim, tc.ID, state, content, errText != "", msg, append(events, agui.ToolCallResult(msg.ID, tc.ID, content))); err != nil {
+	if err := t.h.Store.AnswerToolCall(t.ctx, t.claim, tc.ID, state, content, errText != "", msg, src, append(events, agui.ToolCallResult(msg.ID, tc.ID, content))); err != nil {
 		return err
 	}
 	t.messages = append(t.messages, msg)
@@ -1071,7 +1085,15 @@ func (t *turn) execute(tc run.ToolCall) (bool, error) {
 			}
 		}
 	}
-	return true, t.answer(tc, run.CallDone, text, "")
+	// D49: the citations of a tool that sends content outside the enterprise become sources of this run. The text the model
+	// reads is the result's text, as before; what is recorded here is never given to a model.
+	var src *run.SourceBatch
+	if agent.MatchesTool(t.gateway.ExternalTools, tc.Tool) {
+		if b := run.ParseCitations(res.StructuredContent); !b.Empty() {
+			src = &b
+		}
+	}
+	return true, t.answerSourced(tc, run.CallDone, text, "", src)
 }
 
 type streamer struct {
@@ -1320,6 +1342,10 @@ func (t *turn) complete() error {
 		// delegation needs the owner's stored token, which is only readable while the claim is live
 		subject, _ = t.h.Store.Credential(t.ctx, t.claim)
 	}
+	// D49: the citation marks of the answer are checked against the sources before the run ends; this marks and never blocks
+	if err := t.h.Store.CheckSources(t.ctx, t.claim, t.finalAnswer()); err != nil {
+		return err
+	}
 	if err := t.h.Store.Finish(t.ctx, t.claim, run.StatusCompleted, "", "", []agui.Event{agui.RunFinished(t.rc.Run.ThreadID, t.rc.Run.ID, agui.OutcomeSuccess, nil)}); err != nil {
 		return err
 	}
@@ -1327,6 +1353,16 @@ func (t *turn) complete() error {
 		t.h.remember(x, subject)
 	}
 	return nil
+}
+
+// finalAnswer is the text of the run's last assistant message: what the citation check reads.
+func (t *turn) finalAnswer() string {
+	for i := len(t.messages) - 1; i >= 0; i-- {
+		if t.messages[i].Role == agui.RoleAssistant {
+			return t.messages[i].Content
+		}
+	}
+	return ""
 }
 
 // exchange says whether this turn's run is to be remembered (D33) and what was said: a caller's run

@@ -394,7 +394,7 @@ type legacyAnswer struct {
 	*postgres.Store
 }
 
-func (l legacyAnswer) AnswerToolCall(ctx context.Context, c *run.Claim, id, state, result string, isError bool, _ agui.Message, ev []agui.Event) error {
+func (l legacyAnswer) AnswerToolCall(ctx context.Context, c *run.Claim, id, state, result string, isError bool, _ agui.Message, _ *run.SourceBatch, ev []agui.Event) error {
 	if err := l.Store.UpdateToolCall(ctx, c, id, state, result, isError, nil); err != nil {
 		return err
 	}
@@ -448,14 +448,14 @@ func TestAToolCallsFinalStateAndItsToolMessageAreWrittenInOneTransactionOnPostgr
 		t.Fatal(err)
 	}
 	clash := agui.Message{ID: "asst_a", Role: agui.RoleTool, ToolCallID: "c1", Content: "3"} // the id of a message the thread has
-	if err := e.store.AnswerToolCall(ctx, c, "c1", run.CallDone, "3", false, clash, nil); err == nil {
+	if err := e.store.AnswerToolCall(ctx, c, "c1", run.CallDone, "3", false, clash, nil, nil); err == nil {
 		t.Fatal("a refused message was accepted")
 	}
 	if got, err := e.store.Context(ctx, c); err != nil || len(got.ToolCalls) != 1 || got.ToolCalls[0].State != run.CallConfirmed {
 		t.Errorf("the call must be as it was: %v %+v", err, got.ToolCalls)
 	}
 	ok := agui.Message{ID: "tool_c1", Role: agui.RoleTool, ToolCallID: "c1", Content: "3"}
-	if err := e.store.AnswerToolCall(ctx, c, "c1", run.CallDone, "3", false, ok, nil); err != nil {
+	if err := e.store.AnswerToolCall(ctx, c, "c1", run.CallDone, "3", false, ok, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := e.store.Context(ctx, c); err != nil || len(got.ToolCalls) != 0 || len(got.LastCalls) != 1 || got.LastCalls[0].State != run.CallDone || got.Messages[len(got.Messages)-1].ID != "tool_c1" {

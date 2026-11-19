@@ -2,7 +2,7 @@
 
 IDP TELOS 的 Agent Hosting & Coordination：`idp-host` 一个二进制，同时是 API 与 Worker。设计决策见 [`docs/adr/ADR-0001-host-design.md`](docs/adr/ADR-0001-host-design.md)。
 
-状态：**M1（PATH A 全链路）与 M2（可对外服务）已完成并实测**：Agent 定义与不可变发布（四眼）、Skill 注册与发布（嵌入 agent release）、Session / Thread / Run、持久化 Run 状态机与事件日志、租约 + fencing 的 Worker（可独立扩缩）、Go 自研 harness、OpenAI 兼容 / Anthropic / Gemini 三个模型适配器、经 idp-mcp 网关的工具调用（静态凭据或 RFC 8693 委派，与真实 Keycloak 联调通过）、用户确认、租户级配额与预算、AG-UI 流式接口、RLS、审计、指标、追踪、TLS、Kubernetes 清单；契约 `idp.telos.host` 1.10.0 已发布。**M3、M4、M5 完成**（ADR 第 11–13 节）：子 agent（父 Run 委派出的子 Run，`AWAITING_SUBAGENT`，D22）、Skill 资源（内联与按需 `resource__read`，D23）、可配置的 Skill 合并规则（D24）、授权码 + PKCE 登录与 EER 工作负载客户端的 OIDC 端到端（D25）、评估门禁（`POST /api/v1/releases/{id}/evaluate`，`EVALUATION_REQUIRED`，D26）、输入护栏（不可信内容定界与注入检测，D27）、输出过滤（租户与发布件的禁用模式、PII 脱敏、外部分类器，`GUARD_BLOCKED`，D28）、模型路由（cost / latency / capability，D29）、A2A 服务端与客户端（`/a2a/agents/{ref}`，远端子 agent，D30）、外部 harness worker（provider 种类 `harness-worker`，`deploy/harness-worker/worker.py`，D31）。**D32 完成**（ADR 第 14 节）：发布件 `context.cmi = true` 时运行创建以调用方身份向 idp-cmi 解析 ContextPackage，条目作为 developer 上下文交给模型，`contextPackageId` 记在运行上；后续步骤复验包（`context.onStale`：continue / refresh / fail，CMI D24）。真实模型门禁在本地 Qwen（OpenAI 与 Anthropic 两种线上格式）上通过。
+状态：**M1（PATH A 全链路）与 M2（可对外服务）已完成并实测**：Agent 定义与不可变发布（四眼）、Skill 注册与发布（嵌入 agent release）、Session / Thread / Run、持久化 Run 状态机与事件日志、租约 + fencing 的 Worker（可独立扩缩）、Go 自研 harness、OpenAI 兼容 / Anthropic / Gemini 三个模型适配器、经 idp-mcp 网关的工具调用（静态凭据或 RFC 8693 委派，与真实 Keycloak 联调通过）、用户确认、租户级配额与预算、AG-UI 流式接口、RLS、审计、指标、追踪、TLS、Kubernetes 清单；契约 `idp.telos.host` 1.11.0 已发布。**M3、M4、M5 完成**（ADR 第 11–13 节）：子 agent（父 Run 委派出的子 Run，`AWAITING_SUBAGENT`，D22）、Skill 资源（内联与按需 `resource__read`，D23）、可配置的 Skill 合并规则（D24）、授权码 + PKCE 登录与 EER 工作负载客户端的 OIDC 端到端（D25）、评估门禁（`POST /api/v1/releases/{id}/evaluate`，`EVALUATION_REQUIRED`，D26）、输入护栏（不可信内容定界与注入检测，D27）、输出过滤（租户与发布件的禁用模式、PII 脱敏、外部分类器，`GUARD_BLOCKED`，D28）、模型路由（cost / latency / capability，D29）、A2A 服务端与客户端（`/a2a/agents/{ref}`，远端子 agent，D30）、外部 harness worker（provider 种类 `harness-worker`，`deploy/harness-worker/worker.py`，D31）。**D32 完成**（ADR 第 14 节）：发布件 `context.cmi = true` 时运行创建以调用方身份向 idp-cmi 解析 ContextPackage，条目作为 developer 上下文交给模型，`contextPackageId` 记在运行上；后续步骤复验包（`context.onStale`：continue / refresh / fail，CMI D24）。真实模型门禁在本地 Qwen（OpenAI 与 Anthropic 两种线上格式）上通过。
 
 ## 组成
 
@@ -34,7 +34,7 @@ IDP TELOS 的 Agent Hosting & Coordination：`idp-host` 一个二进制，同时
 | `internal/credential`、`adapters/identity`、`internal/authorization` | 令牌交换与加密；JWT/JWKS 与开发令牌；角色 |
 | `adapters/store/postgres`、`migrations/` | 仓库、迁移、RLS、租约与 fencing |
 | `internal/config`、`internal/observability`、`internal/transport` | providers/gateways 配置文件；日志、追踪（自写 OTLP/HTTP JSON 导出器）、指标；HTTP、SSE、TLS |
-| `api/openapi.yaml`、`api/contracts/` | OpenAPI 3.1（测试保证与路由一致）；契约 `idp.telos.host` 1.10.0 的权威副本与一致性测试（`go test ./internal/run -run TestContract`） |
+| `api/openapi.yaml`、`api/contracts/` | OpenAPI 3.1（测试保证与路由一致）；契约 `idp.telos.host` 1.11.0 的权威副本与一致性测试（`go test ./internal/run -run TestContract`） |
 | `tests/integration`、`tests/e2e`、`tests/live`、`tests/deploy`、`tests/fixtures` | 真实 PostgreSQL 上的进程内全链路；compose 端到端；真实模型门禁；Kubernetes 清单一致性；模型与 MCP 的测试替身 |
 | `deploy/` | 镜像（scratch）、compose 拓扑（含 idp-mcp 的发布镜像）、端到端驱动脚本、Kubernetes 清单 |
 
@@ -101,6 +101,8 @@ provider 的 `retry` 与 `idleTimeoutSeconds`（ADR D45、D46）都可以不配�
 **worker 中断时进行中的工具调用（ADR D47，修订 D3）。** worker 停止或崩溃时，HOST 分不清"已经执行完但结果丢了"和"根本没发出去"，所以接手的 turn 对记为 `EXECUTING` 的网关工具调用只在重发无害时才重发：网关现在列出的该工具带 `readOnlyHint` 或 `idempotentHint`（`tools/list` 的 `annotations`），且没有被网关条目的 `neverResendTools`（模式语法与校验同 `externalTools`，匹配即永不重发，不看标注）点名。其余调用（没有标注、标注为假、网关已不再列出该工具、任何子智能体调用）不重发：模型收到一条工具错误，说明调用被中断、结果未知、可能已经做了也可能没有、重做之前先核实；运行的事件流记 `idp.host/tool.interrupted {toolCallId, tool, resent, reason}`（`resent: true` 的是被重发的那次重复；`reason` 为 `worker_stopped`，期限与取消打断的调用为 `deadline`、`canceled`），指标 `idp_host_tool_interruptions_total{resent, reason}` 同样计数。助手消息与它的工具调用记录在同一个事务里写入，工具调用的最终状态与它的工具消息也是；旧数据里缺的记录或工具消息，续跑时补建并照常执行。收到 SIGTERM 的 worker 不再认领运行，进行中的调用（模型调用、工具调用、远程智能体调用）做完，不开始任何新的调用，在下一个边界把运行交还（运行仍是 `RUNNING`，下一个 worker 立刻认领，不等租约过期）；超过 `IDP_HOST_STOP_GRACE`（缺省 `20s`；必须小于平台的终止宽限期：Kubernetes 清单的 `terminationGracePeriodSeconds` 为 30 秒，compose 的 host-worker 为 `stop_grace_period: 30s`）仍在进行的才被中断；`0` 表示立即中断。
 
 `cmi.remember` 是纯配置：运营方打开后，**所有** `context.cmi = true` 的 agent 都会被记住（契约不变；按 agent 退出需要改契约，见 ADR D33）。写入在运行终态之后异步进行，失败只记日志并计入 `idp_host_memory_writes_total{outcome}`（written / replayed / rejected / failed / auth_failed / no_credential），绝不影响运行。
+
+**运行的来源与引用核对（ADR D49，契约 1.11.0）。** 发布件的工具匹配网关的 `externalTools`（D44）时，HOST 读它的结果里的 `structuredContent.citations`（`{n, title, url, fetchedAt?, sha256?}`），把校验过的条目记成本次运行的来源：编号唯一、至多 100 条、只存标题与地址（不存摘录与页面正文）、标题是不可信的文字，只作数据保存和展示，不会进入任何模型请求；本地子 agent 找到的来源也记入父运行。运行完成时，HOST 在最终回答里找 `[n]`（`[1][2]`、`[1, 2]`；Markdown 链接、代码、`[x]`、`[2026]`、`[1-3]` 都不是引用），在来源里的记 `cited: true`，不在的列入 `unverifiedCitations`；只标记，不拦截、不改回答；既没有对外工具也没有来源的运行不检查。运行的表示（`GET /v1/runs/{id}`、线程的运行列表、`subruns`）多出可选的 `sources`（按 `n` 排序）与 `unverifiedCitations`；运行结束时事件流里有一条 `idp.host/run.sources`（完整列表与丢弃、冲突的计数）。没有新的设置；存储在迁移 `0010_run_sources.sql` 的表 `run_sources`（按租户的行级安全）。
 
 ## 许可证
 

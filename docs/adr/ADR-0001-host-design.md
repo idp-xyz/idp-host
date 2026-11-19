@@ -695,3 +695,78 @@ D37 让成员的文件经票据进出运行：字节不经过模型。但 agent 
 - **成员自己粘贴进对话的文字**：用户把机密内容写进消息，它就在运行的输入里，任何筛选都看不见；D48 只管 HOST 从文件与 CMI 取来的东西。
 - 没有界面：被扣下的原因只在事件流里。
 - 平台 compose 的验收（PATH N 之后的一条）不在 HOST 仓库内做，见交付说明。
+
+## 31. D49：运行记下它的工具返回的网页来源，结束时核对回答里的引用编号（2026-11-19 决策与实施，契约 1.11.0，平台 ADR-0003 D9、附录 D 任务 H1 与 K1）
+
+决策依据：平台 `ADR-0003-appendix-d-phase2-plan.md` 第 4.1 节、第 2 节第 1、2 条、选择点 4（取 (a)：只标记，不拦截）、第 9 节对存储与契约版本的说明；平台 `ADR-0003-web-search-and-fetch.md` D9 与第 11 节的两条风险（"完整性风险无法消除"、"模型可能虚构引用"）。
+
+起因：idp-web 在工具结果的 `structuredContent.citations` 里给出 `{n, title, url, fetchedAt, sha256}`，D44 把这类工具记为 `externalTools`，但 HOST 只在沙箱的文件交付上读 `structuredContent`，运行记录里没有来源，成员只能相信模型写的 `[n]`。D49 让 HOST 从**本次运行自己的**工具结果里收集来源，运行结束时把回答里的 `[n]` 与来源对上：存在的标记为已引用，不存在的列出来。
+
+| # | 决策 | 理由 |
+|---|---|---|
+| D49-1 | **收集：只读匹配本网关 `externalTools` 的工具的成功结果。** `execute` 在工具返回后读 `structuredContent.citations`（`run.ParseCitations`），结果交给存储，与该调用的最终状态、它的 tool 消息写在同一个事务里（`Store.AnswerToolCall` 多一个参数 `*run.SourceBatch`）。不匹配的工具（例如沙箱）即使返回同样的结构也不读；失败的结果不读 | 来源是"送出企业再带回来的外部内容"的记录；不是对外工具的结果，来源的含义不成立。写在同一事务里，所以一次调用只记一次：worker 在调用中途停止时，该调用的结果和来源都没有写，接手的 worker 重发（D47 允许只读工具）后记一次；调用已回答后停止则不会重发 |
+| D49-2 | **校验，逐条；无效的条目丢弃并计数，不是运行的错误。** `n`：JSON 整数，1 到 1 000 000（idp-web 按调用者一直递增，不会回绕，所以上限取大）；`url`：字符串，不超过 2048 字节，能被解析，scheme 为 http 或 https（不分大小写），有主机，没有用户信息（`user:pw@`），不含空白与控制字符；`title`：必须是字符串，换行与制表符变空格，其余控制字符和格式字符（含双向文字覆盖符）去掉，空白折叠，超过 300 个字符截断并以省略号结尾（空字符串可以）；`fetchedAt`：有则必须是 RFC 3339，存为 UTC；`sha256`：有则必须是 64 位十六进制，存为小写；空串与 null 等于没有；对象里的其他字段（包括任何摘录）一律忽略，不存。`citations` 不是数组、结果没有 `structuredContent`：什么也不加，也不算无效条目。一个结果最多读前 100 条，其余计入"超过上限" | 模型读到的文字（工具的 `text`）不受这些影响，所以一个格式错的 `citations` 不会让运行失败，也不会改变模型看到的东西 |
+| D49-3 | **合并：同一个 `n` 再出现，保留第一次的地址与第一个非空的标题；`fetchedAt` 取最早的；已有的 `sha256` 不被替换（没有时第一个出现的补上）。** 同一个 `n` 带**不同**的地址：保留第一个，计一次"冲突"，其余字段一概不取。每次运行最多 100 条来源：新的编号超出时不记，计入"超过上限"；已有的编号仍可合并。列表按 `n` 升序，`n` 在一次运行内唯一但不一定连续（idp-web 的 `n` 按调用者，同一成员同时跑两次运行时编号互相穿插） | 合并规则是幂等的：同一批再合并一次，除计数外什么也不变 |
+| D49-4 | **`sha256` 的含义写死：它是"第一次读到这个来源时交给模型的那一段正文"的摘要，不是整页的摘要。** idp-web 的 `web_fetch` 对一页分段读取（`offset`），每一段的引用各有一个 `sha256`；同一个 `n` 读了几段，这里只留最先记录的那一个。所以它能证明"模型读到过这样一段"，不能用来校验整页 | 为每段留一个摘要要把来源变成列表的列表；成员核对的是"页面在哪里"，不是字节 |
+| D49-5 | **冲突的已知来源：idp-web 为请求的地址编号，却在引用里写重定向之后的最终地址**（`citation.URL = c.page.FinalURL`，`handlers.go`），所以"先搜索得到 A，再读取时 A 重定向到 A'"会在同一个 `n` 下带来两个地址，被计为冲突。保留第一个（搜索给出的、成员可以打开的地址）。**冲突计数因此在有重定向的运行里不为零，它不是错误**；计数只用来发现编号体系本身出了问题（同一个 `n` 指向两个毫不相干的页面）。事件里只有次数，不带地址 | 平台计划写的"不该发生"在重定向时会发生；要让计数干净，要么 idp-web 的引用同时带请求地址与最终地址（平台仓库的改动，没有做），要么 HOST 把重定向的地址视为同一来源（HOST 无从判断，没有做） |
+| D49-6 | **本地子 agent 的来源也记入父运行，子运行自己的列表仍归子运行。** 子 agent 的结果回到父运行的方式是它最后一条助手消息的文字（`ChildOutcome.Output`），这段文字里可以有 `[n]`；父运行的回答可以原样引用它们。子运行与父运行是同一个调用者（凭据继承），所以编号在同一个编号体系里，同一个 `n` 就是同一个来源。规则：父运行收集子运行的结果时（`collect`），把子运行的**来源列表**（不带计数，不带 `cited`）按 D49-3 合并进自己的，与那个 DELEGATED 调用的回答在同一个事务里。子运行已完成才合并；失败、取消的子运行没有答案文字，不合并。所以"回答里的每个 `[n]` 都能在**这次运行**的来源里查到"仍然成立。远程 A2A 子 agent 没有来源：它回的文字里的编号父运行查不到，会被列为无法核对，这是对的 | 最小的规则：不新增查询、不改子运行的数据；子运行的丢弃与冲突计数是子运行自己的事 |
+| D49-7 | **标题只是数据，从不进入任何模型请求。** 来源只写进数据库、运行的表示和 `run.sources` 事件；`Store.Context` 不读它，`guardedMessages`、`filesNote`、预算说明、系统与 developer 文本、任务文字、子 agent 的输入、恢复后的请求、摘要都不碰它（没有代码路径把它读回 harness）。**要说清的一点：模型仍然读到工具自己的 `text`，而 idp-web 的 `text` 里就有标题**（`[n] 标题`），经 D27/D44 包上"不可信的外部内容"的标记；D49 没有改变这一点，也没有增加新的通道——记下来的列表是另一份，不被读回。测试里的网关把"注入的标题"只放在结构化结果里，其 `text` 用另一个标题，以便证明那份记录没有被读回 | 平台计划写的"标题绝不进入给模型的上下文"在字面上做不到（工具文本里本来就有），能保证的是"记下来的列表不进入" |
+| D49-8 | **运行完成时核对，只标记，不拦截、不改回答。** `Store.CheckSources`（在 `Finish(COMPLETED)` 之前，同一事务里读来源、核对、存回、追加事件）：回答里写了、并且在来源里的编号，该来源 `cited = true`；回答里写了、不在来源里的编号，进入 `unverifiedCitations`。**没有对外工具（`Input.ExternalTools` 为假）并且没有来源的运行，整个检查跳过**：回答里的方括号数字不是引用，没有 `unverifiedCitations`、没有事件。有对外工具但什么也没读到、回答里却写了 `[3]`，正是这项检查要发现的情形。检查只在 COMPLETED 时做；失败、取消的运行保留已收集的来源（`cited` 全为假），没有 `run.sources` 事件 | 选择点 4：编号写错不等于内容有害，拦截会让成员拿不到答案 |
+| D49-9 | **事件 `idp.host/run.sources`：运行结束时一次，在 `RUN_FINISHED` 之前**，值为 `{sources, unverifiedCitations, droppedInvalid, droppedOverLimit, conflicts, checked}`，`sources` 是完整列表。检查做过且有话可说（有来源、有无法核对的编号、或有丢弃）才写。**运行期间没有增量事件**：来源在回答出来之前没有"已引用"的含义，Workspace 与别的消费者在运行结束时才取（它跟随事件流到 `RUN_FINISHED`），增量事件要为每次工具调用多写一条，换不到任何调用方现在需要的东西。需要时可以加，契约不受影响（事件不属于 schema） | |
+
+**引用标记的语法**（`run.CitationMarks`）。依据：平台的技能文本只要求"cite each source as [n]"（`deploy/compose/e2e.sh` 里 web-assistant 的说明；idp-web 的 README 只说明 `citations` 的字段）。取保守的最小语法：
+
+| 是引用 | 不是引用（不记已引用，也不报无法核对） |
+|---|---|
+| `[3]`；`[1][2]`（两个标记）；`[1, 2]`、`[1,2]`（逗号分隔的列表，每个数字不带前导零、至多六位）；紧跟中文或标点的 `营业额[1]。`；行首的 `[2] 第二点`、`[1]: https://…` | `[x]`、`[N/A]`、`[TODO]`、`[ ]`、`[]`；`[2026]`（年份，见下）；`[0]`、`[01]`；范围 `[1-3]`、`[1–3]`（不展开，也不当作引用）；Markdown 链接 `[3](https://…)`、引用式链接 `[文字][1]`；图片；行内代码和围栏代码块（反引号或波浪线，不闭合的块到文末）里的一切；全角括号 `【1】`；`[1 见上]`、`[1;2]` |
+
+还有三条限制，写在代码与测试里：
+- **粘在 ASCII 字母、数字、下划线后面的标记**（`arr[7]`、`x_2[5]`）读作下标：只有当它指向已知来源时才记为已引用，永不报为无法核对。
+- **不存在的编号只在 1 到 3 位数时才报**；更长的数字（`[123456]`）不报，因为像年份和别的数字。已知来源的编号不受这条限制（idp-web 按调用者递增，会超过 999）。
+- **语法的盲区**：把数组写成 `[1, 2]` 的回答会被当作引用，没有来源也没有对外工具的运行不检查，有来源的运行可能多报一个；`【1】` 或 `^1` 之类别的写法不认，没认出来就既不标已引用也不报，是漏报方向的错误，不会冤枉成员。
+
+**这项检查发现不了什么：** 来源存在、但并不支持那句话的引用；回答里完全没有标记的陈述；模型改写了页面内容；引用与模型读到的段落不是同一段（见 D49-4）。它只发现"这个编号根本不存在"。ADR-0003 第 11 节写明后者靠引用精确率的测量和成员核对。
+
+**存储。** 迁移 `0010_run_sources.sql`：表 `run_sources(tenant_id, run_id, doc jsonb, updated_at)`，主键 `(tenant_id, run_id)`，外键到 `runs`，按租户的行级安全（`FORCE ROW LEVEL SECURITY` 与 `tenant_rows` 策略，同 `evaluations` 等表），`idp_host_app` 有 SELECT、INSERT、UPDATE。**为什么是一张表而不是 `runs` 的一列：**列出一个线程的运行（最多 500 行）读很多行，而来源最长有 100 条（最坏约 250 KiB 一行）；`GetRun`、`ListRuns`、`ListChildRuns`、幂等重放用一条 `run_id = ANY(...)` 查询补上。`doc` 是 `{items, droppedInvalid, droppedOverLimit, conflicts, checked, unverified}`，`items` 是 `run.Source` 的列表。**合并在 `owned` 取得的运行行锁下读、合并、写**，所以同一次运行的两个写者（不会同时有，但 fencing 之外多一层保证）不会互相覆盖。接手的 worker 从数据库读到前一个 worker 已经写下的来源，来源因此跨 worker 交接与确认后的恢复保留。
+
+**供应商条款。** 只保存**标题与地址**（以及读取时间与摘要）；**搜索摘录（`excerpt`）和页面正文都不存**——不进数据库，不进事件。这与平台附录 D 第 9 节的要求一致（"摘录不存"）。**标题能否保存仍要按合同核实**（附录 B 的问题清单里已有这一条）：在核实之前，运营方可以不开启 `externalTools`（来源就不会记），HOST 没有单独的开关，因为来源的存在本身是 D9 的要求；如果合同不允许存标题，需要的是一个小改动：存 `title` 时留空，列表仍有地址。
+
+**契约 `idp.telos.host` 1.11.0（向后兼容的小版本）：** `AgentRun` 增可选的 `sources`（最多 100 项，`RunSource`：`n`、`title`、`url`，可选 `fetchedAt`、`sha256`，`cited`）与 `unverifiedCitations`（整数，1 到 999，唯一）；新增定义 `RunSource`。示例增一个带来源与无法核对编号的已完成运行。事件名与字段不属于 schema（同 D44、D45）。生产者一致性测试：`internal/run` 的 `TestContract*`（定义的字段与 Go 结构一致，示例由 Go 值生成并往返，另有 `TestContractRejectsRunSourcesTheHostWouldNotRecord`：n 为 0 或字符串、ftp 与 javascript 地址、含空格的地址、大写与过短的 sha256、不是时间的 `fetchedAt`、过长标题、缺 `cited`、多余字段（摘录）、101 项、`unverifiedCitations` 里的 0、年份、重复、文字）。**对消费者：**`AgentRun` 对生产者是封闭的（`additionalProperties: false`），所以按 1.10.0 的 schema 严格校验 HOST 返回的运行的消费者会拒绝带 `sources` 的运行；idp-workspace 不这样做（见交付说明），它读 `GET /v1/runs/{id}` 时只取 `deadlineAt`，跟随事件流时忽略不认识的自定义事件，所以旧 Workspace 容忍新字段与新事件。**升级顺序：先 HOST，后 Workspace。**
+
+**实施：**`internal/run/sources.go`（`Source`、`SourceBatch`、`SourceSet`、`ParseCitations`、`Merge`、`CitationMarks`、`CheckAtEnd`）；`internal/run/run.go`（`Run.Sources`、`Run.UnverifiedCitations`、`ChildOutcome.Sources`）；`internal/harness/harness.go`（`execute` 读 citations，`collect` 合并子运行的来源，`complete` 调 `CheckSources`；Store 接口的 `AnswerToolCall` 多一个参数，新增 `CheckSources`）；`adapters/store/postgres/run_sources.go` 与 `runs.go`；`migrations/0010_run_sources.sql`；`internal/agui`（`CustomRunSources`）；`api/contracts`、`api/openapi.yaml`；`tests/fixtures/fakemcp`（`Tool.HandleAs`：按调用者回答，idp-web 的来源编号按调用者）。没有新设置，没有新依赖。
+
+**验证：**
+- `internal/run`：`TestACitationIsRecordedOnlyWhenItsFieldsAreValid`（每一种无效，含 28 个反例）、`TestATitleIsCleanedAndCut`、`TestSourcesAreMergedByNumber`、`TestTheSourceListHoldsAtMostAHundred`、`TestAChildsBatchCarriesNoCountsAndNoCitedMarks`、`TestCitationMarksAreFoundByTheGrammarAndNothingElseIsReported`（两个方向，25 个例子）、`TestTheCheckMarksCitedSourcesAndSkipsARunWithNothingToCheck`。
+- `internal/harness`（模型替身与网关替身，后者像 idp-web 一样按调用者编号）：`TestARunsSourcesAreExactlyThoseOfItsOwnToolResultsWhileOtherRunsOverlap`（三个运行同时在网关里，同一成员两个、另一成员一个，读的页面部分重叠，每个列表恰好是自己的）、`TestOnlyTheResultsOfExternalToolsAreReadForCitations`、`TestARunThatSearchedAndReadHasItsSourcesCitedAndUnverifiedMarked`、`TestInvalidCitationsAreDroppedAndCountedAndTheRunGoesOn`、`TestAtMostAHundredSourcesAreRecordedAndTheEventSaysHowManyWereDropped`、`TestANumberGivenAgainWithAnotherAddressKeepsTheFirstAndCountsAConflict`、`TestATitleThatIsAnInjectionIsStoredAndNeverReachesAModelRequest`（记录每个模型请求的原始请求体，含工具说明；经历等确认后恢复与子 agent 的来源合并）、`TestARunWithoutOutwardToolsAndWithoutSourcesIsNotChecked`（两个方向）、`TestSourcesSurviveAHandOverAndARepeatedReadOnlyCallIsRecordedOnce`、`TestAWorkerThatDiesAtTheEndOfTheRunLosesNoSources`、`TestTheSourcesOfASubagentAreAddedToTheParentsList`。
+- PostgreSQL（`TestRunSourcesOnPostgres`）：三个运行并发、持久化、API 的表示（`GET /v1/runs/{id}`、线程的运行列表、子运行列表）、事件在 `RUN_FINISHED` 之前恰一次、没有任何标题进入模型请求、租户隔离（另一租户的 `GET` 为 404，在另一租户的事务里 `run_sources` 一行也看不到，写别的租户的行被拒）、存下的文档里没有页面正文、子 agent、worker 在只读调用中死去后由另一个 worker 接手（先前的来源还在，重发的读取只记一次，事件说明重发）、无对外工具无来源的运行不检查。
+
+**拿掉一个控制、看测试失败**（每一项在实现里拿掉一次，跑下列测试，失败后恢复）
+
+| 控制 | 拿掉的东西 | 失败的测试 |
+|---|---|---|
+| 来源按运行隔离（D49-1、D49-3） | harness 里改成按所有者累积（模拟"按调用者"的做法），把累积的列表交给存储 | `TestARunsSourcesAreExactlyThoseOfItsOwnToolResultsWhileOtherRunsOverlap`；`TestRunSourcesOnPostgres` 的并发运行、事件、子 agent、交接子例 |
+| 只读对外工具的结果（D49-1） | `agent.MatchesTool(ExternalTools, …)` 改为恒真 | `TestOnlyTheResultsOfExternalToolsAreReadForCitations` |
+| 来源的合并按编号（D49-3） | 去掉"编号已有"的分支 | `TestSourcesAreMergedByNumber`、`TestTheSourceListHoldsAtMostAHundred`，harness 里五个运行级测试（重复的只读调用因此重复记录） |
+| 100 条上限 | 去掉上限判断 | `TestTheSourceListHoldsAtMostAHundred`、`TestAtMostAHundredSourcesAreRecordedAndTheEventSaysHowManyWereDropped` |
+| 冲突计数 | 不计 | `TestSourcesAreMergedByNumber`、`TestANumberGivenAgainWithAnotherAddressKeepsTheFirstAndCountsAConflict` |
+| 最早的 `fetchedAt`、不替换 `sha256`（D49-3、D49-4） | 各去掉一次 | `TestSourcesAreMergedByNumber` |
+| 校验 | 不查 scheme；不去控制字符 | `TestACitationIsRecordedOnlyWhenItsFieldsAreValid`；`TestATitleIsCleanedAndCut` |
+| 标题不进模型（D49-7） | 把来源的标题接到工具文本后面给模型 | `TestATitleThatIsAnInjectionIsStoredAndNeverReachesAModelRequest` |
+| 子 agent 的来源并入父运行（D49-6） | `collect` 不传 `out.Sources`；存储的 `ChildOutcome` 不带来源 | `TestTheSourcesOfASubagentAreAddedToTheParentsList`、`TestRunSourcesOnPostgres` 的子 agent 子例 |
+| 没有对外工具也没有来源就不检查（D49-8） | 去掉跳过的条件 | `TestTheCheckMarksCitedSourcesAndSkipsARunWithNothingToCheck`、`TestARunWithoutOutwardToolsAndWithoutSourcesIsNotChecked` |
+| 无法核对的编号（D49-8） | 不报；放宽位数限制（年份被报）；链接、引用式链接、代码、粘连的下标各去掉一次 | 语法表里对应的例子 |
+| 来源随交接保留（D49-1） | 存储合并时不先读已有的来源 | `TestRunSourcesOnPostgres` 的并发、事件、子 agent、交接子例 |
+| 行级安全 | 迁移里去掉 `run_sources` 的 RLS | `TestRunSourcesOnPostgres` 的租户子例 |
+| 运行的表示带来源 | `GetRun` 不补来源 | `TestRunSourcesOnPostgres` 的并发子例 |
+| 事件 | 不追加 `run.sources` | `TestRunSourcesOnPostgres` 的事件与交接子例 |
+| 契约 | schema 的 `unverifiedCitations` 改名；允许 ftp 地址 | `TestContractFieldsMatchGo`、`TestContractExamplesAreGeneratedAndValid`；`TestContractRejectsRunSourcesTheHostWouldNotRecord` |
+
+**没有做的：**
+- **"来源存在却不支持那句话"：**发现不了，见上。
+- **回答没有标记的陈述：**不查。
+- **不拦截：**`unverifiedCitations` 只是标记（选择点 4）。拦截要另议，并要有误报率的数据。
+- **失败、取消的运行没有 `run.sources` 事件与检查：**来源仍在运行的表示里；需要时是小改动。
+- **idp-web 的最终地址与请求地址不一致造成的冲突计数（D49-5）：**要改 idp-web 的引用或另议。
+- **标题的合同核实：**见"供应商条款"。
+- **Workspace 与平台：**收件箱详情的展示（WS1）、契约副本进 `idp-contracts`（K1）、compose 与 kind 的验收（P3）不在本仓库内做，见交付说明。
+- **每次运行的调用上限、配额：**与本决定无关（计划第 2 节第 4 条）。

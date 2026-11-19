@@ -1,5 +1,5 @@
 {
-  "description": "idp.telos.host 1.10.0 的示例：每一个都是 idp-host 实际产出或原样接受的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录，RunOptions 经 run.ParseOptions 解析后原样往返）。",
+  "description": "idp.telos.host 1.11.0 的示例：每一个都是 idp-host 实际产出或原样接受的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录，RunOptions 经 run.ParseOptions 解析后原样往返）。",
   "generatedBy": "go test ./internal/run -run TestContract -update",
   "examples": [
     {
@@ -632,6 +632,51 @@
         "status": "COMPLETED",
         "stepCount": 1,
         "threadId": "eval_7f3c1a2e5b6d4c8e9f0123456789abcd_0"
+      }
+    },
+    {
+      "definition": "AgentRun",
+      "value": {
+        "agentId": "9e8d7c6b-0000-4000-8000-000000000002",
+        "cancelRequested": false,
+        "createdAt": "2026-11-03T13:40:00Z",
+        "deadlineAt": "2026-11-03T13:50:00Z",
+        "finishedAt": "2026-11-03T13:40:20Z",
+        "owner": "carol",
+        "releaseDigest": "sha256:5b73bc7ee88a23f9ce1dce82e2d8efb54cc9a493fef3008034e09fdf39643c68",
+        "releaseId": "7f3c1a2e-5b6d-4c8e-9f01-23456789abcd",
+        "runId": "run_01JD7Q3Z8M8T0G3C6N4V9S2A1F",
+        "sources": [
+          {
+            "cited": true,
+            "fetchedAt": "2026-11-03T13:41:07Z",
+            "n": 2,
+            "sha256": "5d41402abc4b2a76b9719d911017c592a1b2c3d4e5f60718293a4b5c6d7e8f90",
+            "title": "Port of Rotterdam: customs clearance times",
+            "url": "https://www.portofrotterdam.example/en/customs"
+          },
+          {
+            "cited": false,
+            "n": 3,
+            "title": "Duty rates, chapter 84",
+            "url": "https://tariff.example/hs/84"
+          },
+          {
+            "cited": false,
+            "fetchedAt": "2026-11-03T13:41:30Z",
+            "n": 5,
+            "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            "title": "报关单填写规范",
+            "url": "https://customs.example.cn/guide?id=5"
+          }
+        ],
+        "startedAt": "2026-11-03T13:40:01Z",
+        "status": "COMPLETED",
+        "stepCount": 4,
+        "threadId": "thr-ops-45",
+        "unverifiedCitations": [
+          7
+        ]
       }
     },
     {

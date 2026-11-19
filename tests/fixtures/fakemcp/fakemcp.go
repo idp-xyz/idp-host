@@ -22,6 +22,9 @@ type Tool struct {
 	Handle      func(args map[string]any) (text string, isError bool)
 	// Structured, when set, gives the result's structuredContent.
 	Structured func(args map[string]any) any
+	// HandleAs, when set, answers instead of Handle and Structured with the caller's bearer too, for a tool whose answer
+	// depends on who asks (idp-web numbers its sources per caller).
+	HandleAs func(bearer string, args map[string]any) (text string, structured any, isError bool)
 	// Refuse, when it returns a reason, answers like the gateway does for arguments that fail the pinned schema:
 	// -32602 "Invalid arguments for tool <name>" with data.reason.
 	Refuse func(args map[string]any) string
@@ -172,6 +175,15 @@ func (s *Server) Handler() http.Handler {
 					}
 				}
 				if t.Name == name {
+					if t.HandleAs != nil {
+						text, structured, isErr := t.HandleAs(bearer, args)
+						res := map[string]any{"content": []map[string]any{{"type": "text", "text": text}}, "isError": isErr, "_meta": info}
+						if structured != nil && !isErr {
+							res["structuredContent"] = structured
+						}
+						s.write(w, req.ID, res, nil, 200)
+						return
+					}
 					text, isErr := t.Handle(args)
 					if fixed, ok := s.Results[name]; ok {
 						text, isErr = fixed, false

@@ -140,7 +140,8 @@ type ChildOutcome struct {
 	Status         string
 	FailureCode    string
 	FailureMessage string
-	Output         string // the child's last assistant message
+	Output         string       // the child's last assistant message
+	Sources        *SourceBatch // D49: what the child recorded, for the parent to add to its own list
 }
 
 // ChildRunID derives the deterministic id of the child run a tool call delegates to, so a retried
@@ -181,29 +182,33 @@ const ToolExecutionCaller = "caller"
 
 // Run is one execution of an agent on a thread.
 type Run struct {
-	TenantID            string    `json:"-"`
-	ID                  string    `json:"runId"`
-	ThreadID            string    `json:"threadId"`
-	AgentID             string    `json:"agentId"`
-	ReleaseID           string    `json:"releaseId"`
-	ReleaseDigest       string    `json:"releaseDigest"`
-	Owner               string    `json:"owner"`
-	Status              string    `json:"status"`
-	IdempotencyKey      string    `json:"-"`
-	Input               Input     `json:"-"`
-	StepCount           int       `json:"stepCount"`
-	EventSeq            int       `json:"-"`
-	FencingEpoch        int64     `json:"-"`
-	LeaseOwner          string    `json:"-"`
-	LeaseUntil          time.Time `json:"-"`
-	CancelRequested     bool      `json:"cancelRequested"`
-	FailureCode         string    `json:"failureCode,omitempty"`
-	FailureMessage      string    `json:"failureMessage,omitempty"`
-	ExecutionRef        string    `json:"executionRef,omitempty"`
-	ParentRunID         string    `json:"parentRunId,omitempty"`      // the run that delegated to this one (D22)
-	Depth               int       `json:"depth,omitempty"`            // 0 for a caller's run, parent depth + 1 for a sub-agent run
-	Purpose             string    `json:"purpose,omitempty"`          // "" (a caller's run) or PurposeEvaluation (D26)
-	ContextPackageID    string    `json:"contextPackageId,omitempty"` // the CMI package the run's context came from (D32)
+	TenantID         string    `json:"-"`
+	ID               string    `json:"runId"`
+	ThreadID         string    `json:"threadId"`
+	AgentID          string    `json:"agentId"`
+	ReleaseID        string    `json:"releaseId"`
+	ReleaseDigest    string    `json:"releaseDigest"`
+	Owner            string    `json:"owner"`
+	Status           string    `json:"status"`
+	IdempotencyKey   string    `json:"-"`
+	Input            Input     `json:"-"`
+	StepCount        int       `json:"stepCount"`
+	EventSeq         int       `json:"-"`
+	FencingEpoch     int64     `json:"-"`
+	LeaseOwner       string    `json:"-"`
+	LeaseUntil       time.Time `json:"-"`
+	CancelRequested  bool      `json:"cancelRequested"`
+	FailureCode      string    `json:"failureCode,omitempty"`
+	FailureMessage   string    `json:"failureMessage,omitempty"`
+	ExecutionRef     string    `json:"executionRef,omitempty"`
+	ParentRunID      string    `json:"parentRunId,omitempty"`      // the run that delegated to this one (D22)
+	Depth            int       `json:"depth,omitempty"`            // 0 for a caller's run, parent depth + 1 for a sub-agent run
+	Purpose          string    `json:"purpose,omitempty"`          // "" (a caller's run) or PurposeEvaluation (D26)
+	ContextPackageID string    `json:"contextPackageId,omitempty"` // the CMI package the run's context came from (D32)
+	// D49: the web sources the run's tools returned, by number, and the numbers the final answer cites that are not among
+	// them. Data about the run for the member to check an answer against; never given to a model.
+	Sources             []Source  `json:"sources,omitempty"`
+	UnverifiedCitations []int     `json:"unverifiedCitations,omitempty"`
 	EvaluationID        string    `json:"-"`
 	CredentialExpiresAt time.Time `json:"-"`
 	TraceID             string    `json:"traceId,omitempty"`

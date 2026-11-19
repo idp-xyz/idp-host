@@ -31,7 +31,7 @@ var update = flag.Bool("update", false, "regenerate api/contracts/examples.json 
 
 const (
 	contractDir = "../../api/contracts"
-	contractID  = "urn:idp:telos:host:1.10.0"
+	contractID  = "urn:idp:telos:host:1.11.0"
 )
 
 type noLoader struct{}
@@ -161,6 +161,16 @@ func exampleRuns(releaseID, digest string) []run.Run {
 			ParentRunID: "run_01JD7Q3Z8M8T0G3C6N4V9S2A1E", Depth: 1, DeadlineAt: at.Add(30 * time.Minute), CreatedAt: at.Add(20*time.Minute + 2*time.Second), StartedAt: at.Add(20*time.Minute + 3*time.Second)},
 		{ID: "eval_7f3c1a2e5b6d4c8e9f0123456789abcd_0", ThreadID: "eval_7f3c1a2e5b6d4c8e9f0123456789abcd_0", AgentID: "9e8d7c6b-0000-4000-8000-000000000002", ReleaseID: releaseID, ReleaseDigest: digest, Owner: "alice",
 			Status: run.StatusCompleted, StepCount: 1, Purpose: run.PurposeEvaluation, DeadlineAt: at.Add(40 * time.Minute), CreatedAt: at.Add(30 * time.Minute), StartedAt: at.Add(30*time.Minute + time.Second), FinishedAt: at.Add(30*time.Minute + 4*time.Second)},
+		// 1.11.0 (D49): a run that searched and read; the numbers are the caller's, so not consecutive. [2] was cited, [3] was only
+		// found by the search, and the answer also wrote [7], which is not among the sources.
+		{ID: "run_01JD7Q3Z8M8T0G3C6N4V9S2A1F", ThreadID: "thr-ops-45", AgentID: "9e8d7c6b-0000-4000-8000-000000000002", ReleaseID: releaseID, ReleaseDigest: digest, Owner: "carol",
+			Status: run.StatusCompleted, StepCount: 4, DeadlineAt: at.Add(50 * time.Minute), CreatedAt: at.Add(40 * time.Minute), StartedAt: at.Add(40*time.Minute + time.Second), FinishedAt: at.Add(40*time.Minute + 20*time.Second),
+			Sources: []run.Source{
+				{N: 2, Title: "Port of Rotterdam: customs clearance times", URL: "https://www.portofrotterdam.example/en/customs", FetchedAt: "2026-11-03T13:41:07Z",
+					SHA256: "5d41402abc4b2a76b9719d911017c592a1b2c3d4e5f60718293a4b5c6d7e8f90", Cited: true},
+				{N: 3, Title: "Duty rates, chapter 84", URL: "https://tariff.example/hs/84"},
+				{N: 5, Title: "报关单填写规范", URL: "https://customs.example.cn/guide?id=5", FetchedAt: "2026-11-03T13:41:30Z", SHA256: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}},
+			UnverifiedCitations: []int{7}},
 		{ID: "run_01JD7Q3Z8M8T0G3C6N4V9S2A1D", ThreadID: "thr-ops-43", AgentID: "9e8d7c6b-0000-4000-8000-000000000002", ReleaseID: releaseID, ReleaseDigest: digest, Owner: "carol",
 			Status: run.StatusFailed, StepCount: 12, CancelRequested: false, FailureCode: run.FailStepLimit, FailureMessage: "the run reached its limit of 12 steps",
 			ExecutionRef: "eer:execution:0192f3a1", DeadlineAt: at.Add(30 * time.Minute), CreatedAt: at.Add(20 * time.Minute), StartedAt: at.Add(20*time.Minute + time.Second), FinishedAt: at.Add(25 * time.Minute)},
@@ -233,7 +243,7 @@ func buildExamples(t *testing.T) []byte {
 		add("RunOptions", o)
 	}
 	b, err := json.MarshalIndent(examplesFile{
-		Description: "idp.telos.host 1.10.0 的示例：每一个都是 idp-host 实际产出或原样接受的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录，RunOptions 经 run.ParseOptions 解析后原样往返）。",
+		Description: "idp.telos.host 1.11.0 的示例：每一个都是 idp-host 实际产出或原样接受的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录，RunOptions 经 run.ParseOptions 解析后原样往返）。",
 		GeneratedBy: "go test ./internal/run -run TestContract -update",
 		Examples:    out,
 	}, "", "  ")
@@ -348,7 +358,7 @@ func TestContractFieldsMatchGo(t *testing.T) {
 		"RunOptions": run.Options{}, "SubagentRef": agent.SubagentRef{}, "EmbeddedSubagent": agent.EmbeddedSubagent{}, "SkillMerge": agent.SkillMerge{}, "Resource": agent.Resource{},
 		"Guards": agent.Guards{}, "InputGuard": agent.InputGuard{}, "OutputGuard": agent.OutputGuard{}, "Evaluation": agent.Evaluation{}, "EvalCase": agent.EvalCase{}, "Expectation": agent.Expectation{},
 		"Routing": agent.Routing{}, "Candidate": agent.Candidate{}, "A2ARef": agent.A2ARef{}, "ContextPolicy": agent.ContextPolicy{},
-		"FileAttachment": run.Attachment{}, "FileDelivery": run.Delivery{}}
+		"FileAttachment": run.Attachment{}, "FileDelivery": run.Delivery{}, "RunSource": run.Source{}}
 	for def, zero := range closed {
 		d, ok := defs[def].(map[string]any)
 		if !ok {
@@ -607,4 +617,58 @@ func elevenAttachments() []any {
 		out = append(out, map[string]any{"ref": fmt.Sprintf("f%d", i), "name": "a.txt", "mediaType": "text/plain", "size": 1, "sha256": strings.Repeat("0a", 32), "ticket": exampleTicket})
 	}
 	return out
+}
+
+// D49: the shape of the new fields is closed and bounded as the implementation validates what it records: a run that carries
+// a source the HOST would never have recorded is not a valid AgentRun.
+func TestContractRejectsRunSourcesTheHostWouldNotRecord(t *testing.T) {
+	k := loadContract(t)
+	good := func() map[string]any {
+		return map[string]any{"n": 1, "title": "t", "url": "https://a.example/x", "cited": false}
+	}
+	base := func(srcs ...map[string]any) []byte {
+		list := make([]any, len(srcs))
+		for i, s := range srcs {
+			list[i] = s
+		}
+		raw, _ := json.Marshal(map[string]any{"runId": "run_1", "threadId": "thr_1", "agentId": "a", "releaseId": "r", "releaseDigest": "sha256:" + strings.Repeat("a", 64), "owner": "o",
+			"status": "COMPLETED", "stepCount": 1, "cancelRequested": false, "deadlineAt": "2026-11-03T13:10:00Z", "createdAt": "2026-11-03T13:00:00Z", "sources": list})
+		return raw
+	}
+	if err := k.validate("AgentRun", base(good())); err != nil {
+		t.Fatalf("a valid source is refused: %v", err)
+	}
+	with := func(key string, v any) map[string]any { m := good(); m[key] = v; return m }
+	cases := map[string][]map[string]any{
+		"n zero":                  {with("n", 0)},
+		"n a string":              {with("n", "1")},
+		"url ftp":                 {with("url", "ftp://a.example/x")},
+		"url javascript":          {with("url", "javascript:alert(1)")},
+		"url with a space":        {with("url", "https://a.example/a b")},
+		"sha256 upper case":       {with("sha256", strings.Repeat("A", 64))},
+		"sha256 short":            {with("sha256", "abc")},
+		"fetchedAt not a time":    {with("fetchedAt", "yesterday")},
+		"title too long":          {with("title", strings.Repeat("x", 301))},
+		"cited missing":           {{"n": 1, "title": "t", "url": "https://a.example/x"}},
+		"unknown field (excerpt)": {with("excerpt", "page text")},
+	}
+	for name, srcs := range cases {
+		if err := k.validate("AgentRun", base(srcs...)); err == nil {
+			t.Errorf("%s: the schema accepts it", name)
+		}
+	}
+	var many []map[string]any
+	for i := 1; i <= 101; i++ {
+		many = append(many, with("n", i))
+	}
+	if err := k.validate("AgentRun", base(many...)); err == nil {
+		t.Error("101 sources: the schema accepts them")
+	}
+	for name, v := range map[string]any{"zero": []int{0}, "year": []int{2026}, "repeated": []int{3, 3}, "text": []string{"x"}} {
+		raw, _ := json.Marshal(map[string]any{"runId": "run_1", "threadId": "thr_1", "agentId": "a", "releaseId": "r", "releaseDigest": "sha256:" + strings.Repeat("a", 64), "owner": "o",
+			"status": "COMPLETED", "stepCount": 1, "cancelRequested": false, "deadlineAt": "2026-11-03T13:10:00Z", "createdAt": "2026-11-03T13:00:00Z", "unverifiedCitations": v})
+		if err := k.validate("AgentRun", raw); err == nil {
+			t.Errorf("unverifiedCitations %s: the schema accepts it", name)
+		}
+	}
 }

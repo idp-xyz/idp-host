@@ -41,6 +41,17 @@ type crashStore struct {
 	// dieOnToolMessage: the worker dies at the write of a tool message (AppendMessages of a tool message, or AnswerToolCall,
 	// which is that write and the call's state together); nothing of that write is stored.
 	dieOnToolMessage bool
+	// D49: the worker dies at the answer of a call to this tool, or at the check of the citations at the end of the run.
+	dieOnToolAnswer string
+	dieOnCheck      bool
+}
+
+func (c *crashStore) CheckSources(ctx context.Context, cl *run.Claim, answer string) error {
+	if c.dead.Load() || c.dieOnCheck {
+		c.dead.Store(true)
+		return run.ErrFenced
+	}
+	return c.memStore.CheckSources(ctx, cl, answer)
 }
 
 func (c *crashStore) UpdateToolCall(ctx context.Context, cl *run.Claim, id, state, result string, isErr bool, ev []agui.Event) error {
@@ -51,8 +62,8 @@ func (c *crashStore) UpdateToolCall(ctx context.Context, cl *run.Claim, id, stat
 	return c.memStore.UpdateToolCall(ctx, cl, id, state, result, isErr, ev)
 }
 
-func (c *crashStore) AnswerToolCall(ctx context.Context, cl *run.Claim, id, state, result string, isErr bool, msg agui.Message, ev []agui.Event) error {
-	if c.dead.Load() || c.dieOnToolMessage || (c.dieOnState != "" && state == c.dieOnState) {
+func (c *crashStore) AnswerToolCall(ctx context.Context, cl *run.Claim, id, state, result string, isErr bool, msg agui.Message, src *run.SourceBatch, ev []agui.Event) error {
+	if c.dead.Load() || c.dieOnToolMessage || (c.dieOnState != "" && state == c.dieOnState) || c.answerKilled(id) {
 		c.dead.Store(true)
 		return run.ErrFenced
 	}
@@ -65,7 +76,7 @@ func (c *crashStore) AnswerToolCall(ctx context.Context, cl *run.Claim, id, stat
 		}
 		return run.ErrFenced
 	}
-	return c.memStore.AnswerToolCall(ctx, cl, id, state, result, isErr, msg, ev)
+	return c.memStore.AnswerToolCall(ctx, cl, id, state, result, isErr, msg, src, ev)
 }
 
 func (c *crashStore) RecordToolCalls(ctx context.Context, cl *run.Claim, calls []run.ToolCall, ev []agui.Event) error {
@@ -574,4 +585,10 @@ func TestInterruptedToolCallsAreCountedByResentAndReason(t *testing.T) {
 			t.Errorf("counted %v, want [%s]", mt.seen, tc.want)
 		}
 	}
+}
+
+// answerKilled: for the D49 tests, the worker dies at the answer of a call to dieOnToolAnswer (nothing of that write is
+// stored, so the tool's sources are not either).
+func (c *crashStore) answerKilled(id string) bool {
+	return c.dieOnToolAnswer != "" && c.memStore.calls[id] != nil && c.memStore.calls[id].Tool == c.dieOnToolAnswer
 }

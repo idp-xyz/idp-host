@@ -45,7 +45,8 @@ type memStore struct {
 	children map[string]*run.ChildOutcome
 	inputs   map[string]run.ChildRunInput
 	refuse   error
-	released int // how many times the claim was given up (D47)
+	released int           // how many times the claim was given up (D47)
+	sources  run.SourceSet // D49: the run's sources, as the real store keeps them
 }
 
 func newMem(def agent.Definition, msgs []agui.Message, input run.Input) *memStore {
@@ -132,7 +133,7 @@ func (m *memStore) AppendAssistantTurn(_ context.Context, _ *run.Claim, msg agui
 	return m.appendEvents(events)
 }
 
-func (m *memStore) AnswerToolCall(_ context.Context, _ *run.Claim, id, state, result string, isError bool, msg agui.Message, events []agui.Event) error {
+func (m *memStore) AnswerToolCall(_ context.Context, _ *run.Claim, id, state, result string, isError bool, msg agui.Message, src *run.SourceBatch, events []agui.Event) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if err := m.check(); err != nil {
@@ -145,7 +146,21 @@ func (m *memStore) AnswerToolCall(_ context.Context, _ *run.Claim, id, state, re
 		c.FinishedAt = time.Now()
 	}
 	m.rc.Messages = append(m.rc.Messages, msg)
+	m.sources.Merge(src) // D49: with the call's answer, as the real store does
 	return m.appendEvents(events)
+}
+
+// CheckSources is the real store's rule on the in-memory set (D49).
+func (m *memStore) CheckSources(_ context.Context, _ *run.Claim, answer string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.check(); err != nil {
+		return err
+	}
+	if !m.sources.CheckAtEnd(answer, m.rc.Run.Input.ExternalTools) {
+		return nil
+	}
+	return m.appendEvents([]agui.Event{agui.Custom(agui.CustomRunSources, m.sources.Event())})
 }
 
 // Release: the claim is given up at once; the test's next Run on the store is the worker that takes the run.

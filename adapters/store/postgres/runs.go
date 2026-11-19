@@ -177,7 +177,7 @@ func (s *Store) CreateRun(ctx context.Context, tenant string, in CreateRunInput)
 					return fail("CONFLICT", "Idempotency-Key was used for a different request")
 				}
 				out, replayed = existing, true
-				return nil
+				return attachSources(ctx, tx, out)
 			} else if se := new(Error); !errors.As(err, &se) {
 				return err
 			}
@@ -319,8 +319,10 @@ func (s *Store) CreateRun(ctx context.Context, tenant string, in CreateRunInput)
 func (s *Store) GetRun(ctx context.Context, tenant, owner, id string) (*run.Run, error) {
 	var out *run.Run
 	err := s.InTenant(ctx, tenant, func(tx pgx.Tx) (err error) {
-		out, err = scanRun(tx.QueryRow(ctx, `SELECT `+runCols+` FROM runs WHERE id = $1 AND ($2 = '' OR owner = $2)`, id, owner))
-		return err
+		if out, err = scanRun(tx.QueryRow(ctx, `SELECT `+runCols+` FROM runs WHERE id = $1 AND ($2 = '' OR owner = $2)`, id, owner)); err != nil {
+			return err
+		}
+		return attachSources(ctx, tx, out)
 	})
 	return out, err
 }
@@ -341,7 +343,10 @@ func (s *Store) ListRuns(ctx context.Context, tenant, owner, threadID string) ([
 			}
 			out = append(out, *r)
 		}
-		return rows.Err()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		return attachSourcesTo(ctx, tx, out)
 	})
 	return out, err
 }
@@ -936,7 +941,9 @@ func updateToolCall(ctx context.Context, tx pgx.Tx, c *run.Claim, id, state, res
 
 // AnswerToolCall sets a call's final state and result and appends its tool message and the events, in one transaction
 // (D47): the call and its answer can no longer be separated by a worker that stops between two writes.
-func (s *Store) AnswerToolCall(ctx context.Context, c *run.Claim, id, state, result string, isError bool, msg agui.Message, events []agui.Event) error {
+//
+// D49: src, when not nil, is merged into the run's sources in the same transaction.
+func (s *Store) AnswerToolCall(ctx context.Context, c *run.Claim, id, state, result string, isError bool, msg agui.Message, src *run.SourceBatch, events []agui.Event) error {
 	return s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
 		r, err := s.owned(ctx, tx, c)
 		if err != nil {
@@ -946,6 +953,9 @@ func (s *Store) AnswerToolCall(ctx context.Context, c *run.Claim, id, state, res
 			return err
 		}
 		if _, err := appendMessages(ctx, tx, c.TenantID, r.ThreadID, c.RunID, []agui.Message{msg}); err != nil {
+			return err
+		}
+		if err := recordSources(ctx, tx, c, src); err != nil {
 			return err
 		}
 		return appendEvents(ctx, tx, c.TenantID, c.RunID, events)
@@ -1171,6 +1181,11 @@ func (s *Store) ChildOutcome(ctx context.Context, c *run.Claim, childID string) 
 			return err
 		}
 		out = run.ChildOutcome{RunID: child.ID, Status: child.Status, FailureCode: child.FailureCode, FailureMessage: child.FailureMessage}
+		if set, err := loadSources(ctx, tx, c.TenantID, child.ID); err != nil {
+			return err
+		} else {
+			out.Sources = set.Batch() // D49
+		}
 		if !run.Terminal(child.Status) {
 			return nil
 		}
@@ -1214,7 +1229,10 @@ func (s *Store) ListChildRuns(ctx context.Context, tenant, owner, parentID strin
 			}
 			out = append(out, *r)
 		}
-		return rows.Err()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		return attachSourcesTo(ctx, tx, out)
 	})
 	return out, err
 }
