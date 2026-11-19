@@ -770,3 +770,21 @@ D37 让成员的文件经票据进出运行：字节不经过模型。但 agent 
 - **标题的合同核实：**见"供应商条款"。
 - **Workspace 与平台：**收件箱详情的展示（WS1）、契约副本进 `idp-contracts`（K1）、compose 与 kind 的验收（P3）不在本仓库内做，见交付说明。
 - **每次运行的调用上限、配额：**与本决定无关（计划第 2 节第 4 条）。
+
+## 32. D50：流里的错误事件是提供者的错误，不是解码失败（2026-11-19 决策与实施）
+
+修订 D45（哪些错误重试）；沿用 D40（提供者的正文不交给成员）。
+
+起因：2026-11-19 基线测量里，同一个任务的两次运行，其中一次在第 9 次模型调用、180.4 秒后以 `MODEL_ERROR: model call failed: decode` 失败，步错误码 `decode`，0 token；前 8 次调用正常（最长 99 秒、14,000 个输出 token）。原因不明：HOST 没有留下任何消息。OpenAI 兼容适配器的 `flush` 对两种情况都返回 `decode`：数据块不是 JSON，以及数据块是 JSON 且带 `error` 对象，即提供者在一个以 HTTP 200 开始的流里报告失败，后一种几乎肯定是这次的情形，提供者自己的话被丢掉了。Anthropic 适配器（`event: error`）与 Gemini 适配器（`error` 对象）有同样的写法。
+
+| # | 决策 | 理由 |
+|---|---|---|
+| D50-1 | **流里的 `error` 事件是提供者的错误，有自己的错误码。** OpenAI 兼容 `{"error":{message,type,code}}`（code 可为字符串或数字）、Anthropic `{"type":"error","error":{type,message}}`、Gemini `{"error":{code,message,status}}`，由 `model.ClassifyStreamError` 一处解析。OpenAI 适配器里服务器忽略 `stream:true` 而返回的 JSON 正文同样处理。harness-worker 的 `error` 事件原来就有自己的码，不变 | 同一个 `decode` 下是两件事：对方说了什么，和我们读不懂；运维要能分开 |
+| D50-2 | **类别与重试。** `provider_overloaded`（`overloaded`、`unavailable`、503、529）、`provider_rate_limit`（`rate_limit`、429、`RESOURCE_EXHAUSTED`）、`provider_server`（`server_error`、`api_error`、`internal`、超时、5xx）可重试；`provider_error`（其余，包括 `insufficient_quota`、认证、`invalid_request_error`）不重试。类别只看提供者的 type、code、status，不看自由文字（自由文字只用来判断上下文窗口）。可重试的错误走 D45 的原规则，没有新规则：`streamer.streamed()` 为真（已有文字增量写进事件日志）就不重试同一候选，之前只有推理或工具调用片段的流照旧可以重试 | 一次重试比一次失败的 180 秒便宜；已写进日志的文字收不回来（D45-3） |
+| D50-3 | **上下文窗口。** type、code 或消息里出现 D40 认得的标记（`context_length_exceeded`、`exceed_context_size_error`、`exceeds the context` 等），错误码是 `context_length`，运行的失败消息是 D40 的那句。标记表增加 Anthropic 的 `prompt is too long`，对 HTTP 400 同样生效 | 不是故障而是会话的状态，重试没有用 |
+| D50-4 | **提供者的话怎么存、给谁看：只给运维，只在 HOST 日志。** `model.Error` 增 `Detail`：提供者的 type、code、status、message，每个字段至多 160 字符、合起来至多 `MaxDetail` = 300 字符，控制字符与不可打印字符换成空格、连续空格合并、非法 UTF-8 丢弃，超长以 `…` 结尾。`Detail` 只写进 HOST 日志的一行 Warn `model call failed`，带 `run`、`step`、`attempt`、`provider`、`model`、`code`、`detail`，运维凭运行 ID 即可找到；每次失败的尝试一行，大小有上界。事件 `idp.host/model.error {step, provider, model, attempt, code}` 每次失败的尝试一条，**没有任何提供者的文字**，只说"这一步有一次提供者报告的错误或读不懂的数据块"。运行的失败消息、步表、会话消息都不带它：成员看到固定的一句 `model call failed: provider_error: the model server reported an error while answering`（错误码因类别而异）。步表没有详情列，不为此改 schema | 事件流是运行所有者读的。提供者的错误文字不归我们展示：OpenAI 兼容服务器的认证错误会引出密钥的一部分（"Incorrect API key provided: sk-…abcd"），其他的会写出内部主机名或组织 ID。D40 的做法是成员读固定的句子、运维读详情，D50 沿用；放宽的只是详情现在有界、清洗过，并且存在日志里 |
+| D50-5 | **真正读不懂的数据块仍是 `decode`**，现在带一句有界的位置说明（"a stream chunk is not JSON"、"content_block_delta without its block or delta"、"the stream is longer than the limit"），绝不含原始数据；同样只写入日志（事件只有错误码） | 两种情形仍可区分，且不泄漏载荷 |
+
+**拿掉一个控制、看测试失败**：把 `detail` 放回事件：`TestTheProvidersWordsReachOnlyTheHostLog`、`TestANonRetryableStream…` 失败；`ClassifyStreamError` 一律返回 `decode`：`TestClassifyStreamError`、`TestStreamErrorDetailIsBoundedAndClean`、三个适配器各自的 `TestAStreamErrorIsTheProvidersAndKeepsItsWords`、harness 的 `TestARetryableStreamErrorBeforeTextIsRetried`、`TestAStreamErrorAfterTextIsNotRetried`、`TestANonRetryableStreamError…`、`TestAStreamErrorThatSaysTheContextIsFullIsTheContextWindowError`。
+
+**仍不知道的**：那次 180.4 秒的失败，提供者到底说了什么（消息已丢，无法追溯），它是否真是流内错误事件，也可能是数据块损坏；本地模型服务（llama.cpp 一类）在长生成中途发出的错误事件的形状只按文档与适配器已有的解析推断，没有抓到真实样本。**下一次**：先在事件日志里找 `idp.host/model.error`（只有错误码，说明哪一步、第几次尝试），再用运行 ID 在 HOST 日志里找 `model call failed` 一行，其 `detail` 是提供者的话，或（错误码为 `decode` 时）读不懂的是哪一种数据块；若同一类 `provider_server` 反复出现，看模型服务自己的日志（那次 180 秒前后）。日志不是持久的审计记录：日志保留期短于要追查的时间，提供者的话就没了。

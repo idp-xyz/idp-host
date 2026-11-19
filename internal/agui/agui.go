@@ -345,6 +345,9 @@ const (
 	// CustomModelRetry: a request to a model failed with an error worth another try and the host waits before it makes
 	// it (D45): {step, provider, model, attempt, of, code, waitMs, retryAfterMs}. attempt is the request that failed.
 	CustomModelRetry = "idp.host/model.retry"
+	// CustomModelError: a request to a model failed with an error the provider reported or a chunk the host could not
+	// decode (D50): {step, provider, model, attempt, code}. It carries no text of the provider's: that is in the host log.
+	CustomModelError = "idp.host/model.error"
 	// content guards (ADR-0001 D27, D28)
 	CustomGuardFlagged = "idp.host/guard.flagged"
 	CustomGuardBlocked = "idp.host/guard.blocked"

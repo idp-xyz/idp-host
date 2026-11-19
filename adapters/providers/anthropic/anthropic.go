@@ -241,18 +241,22 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 		data = nil
 		var ev event
 		if err := json.Unmarshal([]byte(payload), &ev); err != nil {
-			return &model.Error{Code: "decode"}
+			return model.DecodeError("a stream event is not JSON")
 		}
 		switch ev.Type {
-		case "error":
-			return &model.Error{Code: "decode"}
+		case "error": // D50: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
+			var raw json.RawMessage
+			if ev.Error != nil {
+				raw = *ev.Error
+			}
+			return model.ClassifyStreamError(raw)
 		case "message_start":
 			if ev.Message != nil {
 				usage.PromptTokens = ev.Message.Usage.InputTokens
 			}
 		case "content_block_start":
 			if ev.ContentBlock == nil {
-				return &model.Error{Code: "decode"}
+				return model.DecodeError("content_block_start without a content block")
 			}
 			st := &blockState{kind: ev.ContentBlock.Type, id: ev.ContentBlock.ID, name: ev.ContentBlock.Name}
 			st.text.WriteString(ev.ContentBlock.Text)
@@ -264,7 +268,7 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 		case "content_block_delta":
 			st := blocks[ev.Index]
 			if st == nil || ev.Delta == nil {
-				return &model.Error{Code: "decode"}
+				return model.DecodeError("content_block_delta without its block or delta")
 			}
 			switch ev.Delta.Type {
 			case "text_delta":
@@ -294,7 +298,7 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 		line := strings.TrimSuffix(sc.Text(), "\r")
 		total += len(line)
 		if total > model.MaxResponse {
-			return nil, &model.Error{Code: "decode"}
+			return nil, model.DecodeError("the stream is longer than the limit")
 		}
 		switch {
 		case line == "":

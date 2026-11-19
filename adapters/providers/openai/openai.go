@@ -330,8 +330,11 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 			return nil, watch.StreamError(ctx)
 		}
 		var c chunk
-		if err := json.Unmarshal(raw, &c); err != nil || c.Error != nil {
-			return nil, &model.Error{Code: "decode"}
+		if err := json.Unmarshal(raw, &c); err != nil {
+			return nil, model.DecodeError("the response body is not JSON")
+		}
+		if c.Error != nil {
+			return nil, model.ClassifyStreamError(*c.Error)
 		}
 		acc.apply(&c, onDelta)
 		return acc.response(p.cfg.NewMessageID())
@@ -351,10 +354,10 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 		}
 		var c chunk
 		if err := json.Unmarshal([]byte(payload), &c); err != nil {
-			return &model.Error{Code: "decode"}
+			return model.DecodeError("a stream chunk is not JSON")
 		}
 		if c.Error != nil {
-			return &model.Error{Code: "decode"}
+			return model.ClassifyStreamError(*c.Error) // D50: the provider's own error, inside a stream that began with 200
 		}
 		acc.apply(&c, onDelta)
 		return nil
@@ -363,7 +366,7 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 		line := strings.TrimSuffix(sc.Text(), "\r")
 		total += len(line)
 		if total > model.MaxResponse {
-			return nil, &model.Error{Code: "decode"}
+			return nil, model.DecodeError("the stream is longer than the limit")
 		}
 		switch {
 		case line == "":

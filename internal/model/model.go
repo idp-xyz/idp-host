@@ -114,7 +114,7 @@ const CodeContextLength = "context_length"
 
 // Error is a provider failure safe to record and show: a code, never the provider's raw body.
 type Error struct {
-	Code      string // transport, status, context_length, decode, schema, canceled
+	Code      string // transport, status, context_length, provider_* (D50), decode, schema, canceled
 	Status    int    // HTTP status when Code is "status" or "context_length"
 	Retryable bool
 	// RetryAfter is how long the provider asked the caller to wait before the next request (the Retry-After header of
@@ -122,6 +122,10 @@ type Error struct {
 	RetryAfter time.Duration
 	// Idle marks a transport error that is a stream which sent nothing for the provider's idle timeout (D46).
 	Idle bool
+	// Detail says what the provider or the decoder said, bounded and cleaned (D50): the provider's type, code and
+	// message for an error it reported inside a stream, or where an undecodable chunk was. It is provider-controlled
+	// text: it goes to the host log only, never to an event, the failure message or the step row.
+	Detail string
 }
 
 // Error implements error.
@@ -137,6 +141,24 @@ func (e *Error) Error() string {
 		}
 	}
 	return "model provider error: " + e.Code
+}
+
+// The codes of an error the provider reported inside a stream that began with HTTP 200 (D50). The first three are
+// transient and retried under D45's rule; ProviderError is every other class.
+const (
+	CodeProviderOverloaded = "provider_overloaded" // overloaded_error, 503, 529, UNAVAILABLE
+	CodeProviderRateLimit  = "provider_rate_limit" // rate_limit_error, 429, RESOURCE_EXHAUSTED
+	CodeProviderServer     = "provider_server"     // api_error, server_error, 5xx, INTERNAL, timeouts
+	CodeProviderError      = "provider_error"      // any other class: not retried
+)
+
+// IsProviderStreamCode reports whether code is one of the D50 codes.
+func IsProviderStreamCode(code string) bool {
+	switch code {
+	case CodeProviderOverloaded, CodeProviderRateLimit, CodeProviderServer, CodeProviderError:
+		return true
+	}
+	return false
 }
 
 // CheckEndpoint validates a provider base URL: http(s), a host, no credentials, query or fragment;
@@ -270,7 +292,7 @@ func (i idleReader) Read(p []byte) (int, error) {
 // contextMarkers is how OpenAI-compatible servers name a request that does not fit the model's context window:
 // OpenAI's error code, the message of OpenAI and vLLM, llama.cpp's error type and its message, and the message of
 // the Strata server the platform is tried with ("prompt (N tokens) + max tokens (M) exceeds the context (W)").
-var contextMarkers = []string{"context_length_exceeded", "maximum context length", "exceed_context_size_error", "exceeds the available context size", "exceeds the context"}
+var contextMarkers = []string{"context_length_exceeded", "maximum context length", "exceed_context_size_error", "exceeds the available context size", "exceeds the context", "prompt is too long"}
 
 // ClassifyBody is Classify for a refusal whose body was read (D40): a 400 that says the request does not fit the
 // model's context window gets its own code, because the caller can do something about that one. Only the code

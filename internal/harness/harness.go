@@ -1254,6 +1254,10 @@ func (t *turn) loop() error {
 				message += fmt.Sprintf(": the provider asked to wait %d seconds before the next request, longer than the %d seconds this host waits",
 					int(t.askedWait.Round(time.Second)/time.Second), int(t.askedCap/time.Second))
 			}
+			if model.IsProviderStreamCode(st.ErrorCode) {
+				// D50: the provider's words are not shown to the member; the host log holds them
+				message += ": the model server reported an error while answering"
+			}
 			if st.ErrorCode == model.CodeContextLength {
 				// D40: the thread itself is what does not fit, so the same request would be refused again
 				message = "the conversation no longer fits the model's context window; start a new conversation, or ask for less at a time"
@@ -1546,6 +1550,15 @@ candidates:
 			st.ErrorCode = errorCode(me)
 			if me.Code == "canceled" {
 				return nil, st, err
+			}
+			if me.Detail != "" {
+				// D50: what the provider said is for the operator and goes to the host log only; the event says that there is
+				// something to look for, never what it is (the run's owner reads the event stream)
+				h.Log.Warn("model call failed", "run", t.claim.RunID, "step", step, "attempt", attempt, "provider", ref.Provider, "model", ref.Model, "code", st.ErrorCode, "detail", me.Detail)
+				if aerr := h.Store.AppendEvents(t.ctx, t.claim, []agui.Event{agui.Custom(agui.CustomModelError, map[string]any{"step": step, "provider": ref.Provider,
+					"model": ref.Model, "attempt": attempt, "code": st.ErrorCode})}); aerr != nil {
+					return nil, st, aerr
+				}
 			}
 			if !me.Retryable && me.Code != "transport" {
 				break candidates
