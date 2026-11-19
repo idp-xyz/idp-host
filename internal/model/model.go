@@ -10,11 +10,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"idp-host/internal/agui"
@@ -114,6 +117,11 @@ type Error struct {
 	Code      string // transport, status, context_length, decode, schema, canceled
 	Status    int    // HTTP status when Code is "status" or "context_length"
 	Retryable bool
+	// RetryAfter is how long the provider asked the caller to wait before the next request (the Retry-After header of
+	// an HTTP answer, D45); zero when it did not ask.
+	RetryAfter time.Duration
+	// Idle marks a transport error that is a stream which sent nothing for the provider's idle timeout (D46).
+	Idle bool
 }
 
 // Error implements error.
@@ -123,6 +131,10 @@ func (e *Error) Error() string {
 		return fmt.Sprintf("model provider answered HTTP %d", e.Status)
 	case CodeContextLength:
 		return "the request does not fit the model's context window"
+	case "transport":
+		if e.Idle {
+			return "model provider error: the stream stopped sending data"
+		}
 	}
 	return "model provider error: " + e.Code
 }
@@ -172,6 +184,87 @@ func NewHTTPClient(headerTimeout time.Duration, caFile string) (*http.Client, er
 // Classify turns an HTTP status into a provider error.
 func Classify(status int) *Error {
 	return &Error{Code: "status", Status: status, Retryable: status == 408 || status == 429 || status >= 500}
+}
+
+// ClassifyHTTP is ClassifyBody for a response whose headers are at hand: the error also carries the Retry-After the
+// provider sent with a retryable status (D45), read at now.
+func ClassifyHTTP(status int, header http.Header, body []byte, now time.Time) *Error {
+	e := ClassifyBody(status, body)
+	if e.Retryable {
+		e.RetryAfter, _ = ParseRetryAfter(header.Get("Retry-After"), now)
+	}
+	return e
+}
+
+// maxRetryAfter bounds what a Retry-After header can say, so that a hostile or broken value cannot overflow a duration.
+const maxRetryAfter = 24 * time.Hour
+
+// ParseRetryAfter reads a Retry-After header value (RFC 9110: a number of seconds or an HTTP date) as the time to wait
+// from now. A date in the past is no wait; a value that is neither is ignored (false).
+func ParseRetryAfter(v string, now time.Time) (time.Duration, bool) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0, false
+	}
+	if secs, err := strconv.ParseUint(v, 10, 63); err == nil {
+		return min(time.Duration(min(secs, uint64(maxRetryAfter/time.Second)))*time.Second, maxRetryAfter), true
+	}
+	if at, err := http.ParseTime(v); err == nil {
+		return min(max(at.Sub(now), 0), maxRetryAfter), true
+	}
+	return 0, false
+}
+
+// IdleWatch bounds the silence of a response body (D46): when no byte arrives for the idle timeout, it cancels the
+// request, so a model that stopped answering in the middle of a stream cannot hold a run (and its lease) for ever.
+type IdleWatch struct {
+	timer *time.Timer
+	idle  time.Duration
+	fired atomic.Bool
+}
+
+// NewIdleWatch starts the watch; cancel is called once, when the silence exceeds idle. A zero idle watches nothing.
+func NewIdleWatch(idle time.Duration, cancel context.CancelFunc) *IdleWatch {
+	w := &IdleWatch{idle: idle}
+	if idle > 0 {
+		w.timer = time.AfterFunc(idle, func() { w.fired.Store(true); cancel() })
+	}
+	return w
+}
+
+// Wrap returns r with every successful read restarting the idle timer.
+func (w *IdleWatch) Wrap(r io.Reader) io.Reader { return idleReader{w, r} }
+
+// Stop ends the watch (the response was read to its end or abandoned).
+func (w *IdleWatch) Stop() {
+	if w.timer != nil {
+		w.timer.Stop()
+	}
+}
+
+// Fired reports whether the watch cancelled the request.
+func (w *IdleWatch) Fired() bool { return w.fired.Load() }
+
+// StreamError is the error of a body read or request that failed: canceled when the caller's context ended, an
+// idle transport error when the watch fired, a plain retryable transport error otherwise.
+func (w *IdleWatch) StreamError(ctx context.Context) *Error {
+	if ctx.Err() != nil {
+		return &Error{Code: "canceled"}
+	}
+	return &Error{Code: "transport", Retryable: true, Idle: w.Fired()}
+}
+
+type idleReader struct {
+	w *IdleWatch
+	r io.Reader
+}
+
+func (i idleReader) Read(p []byte) (int, error) {
+	n, err := i.r.Read(p)
+	if n > 0 && i.w.timer != nil {
+		i.w.timer.Reset(i.w.idle)
+	}
+	return n, err
 }
 
 // contextMarkers is how OpenAI-compatible servers name a request that does not fit the model's context window:

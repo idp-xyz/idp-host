@@ -221,7 +221,9 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 		}
 	}
 	var providers []model.Provider
+	retry := map[string]model.RetryPolicy{} // D45
 	for _, p := range cfg.Providers {
+		retry[p.Name] = p.RetryPolicy()
 		hc, err := model.NewHTTPClient(2*time.Minute, p.CAFile)
 		if err != nil {
 			return fmt.Errorf("provider %s: %w", p.Name, err)
@@ -235,25 +237,25 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 			if p.UsageInStream != nil {
 				usage = *p.UsageInStream
 			}
-			prov, err := openai.New(openai.Config{Name: p.Name, BaseURL: p.BaseURL, APIKey: p.APIKey, HTTP: hc, UsageInStream: usage, MaxTokensField: p.MaxTokensField, AllowPlainHTTP: p.Insecure})
+			prov, err := openai.New(openai.Config{Name: p.Name, BaseURL: p.BaseURL, APIKey: p.APIKey, HTTP: hc, UsageInStream: usage, MaxTokensField: p.MaxTokensField, AllowPlainHTTP: p.Insecure, IdleTimeout: p.IdleTimeout()})
 			if err != nil {
 				return err
 			}
 			providers = append(providers, prov)
 		case "anthropic":
-			prov, err := anthropic.New(anthropic.Config{Name: p.Name, BaseURL: p.BaseURL, APIKey: p.APIKey, HTTP: hc, AllowPlainHTTP: p.Insecure})
+			prov, err := anthropic.New(anthropic.Config{Name: p.Name, BaseURL: p.BaseURL, APIKey: p.APIKey, HTTP: hc, AllowPlainHTTP: p.Insecure, IdleTimeout: p.IdleTimeout()})
 			if err != nil {
 				return err
 			}
 			providers = append(providers, prov)
 		case "gemini":
-			prov, err := gemini.New(gemini.Config{Name: p.Name, BaseURL: p.BaseURL, APIKey: p.APIKey, HTTP: hc, AllowPlainHTTP: p.Insecure})
+			prov, err := gemini.New(gemini.Config{Name: p.Name, BaseURL: p.BaseURL, APIKey: p.APIKey, HTTP: hc, AllowPlainHTTP: p.Insecure, IdleTimeout: p.IdleTimeout()})
 			if err != nil {
 				return err
 			}
 			providers = append(providers, prov)
 		case "harness-worker": // ADR-0001 D31: an external harness behind the HOST's step protocol
-			prov, err := harnessworker.New(harnessworker.Config{Name: p.Name, Endpoint: p.BaseURL, APIKey: p.APIKey, HTTP: hc, AllowPlainHTTP: p.Insecure})
+			prov, err := harnessworker.New(harnessworker.Config{Name: p.Name, Endpoint: p.BaseURL, APIKey: p.APIKey, HTTP: hc, AllowPlainHTTP: p.Insecure, IdleTimeout: p.IdleTimeout()})
 			if err != nil {
 				return err
 			}
@@ -419,7 +421,7 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 	wctx, cancelWorkers := context.WithCancel(ctx)
 	defer cancelWorkers()
 	if workers > 0 {
-		h := &harness.Harness{Store: store, Providers: registry, Gateways: gateways, Classifiers: classifiers, A2A: a2aClient, CMI: cmiClient, CMIKey: cmiKey, CMIToken: cmiToken, Remember: remember, Metrics: worker.NewMetrics(metrics), Log: log}
+		h := &harness.Harness{Store: store, Providers: registry, Gateways: gateways, Classifiers: classifiers, A2A: a2aClient, CMI: cmiClient, CMIKey: cmiKey, CMIToken: cmiToken, Remember: remember, Retry: retry, Metrics: worker.NewMetrics(metrics), Log: log}
 		w := &worker.Worker{ID: env("IDP_HOST_INSTANCE", hostname), Store: store, Harness: h, Concurrency: workers, Lease: lease, Log: log}
 		wg.Add(1)
 		go func() {

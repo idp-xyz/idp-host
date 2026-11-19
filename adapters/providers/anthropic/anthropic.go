@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"go.opentelemetry.io/otel/propagation"
 
@@ -33,6 +34,9 @@ type Config struct {
 	APIKey       string
 	HTTP         *http.Client
 	NewMessageID func() string
+	// IdleTimeout is how long a response may stay silent between two reads before the request is cancelled and the call
+	// fails as a retryable transport error (D46); zero means model.DefaultIdleTimeout.
+	IdleTimeout time.Duration
 	// AllowPlainHTTP permits http:// to non-loopback hosts (development only).
 	AllowPlainHTTP bool
 }
@@ -54,6 +58,14 @@ func New(cfg Config) (*Provider, error) {
 		cfg.NewMessageID = model.NewMessageID
 	}
 	return &Provider{cfg: cfg}, nil
+}
+
+// idle is the silence a response may keep (D46).
+func (p *Provider) idle() time.Duration {
+	if p.cfg.IdleTimeout > 0 {
+		return p.cfg.IdleTimeout
+	}
+	return model.DefaultIdleTimeout
 }
 
 // Name implements model.Provider.
@@ -185,7 +197,9 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 	if err != nil {
 		return nil, err
 	}
-	hr, err := http.NewRequestWithContext(ctx, http.MethodPost, p.cfg.BaseURL+"/v1/messages", bytes.NewReader(raw))
+	rctx, cancelReq := context.WithCancel(ctx) // cancelled by the idle watch (D46)
+	defer cancelReq()
+	hr, err := http.NewRequestWithContext(rctx, http.MethodPost, p.cfg.BaseURL+"/v1/messages", bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
 	}
@@ -206,13 +220,16 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-		return nil, model.Classify(resp.StatusCode)
+		return nil, model.ClassifyHTTP(resp.StatusCode, resp.Header, nil, time.Now())
 	}
+	watch := model.NewIdleWatch(p.idle(), cancelReq)
+	defer watch.Stop()
+	stream := watch.Wrap(resp.Body)
 	blocks := map[int]*blockState{}
 	var order []int
 	var usage model.Usage
 	stop := ""
-	sc := bufio.NewScanner(resp.Body)
+	sc := bufio.NewScanner(stream)
 	sc.Buffer(make([]byte, 64<<10), 4<<20)
 	var data []string
 	total := 0
@@ -292,10 +309,7 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 		return nil, err
 	}
 	if err := sc.Err(); err != nil {
-		if ctx.Err() != nil {
-			return nil, &model.Error{Code: "canceled"}
-		}
-		return nil, &model.Error{Code: "transport", Retryable: true}
+		return nil, watch.StreamError(ctx)
 	}
 	msg := agui.Message{ID: p.cfg.NewMessageID(), Role: agui.RoleAssistant}
 	var reasoning strings.Builder

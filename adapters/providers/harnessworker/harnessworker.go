@@ -29,6 +29,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"idp-host/internal/agui"
 	"idp-host/internal/model"
@@ -41,7 +42,10 @@ type Config struct {
 	APIKey         string
 	HTTP           *http.Client
 	AllowPlainHTTP bool
-	NewMessageID   func() string
+	// IdleTimeout is how long a response may stay silent between two reads before the request is cancelled and the call
+	// fails as a retryable transport error (D46); zero means model.DefaultIdleTimeout.
+	IdleTimeout  time.Duration
+	NewMessageID func() string
 }
 
 // Provider implements model.Provider.
@@ -61,6 +65,14 @@ func New(cfg Config) (*Provider, error) {
 		cfg.NewMessageID = model.NewMessageID
 	}
 	return &Provider{cfg: cfg}, nil
+}
+
+// idle is the silence a response may keep (D46).
+func (p *Provider) idle() time.Duration {
+	if p.cfg.IdleTimeout > 0 {
+		return p.cfg.IdleTimeout
+	}
+	return model.DefaultIdleTimeout
 }
 
 // Name implements model.Provider.
@@ -111,7 +123,9 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 	if err != nil {
 		return nil, &model.Error{Code: "schema"}
 	}
-	hr, err := http.NewRequestWithContext(ctx, http.MethodPost, p.cfg.Endpoint+"/v1/turn", bytes.NewReader(body))
+	rctx, cancelReq := context.WithCancel(ctx) // cancelled by the idle watch (D46)
+	defer cancelReq()
+	hr, err := http.NewRequestWithContext(rctx, http.MethodPost, p.cfg.Endpoint+"/v1/turn", bytes.NewReader(body))
 	if err != nil {
 		return nil, &model.Error{Code: "transport"}
 	}
@@ -130,11 +144,14 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		return nil, model.Classify(resp.StatusCode)
+		return nil, model.ClassifyHTTP(resp.StatusCode, resp.Header, nil, time.Now())
 	}
+	watch := model.NewIdleWatch(p.idle(), cancelReq)
+	defer watch.Stop()
+	stream := watch.Wrap(resp.Body)
 	out := &model.Response{Message: agui.Message{ID: p.cfg.NewMessageID(), Role: agui.RoleAssistant}}
 	var content, reasoning strings.Builder
-	sc := bufio.NewScanner(io.LimitReader(resp.Body, model.MaxResponse))
+	sc := bufio.NewScanner(io.LimitReader(stream, model.MaxResponse))
 	sc.Buffer(make([]byte, 64<<10), 1<<20)
 	done := false
 	for sc.Scan() {
@@ -189,10 +206,7 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 		}
 	}
 	if err := sc.Err(); err != nil {
-		if ctx.Err() != nil {
-			return nil, &model.Error{Code: "canceled"}
-		}
-		return nil, &model.Error{Code: "transport", Retryable: true}
+		return nil, watch.StreamError(ctx)
 	}
 	if !done {
 		if ctx.Err() != nil {

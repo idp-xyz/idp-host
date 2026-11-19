@@ -339,6 +339,9 @@ const (
 	CustomContextStale    = "idp.host/context.stale" // a later step found the package stale (CMI D24)
 	// model routing (ADR-0001 D29)
 	CustomModelRouted = "idp.host/model.routed"
+	// CustomModelRetry: a request to a model failed with an error worth another try and the host waits before it makes
+	// it (D45): {step, provider, model, attempt, of, code, waitMs, retryAfterMs}. attempt is the request that failed.
+	CustomModelRetry = "idp.host/model.retry"
 	// content guards (ADR-0001 D27, D28)
 	CustomGuardFlagged = "idp.host/guard.flagged"
 	CustomGuardBlocked = "idp.host/guard.blocked"

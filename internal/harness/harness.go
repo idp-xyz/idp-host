@@ -37,6 +37,8 @@ type Store interface {
 	AppendEvents(ctx context.Context, c *run.Claim, events []agui.Event) error
 	AppendMessages(ctx context.Context, c *run.Claim, msgs []agui.Message, events []agui.Event) error
 	StartStep(ctx context.Context, c *run.Claim, maxSteps int, maxTokensPerRun int64, provider, model string) (step int, cancelRequested bool, err error)
+	// CancelRequested reads whether the owner asked to cancel the run, without taking it; run.ErrFenced for a lost claim (D46).
+	CancelRequested(ctx context.Context, c *run.Claim) (bool, error)
 	FinishStep(ctx context.Context, c *run.Claim, st run.Step, events []agui.Event) error
 	RecordToolCalls(ctx context.Context, c *run.Claim, calls []run.ToolCall, events []agui.Event) error
 	UpdateToolCall(ctx context.Context, c *run.Claim, id, state, result string, isError bool, events []agui.Event) error
@@ -105,6 +107,11 @@ type Harness struct {
 	Remember *cmiclient.Remember
 	memWG    sync.WaitGroup
 
+	// Retry is the retry policy toward each provider by name (D45); a provider without an entry gets the defaults.
+	Retry map[string]model.RetryPolicy
+	// CancelPoll is how often a run in progress asks the store whether its owner asked to cancel it (default 1 s, D46).
+	CancelPoll time.Duration
+
 	DeltaFlush      time.Duration // how often streamed text is persisted (default 50 ms)
 	ToolTimeout     time.Duration // per tool call (default 60 s)
 	ToolResultLimit int           // bytes of one tool result handed to the model (default 16 KiB, D40)
@@ -116,6 +123,9 @@ type Harness struct {
 }
 
 func (h *Harness) defaults() {
+	if h.CancelPoll == 0 {
+		h.CancelPoll = time.Second
+	}
 	if h.DeltaFlush == 0 {
 		h.DeltaFlush = 50 * time.Millisecond
 	}
@@ -148,26 +158,35 @@ func (h *Harness) defaults() {
 type turn struct {
 	contextVerified bool // the CMI package was checked (and found stale or unanswerable) once already (D24)
 	h               *Harness
-	ctx             context.Context
-	claim           *run.Claim
-	rc              *run.Context
-	def             agent.Definition
-	messages        []agui.Message
-	gateway         *Gateway
-	tools           []model.ToolSpec
-	frontend        map[string]bool
-	visible         map[string]bool
-	subagents       map[string]agent.EmbeddedSubagent    // by tool name (D22)
-	resources       map[string]map[string]agent.Resource // on-demand skill resources by skill and name (D23)
-	waiting         bool                                 // a delegated call's child run has not ended yet
-	output          *guard.Output                        // the tenant's and the release's output filter (D28)
-	flagged         map[string]bool                      // untrusted content already reported in this turn (D27)
-	fileProps       map[string]map[string]string         // gateway tool -> property -> fileAttachment | fileDelivery (D37)
-	cred            *credential.Token                    // the run's delegated gateway credential, as last loaded or renewed (D38)
-	tickets         *run.FileTickets                     // loaded at the first file-taking call
-	step            int                                  // the model step in progress (D41)
-	salvageN        int                                  // host-initiated calls made while salvaging a file at the step limit
-	lastResult      *mcpclient.CallResult                // the gateway result of the call execute just finished
+	// ctx is the worker's: the claim lives while it does, and every write to the store uses it. callCtx ends when ctx
+	// does and also at the run's deadline and when the owner cancels (D46): every call to the model, a gateway, a remote
+	// agent or the CMI uses it, so that none of them outlives the run, and what must still be written when it ends (the
+	// step, the tool call, the end of the run) can be.
+	ctx        context.Context
+	callCtx    context.Context
+	stopCalls  context.CancelCauseFunc
+	attempts   int           // model requests made in the step in progress, retries and fallbacks included (D45)
+	askedWait  time.Duration // the longest Retry-After that was refused in the step in progress (D45)
+	askedCap   time.Duration // what the provider that asked it is waited for, at most
+	claim      *run.Claim
+	rc         *run.Context
+	def        agent.Definition
+	messages   []agui.Message
+	gateway    *Gateway
+	tools      []model.ToolSpec
+	frontend   map[string]bool
+	visible    map[string]bool
+	subagents  map[string]agent.EmbeddedSubagent    // by tool name (D22)
+	resources  map[string]map[string]agent.Resource // on-demand skill resources by skill and name (D23)
+	waiting    bool                                 // a delegated call's child run has not ended yet
+	output     *guard.Output                        // the tenant's and the release's output filter (D28)
+	flagged    map[string]bool                      // untrusted content already reported in this turn (D27)
+	fileProps  map[string]map[string]string         // gateway tool -> property -> fileAttachment | fileDelivery (D37)
+	cred       *credential.Token                    // the run's delegated gateway credential, as last loaded or renewed (D38)
+	tickets    *run.FileTickets                     // loaded at the first file-taking call
+	step       int                                  // the model step in progress (D41)
+	salvageN   int                                  // host-initiated calls made while salvaging a file at the step limit
+	lastResult *mcpclient.CallResult                // the gateway result of the call execute just finished
 }
 
 // Formats a gateway tool's input schema gives a property that takes a member's file (D37): the model writes
@@ -206,7 +225,7 @@ func (h *Harness) Run(ctx context.Context, c *run.Claim) error {
 	}
 	if run.Overdue(rc.Run.DeadlineAt, h.Now()) {
 		// D35: a run claimed after its deadline does nothing more, not even a call its owner confirmed
-		return h.fail(ctx, c, run.FailTimeout, "the run exceeded its time limit")
+		return h.fail(ctx, c, run.FailTimeout, timeoutMessage)
 	}
 	t := &turn{h: h, ctx: ctx, claim: c, rc: rc, def: rc.Release.Effective(), messages: rc.Messages, frontend: map[string]bool{}, visible: map[string]bool{},
 		subagents: map[string]agent.EmbeddedSubagent{}, resources: rc.Release.OnDemandResources()}
@@ -226,6 +245,7 @@ func (h *Harness) Run(ctx context.Context, c *run.Claim) error {
 		t.def.Model.MaxOutputTokens = m
 	}
 	t.flagged = map[string]bool{}
+	defer t.watch()()
 	out, err := guard.NewOutput(rc.BlockedPatterns, t.def.Guards.Output.Patterns, t.def.Guards.Output.Redact)
 	if err != nil {
 		return h.fail(ctx, c, run.FailInternal, "output guard: "+err.Error())
@@ -240,6 +260,11 @@ func (h *Harness) Run(ctx context.Context, c *run.Claim) error {
 			return h.Store.Finish(ctx, c, run.StatusAwaitingInput, "", "", nil) // nothing changed; keep waiting
 		}
 	}
+	return t.settle(t.proceed())
+}
+
+// proceed prepares the tools, resolves the decided calls and runs the loop.
+func (t *turn) proceed() error {
 	if err := t.prepareTools(); err != nil {
 		return err
 	}
@@ -247,9 +272,113 @@ func (h *Harness) Run(ctx context.Context, c *run.Claim) error {
 		return err
 	}
 	if t.waiting {
-		return h.Store.Finish(ctx, c, run.StatusAwaitingSubagent, "", "", nil)
+		return t.h.Store.Finish(t.ctx, t.claim, run.StatusAwaitingSubagent, "", "", nil)
 	}
 	return t.loop()
+}
+
+const timeoutMessage = "the run exceeded its time limit"
+
+// Why the calls of a run in progress were cut short (D46): the causes of t.callCtx.
+var (
+	errDeadline        = errors.New("the run's deadline passed")
+	errCancelRequested = errors.New("the owner asked to cancel the run")
+	// errInterrupted is what a step of the turn returns once it has recorded what it had to (the step's row, the call's
+	// state) after t.callCtx ended; settle turns it into the end of the run.
+	errInterrupted = errors.New("a call in progress was cut short")
+)
+
+// watch gives the turn its call context and returns the function that stops watching (D46). The context ends at the
+// run's deadline (D35: a run that exceeded its time limit does nothing more, so nothing in progress may go on) and when
+// the store says the owner asked to cancel: the store is asked every CancelPoll, because the worker's heartbeat comes
+// only every third of the lease (10 s by default) and a cancel should be seen within about a second. A claim the store
+// no longer honours ends it too: the next write would be refused anyway.
+func (t *turn) watch() func() {
+	t.callCtx, t.stopCalls = context.WithCancelCause(t.ctx)
+	done := make(chan struct{})
+	var timer *time.Timer
+	if d := t.rc.Run.DeadlineAt; !d.IsZero() {
+		timer = time.AfterFunc(d.Sub(t.h.Now()), func() { t.stopCalls(errDeadline) })
+	}
+	go func() {
+		tick := time.NewTicker(t.h.CancelPoll)
+		defer tick.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.callCtx.Done():
+				return
+			case <-tick.C:
+				switch requested, err := t.h.Store.CancelRequested(t.ctx, t.claim); {
+				case errors.Is(err, run.ErrFenced):
+					t.stopCalls(run.ErrFenced)
+				case err != nil:
+					t.h.Log.Warn("cancel check failed", "run", t.claim.RunID, "error", err)
+				case requested:
+					t.stopCalls(errCancelRequested)
+				}
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		if timer != nil {
+			timer.Stop()
+		}
+		t.stopCalls(nil)
+	}
+}
+
+// settle ends the run as the cause of an interrupted call says: failed RUN_TIMEOUT as the deadline check of the loop does
+// (D35), canceled as the check at the start of a step does, and for a lost claim or a stopped worker nothing more
+// is written (run.ErrFenced, as before).
+func (t *turn) settle(err error) error {
+	if !errors.Is(err, errInterrupted) {
+		return err
+	}
+	switch cause := context.Cause(t.callCtx); {
+	case errors.Is(cause, errDeadline):
+		return t.h.fail(t.ctx, t.claim, run.FailTimeout, timeoutMessage)
+	case errors.Is(cause, errCancelRequested):
+		return t.canceled()
+	}
+	return run.ErrFenced
+}
+
+// ours reports whether the call context ended because of the deadline or a cancel, as opposed to the claim being lost
+// or the worker stopping: only then is there something to record, and the store still honours the claim.
+func (t *turn) ours() bool {
+	cause := context.Cause(t.callCtx)
+	return errors.Is(cause, errDeadline) || errors.Is(cause, errCancelRequested)
+}
+
+// interruptCode is the error code of the step a call cut short ends (D46): deadline or canceled.
+func (t *turn) interruptCode() string {
+	if errors.Is(context.Cause(t.callCtx), errDeadline) {
+		return "deadline"
+	}
+	return "canceled"
+}
+
+// interruptedCall records the tool call that was running when t.callCtx ended as FAILED with a message that says it was
+// interrupted (D46): the thread keeps the assistant message's tool calls answered, so that a later run on it is not
+// refused by the provider, and whoever reads the call knows the gateway may or may not have done it. It always returns
+// errInterrupted; tc is nil for a call that has no record (listing the tools, renewing a credential).
+func (t *turn) interruptedCall(tc *run.ToolCall) error {
+	if tc != nil && t.ours() {
+		if err := t.answer(*tc, run.CallFailed, "", "interrupted: "+t.interruptReason()+" while this call was running; the tool may or may not have completed it"); err != nil {
+			return err
+		}
+	}
+	return errInterrupted
+}
+
+func (t *turn) interruptReason() string {
+	if errors.Is(context.Cause(t.callCtx), errDeadline) {
+		return "the run's time limit passed"
+	}
+	return "the owner canceled the run"
 }
 
 func (h *Harness) fail(ctx context.Context, c *run.Claim, code, msg string) error {
@@ -275,16 +404,22 @@ func (t *turn) prepareTools() error {
 		if err != nil {
 			return t.credentialFailure(nil, err)
 		}
-		lctx, cancel := context.WithTimeout(t.ctx, h.ToolTimeout)
+		lctx, cancel := context.WithTimeout(t.callCtx, h.ToolTimeout)
 		tools, err := gw.Client.ListTools(lctx, gw.Endpoint, bearer)
 		cancel()
+		if err != nil && t.callCtx.Err() != nil {
+			return errInterrupted
+		}
 		if mcpclient.Unauthorized(err) { // D38: renewed once; a credential the gateway still refuses ends the run
 			if bearer, err = t.gatewayBearer(true); err != nil {
 				return t.credentialFailure(nil, err)
 			}
-			lctx, cancel := context.WithTimeout(t.ctx, h.ToolTimeout)
+			lctx, cancel := context.WithTimeout(t.callCtx, h.ToolTimeout)
 			tools, err = gw.Client.ListTools(lctx, gw.Endpoint, bearer)
 			cancel()
+			if err != nil && t.callCtx.Err() != nil {
+				return errInterrupted
+			}
 			if mcpclient.Unauthorized(err) {
 				return t.credentialFailure(nil, refusedCredential())
 			}
@@ -473,9 +608,12 @@ func (t *turn) gatewayBearer(force bool) (string, error) {
 		return "", &run.Failure{Code: run.FailCredential, Message: "the delegated credential expired at " + t.cred.ExpiresAt.UTC().Format(time.RFC3339) +
 			" and cannot be renewed: send the request again"}
 	}
-	rctx, cancel := context.WithTimeout(t.ctx, 15*time.Second)
+	rctx, cancel := context.WithTimeout(t.callCtx, 15*time.Second)
 	tok, err := gw.Refresh(rctx, t.cred.RefreshToken)
 	cancel()
+	if err != nil && t.callCtx.Err() != nil {
+		return "", errInterrupted
+	}
 	if err != nil {
 		if errors.Is(err, credential.ErrSessionEnded) {
 			return "", &run.Failure{Code: run.FailCredential, Message: "the user's session has ended (signed out, idle too long or at its maximum length), " +
@@ -632,7 +770,7 @@ func (t *turn) delegate(tc run.ToolCall) error {
 		if err := t.h.Store.UpdateToolCall(t.ctx, t.claim, tc.ID, run.CallExecuting, "", false, []agui.Event{agui.Custom(agui.CustomSubagentStarted, map[string]any{"toolCallId": tc.ID, "agent": sub.Name, "remote": sub.A2A.CardURL})}); err != nil {
 			return err
 		}
-		cctx, cancel := context.WithTimeout(t.ctx, a2a.Deadline(t.h.Now(), t.rc.Run.DeadlineAt))
+		cctx, cancel := context.WithTimeout(t.callCtx, a2a.Deadline(t.h.Now(), t.rc.Run.DeadlineAt))
 		start := t.h.Now()
 		res, err := t.h.A2A.Send(cctx, sub.A2A.CardURL, run.ChildRunID(t.rc.Run.ID, tc.ID), "m_"+tc.ID, args.Input)
 		cancel()
@@ -644,8 +782,8 @@ func (t *turn) delegate(tc run.ToolCall) error {
 			t.h.Metrics.ToolCall("a2a:"+sub.Name, outcome, t.h.Now().Sub(start))
 		}
 		if err != nil {
-			if t.ctx.Err() != nil {
-				return run.ErrFenced
+			if t.callCtx.Err() != nil {
+				return t.interruptedCall(&tc)
 			}
 			return t.answer(tc, run.CallFailed, "", "remote agent "+sub.Name+": "+sanitize(err))
 		}
@@ -725,22 +863,33 @@ func (t *turn) execute(tc run.ToolCall) (bool, error) {
 		return false, err
 	}
 	bearer, err := t.gatewayBearer(false)
+	if errors.Is(err, errInterrupted) {
+		return false, t.interruptedCall(&tc)
+	}
 	if err != nil {
 		return false, t.credentialFailure(&tc, err)
 	}
 	start := h.Now()
-	cctx, cancel := context.WithTimeout(t.ctx, h.ToolTimeout)
+	cctx, cancel := context.WithTimeout(t.callCtx, h.ToolTimeout)
 	res, err := t.gateway.Client.CallTool(cctx, t.gateway.Endpoint, bearer, tc.Tool, args)
 	cancel()
+	if err != nil && t.callCtx.Err() != nil {
+		return false, t.interruptedCall(&tc) // D46: the deadline or a cancel reached the call
+	}
 	if mcpclient.Unauthorized(err) {
 		// D38: the gateway refused the credential before it reached the tool, so the call is made again once with a
 		// renewed one; a refusal after that ends the run instead of handing the model an error it cannot fix
-		if bearer, err = t.gatewayBearer(true); err != nil {
+		if bearer, err = t.gatewayBearer(true); errors.Is(err, errInterrupted) {
+			return false, t.interruptedCall(&tc)
+		} else if err != nil {
 			return false, t.credentialFailure(&tc, err)
 		}
-		cctx, cancel := context.WithTimeout(t.ctx, h.ToolTimeout)
+		cctx, cancel := context.WithTimeout(t.callCtx, h.ToolTimeout)
 		res, err = t.gateway.Client.CallTool(cctx, t.gateway.Endpoint, bearer, tc.Tool, args)
 		cancel()
+		if err != nil && t.callCtx.Err() != nil {
+			return false, t.interruptedCall(&tc)
+		}
 		if mcpclient.Unauthorized(err) {
 			return false, t.credentialFailure(&tc, refusedCredential())
 		}
@@ -836,6 +985,13 @@ func (s *streamer) flushLocked() {
 	}
 }
 
+// streamed reports whether any text was received: from then on the attempt cannot be replaced by another (D45).
+func (s *streamer) streamed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.full.Len() > 0
+}
+
 func (s *streamer) finish() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -848,7 +1004,7 @@ func (t *turn) loop() error {
 	h := t.h
 	for {
 		if run.Overdue(t.rc.Run.DeadlineAt, h.Now()) {
-			return h.fail(t.ctx, t.claim, run.FailTimeout, "the run exceeded its time limit")
+			return h.fail(t.ctx, t.claim, run.FailTimeout, timeoutMessage)
 		}
 		primary := t.def.Model
 		step, cancelRequested, err := h.Store.StartStep(t.ctx, t.claim, t.def.Limits.MaxSteps, t.def.Limits.MaxTokensPerRun, primary.Provider, primary.Model)
@@ -879,6 +1035,17 @@ func (t *turn) loop() error {
 		}
 		resp, st, err := t.callModel(step)
 		if err != nil {
+			if errors.Is(err, errInterrupted) {
+				// D46: the deadline or a cancel cut the call short; the step's row says which, and the run ends as
+				// the cause says (settle). A lost claim or a stopped worker writes nothing.
+				if t.ours() {
+					_ = h.Store.FinishStep(t.ctx, t.claim, st, nil)
+					if h.Metrics != nil {
+						h.Metrics.StepFinished(st.Provider, st.Model, st.ErrorCode, st.Latency, model.Usage{})
+					}
+				}
+				return err
+			}
 			if errors.Is(err, run.ErrFenced) || t.ctx.Err() != nil {
 				return run.ErrFenced
 			}
@@ -896,11 +1063,40 @@ func (t *turn) loop() error {
 				h.Metrics.StepFinished(st.Provider, st.Model, "error", st.Latency, model.Usage{})
 			}
 			message := "model call failed: " + st.ErrorCode
+			if t.askedWait > 0 {
+				message += fmt.Sprintf(": the provider asked to wait %d seconds before the next request, longer than the %d seconds this host waits",
+					int(t.askedWait.Round(time.Second)/time.Second), int(t.askedCap/time.Second))
+			}
 			if st.ErrorCode == model.CodeContextLength {
 				// D40: the thread itself is what does not fit, so the same request would be refused again
 				message = "the conversation no longer fits the model's context window; start a new conversation, or ask for less at a time"
 			}
 			return h.fail(t.ctx, t.claim, run.FailModel, message)
+		}
+		if t.callCtx.Err() == nil {
+			// D46: a cancel the owner asked for before the answer is stored wins over it; asked after, it comes too late
+			// and the run completes. The poll is made here, besides the watcher's, so that an answer that arrives
+			// within a poll interval of the cancel does not hide it.
+			if requested, cerr := h.Store.CancelRequested(t.ctx, t.claim); errors.Is(cerr, run.ErrFenced) {
+				return cerr
+			} else if cerr == nil && requested {
+				t.stopCalls(errCancelRequested)
+			}
+		}
+		if t.callCtx.Err() != nil {
+			st.ErrorCode = t.interruptCode()
+			if t.ours() {
+				if resp.Message.Content != "" { // its text was streamed: close it, it is not stored
+					if aerr := h.Store.AppendEvents(t.ctx, t.claim, []agui.Event{agui.TextMessageEnd(resp.Message.ID)}); aerr != nil {
+						return aerr
+					}
+				}
+				_ = h.Store.FinishStep(t.ctx, t.claim, st, nil)
+				if h.Metrics != nil {
+					h.Metrics.StepFinished(st.Provider, st.Model, st.ErrorCode, st.Latency, resp.Usage)
+				}
+			}
+			return t.settle(errInterrupted)
 		}
 		if h.Metrics != nil {
 			h.Metrics.StepFinished(st.Provider, st.Model, st.StopReason, st.Latency, resp.Usage)
@@ -913,7 +1109,7 @@ func (t *turn) loop() error {
 			events = append(events, agui.ToolCallStart(call.ID, call.Function.Name, resp.Message.ID), agui.ToolCallArgs(call.ID, call.Function.Arguments), agui.ToolCallEnd(call.ID))
 		}
 		events = append(events, agui.Custom(agui.CustomUsage, map[string]any{"step": step, "provider": st.Provider, "model": st.Model,
-			"promptTokens": resp.Usage.PromptTokens, "completionTokens": resp.Usage.CompletionTokens, "latencyMs": st.Latency.Milliseconds()}),
+			"promptTokens": resp.Usage.PromptTokens, "completionTokens": resp.Usage.CompletionTokens, "latencyMs": st.Latency.Milliseconds(), "attempts": t.attempts}),
 			agui.StepFinished(run.StepName(step)))
 		if err := h.Store.FinishStep(t.ctx, t.claim, st, nil); err != nil {
 			return err
@@ -1062,7 +1258,9 @@ func (t *turn) callModel(step int) (*model.Response, run.Step, error) {
 		}
 	}
 	st.Provider, st.Model = refs[0].Provider, refs[0].Model
+	t.attempts, t.askedWait, t.askedCap = 0, 0, 0
 	var lastErr error
+candidates:
 	for i, ref := range refs {
 		p, ok := h.Providers.Get(ref.Provider)
 		if !ok {
@@ -1070,51 +1268,96 @@ func (t *turn) callModel(step int) (*model.Response, run.Step, error) {
 			continue
 		}
 		st.Provider, st.Model = ref.Provider, ref.Model
-		msgID := h.NewMessageID()
-		mctx, cancel := context.WithCancel(t.ctx)
-		s := &streamer{t: t, msgID: msgID, last: h.Now(), cancel: cancel, out: t.output, strict: t.def.Guards.Output.Strict}
-		start := h.Now()
-		resp, err := p.Complete(mctx, model.Request{Model: ref.Model, Instructions: t.def.Instructions, Messages: msgs, Tools: tools,
-			Temperature: t.def.Model.Temperature, MaxOutputTokens: t.def.Model.MaxOutputTokens}, s.delta)
-		cancel()
-		st.Latency = h.Now().Sub(start)
-		h.Router.Observe(ref, st.Latency, err != nil && s.blocked == "")
-		if ferr := s.finish(); ferr != nil {
-			return nil, st, ferr // fenced while streaming
-		}
-		if s.blocked != "" {
-			st.ErrorCode = "guard_blocked"
-			return nil, st, &guardBlock{rule: s.blocked, detail: "the output matched a blocked pattern while streaming"}
-		}
-		if err == nil {
-			resp.Message.ID = msgID
-			st.PromptTokens, st.CompletionTokens, st.StopReason = resp.Usage.PromptTokens, resp.Usage.CompletionTokens, resp.StopReason
-			if gerr := t.guardOutput(resp); gerr != nil {
-				st.ErrorCode = "guard_blocked"
-				return nil, st, gerr
+		policy := h.retryPolicy(ref.Provider)
+		for attempt := 1; ; attempt++ {
+			t.attempts++
+			msgID := h.NewMessageID()
+			mctx, cancel := context.WithCancel(t.callCtx)
+			s := &streamer{t: t, msgID: msgID, last: h.Now(), cancel: cancel, out: t.output, strict: t.def.Guards.Output.Strict}
+			start := h.Now()
+			resp, err := p.Complete(mctx, model.Request{Model: ref.Model, Instructions: t.def.Instructions, Messages: msgs, Tools: tools,
+				Temperature: t.def.Model.Temperature, MaxOutputTokens: t.def.Model.MaxOutputTokens}, s.delta)
+			cancel()
+			st.Latency = h.Now().Sub(start)
+			cut := t.callCtx.Err() != nil // the deadline, a cancel or a stopped worker ended the call (D46)
+			h.Router.Observe(ref, st.Latency, err != nil && s.blocked == "" && !cut)
+			if ferr := s.finish(); ferr != nil {
+				return nil, st, ferr // fenced while streaming
 			}
-			if resp.Message.Content != "" && !s.started { // non-streaming provider or strict mode: emit the text now
-				if err := h.Store.AppendEvents(t.ctx, t.claim, []agui.Event{agui.TextMessageStart(msgID, agui.RoleAssistant), agui.TextMessageContent(msgID, resp.Message.Content)}); err != nil {
-					return nil, st, err
+			if s.blocked != "" {
+				st.ErrorCode = "guard_blocked"
+				return nil, st, &guardBlock{rule: s.blocked, detail: "the output matched a blocked pattern while streaming"}
+			}
+			if err == nil {
+				resp.Message.ID = msgID
+				st.ErrorCode = "" // an earlier attempt or candidate failed (D45); the step did not
+				st.PromptTokens, st.CompletionTokens, st.StopReason = resp.Usage.PromptTokens, resp.Usage.CompletionTokens, resp.StopReason
+				if gerr := t.guardOutput(resp); gerr != nil {
+					st.ErrorCode = "guard_blocked"
+					if errors.Is(gerr, errInterrupted) {
+						st.ErrorCode = t.interruptCode()
+						if t.ours() && s.started && resp.Message.Content != "" {
+							if aerr := h.Store.AppendEvents(t.ctx, t.claim, []agui.Event{agui.TextMessageEnd(msgID)}); aerr != nil {
+								return nil, st, aerr
+							}
+						}
+					}
+					return nil, st, gerr
+				}
+				if resp.Message.Content != "" && !s.started { // non-streaming provider or strict mode: emit the text now
+					if err := h.Store.AppendEvents(t.ctx, t.claim, []agui.Event{agui.TextMessageStart(msgID, agui.RoleAssistant), agui.TextMessageContent(msgID, resp.Message.Content)}); err != nil {
+						return nil, st, err
+					}
+				}
+				return resp, st, nil
+			}
+			// the attempt failed: the text it streamed, if any, is closed so that a client following the stream
+			// reads a well formed message, whatever happens next
+			if s.started {
+				if aerr := h.Store.AppendEvents(t.ctx, t.claim, []agui.Event{agui.TextMessageEnd(msgID)}); aerr != nil {
+					return nil, st, aerr
 				}
 			}
-			return resp, st, nil
-		}
-		lastErr = err
-		var me *model.Error
-		if errors.As(err, &me) {
-			st.ErrorCode = me.Code
-			if me.Code == "status" {
-				st.ErrorCode = fmt.Sprintf("status_%d", me.Status)
+			if cut {
+				st.ErrorCode = t.interruptCode()
+				return nil, st, errInterrupted
 			}
+			lastErr = err
+			var me *model.Error
+			if !errors.As(err, &me) {
+				st.ErrorCode = "error"
+				break
+			}
+			st.ErrorCode = errorCode(me)
 			if me.Code == "canceled" {
 				return nil, st, err
 			}
 			if !me.Retryable && me.Code != "transport" {
+				break candidates
+			}
+			// D45: the same candidate is asked again, after a wait, when the error is one that passes and nothing of the
+			// answer has been streamed: text already written to the event log cannot be taken back, so an attempt that
+			// failed after its first text delta is not repeated (the next candidate may still be tried, as before).
+			if !me.Retryable || s.streamed() || attempt >= policy.Attempts {
 				break
 			}
-		} else {
-			st.ErrorCode = "error"
+			wait, ok := policy.Wait(attempt, me.RetryAfter)
+			if !ok {
+				t.askedWait, t.askedCap = me.RetryAfter, policy.WithDefaults().MaxRetryAfter
+				h.Log.Warn("model provider asked to wait longer than this host does", "provider", ref.Provider, "retryAfter", me.RetryAfter)
+				break
+			}
+			if d := t.rc.Run.DeadlineAt; !d.IsZero() && i < len(refs)-1 && !h.Now().Add(wait).Before(d) {
+				break // the wait would outlive the run: the next candidate is asked now (with none left, the deadline ends the wait)
+			}
+			if err := h.Store.AppendEvents(t.ctx, t.claim, []agui.Event{agui.Custom(agui.CustomModelRetry, map[string]any{"step": step, "provider": ref.Provider, "model": ref.Model,
+				"attempt": attempt, "of": policy.Attempts, "code": st.ErrorCode, "waitMs": wait.Milliseconds(), "retryAfterMs": me.RetryAfter.Milliseconds()})}); err != nil {
+				return nil, st, err
+			}
+			if !t.sleep(wait) {
+				st.ErrorCode = t.interruptCode()
+				return nil, st, errInterrupted
+			}
 		}
 		if i < len(refs)-1 {
 			h.Log.Warn("model provider failed, trying fallback", "provider", ref.Provider, "code", st.ErrorCode)
@@ -1124,6 +1367,34 @@ func (t *turn) callModel(step int) (*model.Response, run.Step, error) {
 		st.ErrorCode = "error"
 	}
 	return nil, st, lastErr
+}
+
+// errorCode is the step's error code of a provider error.
+func errorCode(me *model.Error) string {
+	switch {
+	case me.Code == "status":
+		return fmt.Sprintf("status_%d", me.Status)
+	case me.Idle:
+		return "idle_timeout" // D46
+	}
+	return me.Code
+}
+
+// retryPolicy is the retry policy toward the provider (D45).
+func (h *Harness) retryPolicy(provider string) model.RetryPolicy {
+	return h.Retry[provider].WithDefaults()
+}
+
+// sleep waits for d and reports whether it did: false when the deadline, a cancel or the worker's end came first (D46).
+func (t *turn) sleep(d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-t.callCtx.Done():
+		return false
+	}
 }
 
 // dispatch classifies the step's tool calls, executes the automatic ones and decides how the turn
@@ -1178,7 +1449,7 @@ func (t *turn) dispatch(step int, msg agui.Message) (string, error) {
 		return "", err
 	}
 	frontend := false
-	for _, tc := range records {
+	for i, tc := range records {
 		switch tc.State {
 		case run.CallDenied:
 			reason := "tool not available to this agent"
@@ -1192,6 +1463,9 @@ func (t *turn) dispatch(step int, msg agui.Message) (string, error) {
 			}
 		case run.CallConfirmed:
 			if _, err := t.execute(tc); err != nil {
+				if errors.Is(err, errInterrupted) {
+					err = t.abandon(records, i)
+				}
 				return "", err
 			}
 		case run.CallFrontend:
@@ -1215,6 +1489,28 @@ func (t *turn) dispatch(step int, msg agui.Message) (string, error) {
 		return run.StatusAwaitingSubagent, nil
 	}
 	return "", nil
+}
+
+// abandon answers the calls of the step that come after the one the deadline or a cancel interrupted (D46): they will not
+// run, and the thread must not keep an assistant message whose tool calls nothing answers. A call waiting for the
+// member's confirmation is left as it is, as it is when a run is canceled while it waits. It returns errInterrupted.
+func (t *turn) abandon(records []run.ToolCall, after int) error {
+	if !t.ours() {
+		return errInterrupted
+	}
+	for _, tc := range records[after+1:] {
+		var err error
+		switch tc.State {
+		case run.CallConfirmed:
+			err = t.answer(tc, run.CallFailed, "", "not run: "+t.interruptReason()+" before this call started")
+		case run.CallDenied:
+			err = t.answer(tc, run.CallDenied, "", "not run: the run ended before this call was handled")
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return errInterrupted
 }
 
 // externalToolPatterns are the gateways' external-tool patterns by gateway name, for the store to judge a child's release.
@@ -1413,9 +1709,12 @@ func (t *turn) guardOutput(resp *model.Response) error {
 	if c == nil {
 		err = fmt.Errorf("%w: classifier %s is not configured on this host", guard.ErrClassifier, og.Classifier)
 	} else {
-		cctx, cancel := context.WithTimeout(t.ctx, t.h.ToolTimeout)
+		cctx, cancel := context.WithTimeout(t.callCtx, t.h.ToolTimeout)
 		verdict, err = c.Classify(cctx, resp.Message.Content)
 		cancel()
+	}
+	if err != nil && t.callCtx.Err() != nil {
+		return errInterrupted
 	}
 	if err != nil {
 		t.guardMetric("output", "classifier_error")
@@ -1453,11 +1752,14 @@ func (t *turn) verifyContext() (bool, error) {
 	if pkgID == "" || t.h.CMI == nil || t.contextVerified {
 		return false, nil
 	}
-	key := t.h.cmiKey(t.ctx)
+	key := t.h.cmiKey(t.callCtx)
 	if key == "" {
 		return false, nil
 	}
-	v, err := t.h.CMI.Verify(t.ctx, key, pkgID)
+	v, err := t.h.CMI.Verify(t.callCtx, key, pkgID)
+	if err != nil && t.callCtx.Err() != nil {
+		return true, errInterrupted
+	}
 	if err != nil {
 		t.contextVerified = true // once per run; the CMI is not asked again
 		return false, t.h.Store.AppendEvents(t.ctx, t.claim, []agui.Event{agui.Custom(agui.CustomContextStale, map[string]any{"packageId": pkgID, "verified": false, "reason": sanitize(err)})})
@@ -1492,7 +1794,11 @@ func (t *turn) verifyContext() (bool, error) {
 				Kind string `json:"kind"`
 				ID   string `json:"id,omitempty"`
 			}{Kind: "thread", ID: t.rc.Run.ThreadID}
-			if pkg, err := t.h.CMI.Resolve(t.ctx, key, req); err == nil {
+			pkg, err := t.h.CMI.Resolve(t.callCtx, key, req)
+			if err != nil && t.callCtx.Err() != nil {
+				return true, errInterrupted
+			}
+			if err == nil {
 				kept := t.rc.Run.Input.Context[:0:0]
 				for _, c := range t.rc.Run.Input.Context {
 					if !strings.HasPrefix(c.Description, "CMI ") && c.Description != cmiclient.ContextCMIWithheld {

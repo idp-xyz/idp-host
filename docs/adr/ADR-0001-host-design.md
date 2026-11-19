@@ -26,7 +26,7 @@
 |---|---|---|
 | D1 | **HOST 是 MCP Infrastructure 的 MCP 客户端，不内建工具**：工具目录 = 网关对该调用者的 `tools/list`；参数校验、授权、调用审计、漂移封锁都由网关负责。HOST 只做两件事：按 AgentRelease 的允许列表取子集，按确认策略决定是否先问用户 | 文档：HOST / EER → MCP Infrastructure 用标准 MCP；idp-mcp 已经把钉住目录、按主体授权、参数校验、azp/act 审计做完了，HOST 再做一套就是两套 |
 | D2 | **AgentRelease：不可变、内容寻址的 Agent 定义发布**。AgentDefinition 是可编辑的草稿；发布时把它编译成规范化 JSON + SHA-256 的 Release（`idp.host.agent/v1`），审批人不能是创建人（四眼），一个 agent 同一时刻只有一个 current release。Release 内容：指令（system prompt）、模型配置（provider、model、参数、回退列表）、工具允许列表（网关暴露名或 `*`）、确认策略（默认 `auto` / `confirm`，按工具覆盖）、限制（每 Run 最大步数、每步最大工具调用数、输出 token 上限、Run 超时）。每个 Run 记录它运行的 release 摘要 | agent 的行为由模型、提示词、工具目录和策略共同决定，它们必须一起成为发布件，否则无法复现和回滚；和 idp-mcp 的 Release 同一纪律 |
-| D3 | **AgentRun 是持久化状态机，每个 Run 一条追加式事件日志**：`queued → running → (awaiting_input ⇄ running)* → completed | failed | canceled`；每次迁移一个数据库事务；事件按 Run 内 `seq` 单调编号，游标可续。Worker 以租约 + 心跳 + fencing epoch 认领（`SELECT … FOR UPDATE SKIP LOCKED`），租约过期可被重领，旧 Worker 的提交被拒。模型调用不是事务：重领后重跑模型可能重复花费，但不会重复工具调用（工具调用先落库再执行，执行结果落库前该步不算完成） | 可续跑、可审计、多副本安全；这是 PoC 验证过的骨架 |
+| D3 | **AgentRun 是持久化状态机，每个 Run 一条追加式事件日志**：`queued → running → (awaiting_input ⇄ running)* → completed | failed | canceled`；每次迁移一个数据库事务；事件按 Run 内 `seq` 单调编号，游标可续。Worker 以租约 + 心跳 + fencing epoch 认领（`SELECT … FOR UPDATE SKIP LOCKED`），租约过期可被重领，旧 Worker 的提交被拒（D46 修订：运行的期限与取消到达进行中的调用，不再只在步与步之间检查）。模型调用不是事务：重领后重跑模型可能重复花费，但不会重复工具调用（工具调用先落库再执行，执行结果落库前该步不算完成） | 可续跑、可审计、多副本安全；这是 PoC 验证过的骨架 |
 | D4 | **Harness 是接口，M1 实现为进程内 Go 循环**：一步 = 组装上下文（release 指令 + 线程消息 + 调用方给的 context）→ 调模型（流式）→ 若有工具调用：逐个过允许列表与确认策略 → 执行（经网关）或等待确认 → 下一步。每一步、每个工具调用、每个模型用量都是事件。SDK 形态的 harness（OpenAI Agents SDK、Claude Agent SDK）以后作为另一个实现接入，M1 不做 | 我们要的恰恰是 SDK 循环所隐藏的东西；接口留着，不堵死 |
 | D5 | **事件日志是流的唯一来源**：模型的文本增量也落库（按 50 ms 或 32 个增量合并一行），SSE 从事件表读，游标 = 事件 id，`Last-Event-ID` 续传；任何副本都能服务任何 Run 的流 | 多副本下 API 副本和 Worker 副本不一定是同一个；"重放"与"实时"用同一条路，不会有两种真相 |
 | D6 | **AG-UI 是 Workspace ↔ HOST 的协议**：`POST /ag-ui/agents/{agentId}` 收 RunAgentInput、回 AG-UI 事件的 SSE（`RUN_STARTED … RUN_FINISHED / RUN_ERROR`，`TEXT_MESSAGE_*`、`TOOL_CALL_*`、`TOOL_CALL_RESULT`、`STEP_*`、`CUSTOM`）；REST（`/v1/...`）管理 agent、release、session、thread、run、确认，`GET /v1/runs/{id}/events` 是同一事件流的续传入口。线程消息的内部形态就采用 AG-UI 的 Message（`id`、`role`、`content`、`toolCalls`、`toolCallId`），适配器负责与各厂商格式互转。RunAgentInput 里的 `tools` 是**前端工具**：HOST 从不执行它们，模型调用了就发 `TOOL_CALL_*` 然后结束本次 Run，结果由下一次 Run 的 `tool` 消息带回；`state` HOST 不持有，原样忽略 | 文档指定 AG-UI / Agent API；自造格式会让 Workspace 适配一次性的东西 |
@@ -267,7 +267,7 @@ D32 让运行"读"CMI；没有"写"，线程之外的后续运行就记不住这
 
 | # | 决策 | 理由 |
 |---|---|---|
-| D35 | **运行期限之后不再执行任何东西，确认请求最迟随运行期限过期**（修订 D7）：(1) 确认请求的过期时间取"请求时刻 + `confirmationTimeoutSeconds`"与运行期限中较早的一个，`tool_calls.confirmation_expires_at`、`CUSTOM idp.host/confirmation.required` 与 `RUN_FINISHED` 中断里的 `expiresAt` 都是这个值；(2) Worker 在期限之后认领运行时，直接以 `RUN_TIMEOUT` 失败：不执行已确认的调用（它保持 CONFIRMED、没有结果），也不调网关和模型；(3) 期限之后的确认或拒绝得到 409 `the run exceeded its time limit`，不记录任何东西，请求由过期清理（每 5 秒）收尾，运行随即以 `RUN_TIMEOUT` 结束。确认时限短于运行剩余时间时行为不变：请求过期后运行继续，模型收到"确认请求已过期" | 期限是运行的边界：过了期限运行只能失败，这时再执行工具只留下副作用，而需要确认的工具往往正是有副作用的那些。过期时间封顶后，中断给出的就是真正有效的截止时间（Workspace 收件箱据此显示过期时间），超期的运行在期限后几秒内结束，不再挂到确认超时。不改契约：字段与形状不变，只是取值不晚于期限 |
+| D35 | **运行期限之后不再执行任何东西，确认请求最迟随运行期限过期**（修订 D7）：(1) 确认请求的过期时间取"请求时刻 + `confirmationTimeoutSeconds`"与运行期限中较早的一个，`tool_calls.confirmation_expires_at`、`CUSTOM idp.host/confirmation.required` 与 `RUN_FINISHED` 中断里的 `expiresAt` 都是这个值；(2) Worker 在期限之后认领运行时，直接以 `RUN_TIMEOUT` 失败：不执行已确认的调用（它保持 CONFIRMED、没有结果），也不调网关和模型；(3) 期限之后的确认或拒绝得到 409 `the run exceeded its time limit`，不记录任何东西，请求由过期清理（每 5 秒）收尾，运行随即以 `RUN_TIMEOUT` 结束。确认时限短于运行剩余时间时行为不变：请求过期后运行继续，模型收到"确认请求已过期" | 期限是运行的边界：过了期限运行只能失败，这时再执行工具只留下副作用，而需要确认的工具往往正是有副作用的那些。过期时间封顶后，中断给出的就是真正有效的截止时间（Workspace 收件箱据此显示过期时间），超期的运行在期限后几秒内结束，不再挂到确认超时。不改契约：字段与形状不变，只是取值不晚于期限。**D46 修订**：期限也截断进行中的模型与工具调用，运行在期限后约一秒内以 `RUN_TIMEOUT` 结束，不必等调用自己返回 |
 
 **取舍与边界**
 - 按缺省值（运行 300 秒、确认 900 秒），确认窗口就是运行 5 分钟里剩下的时间；需要更长等待的发布件应调大 `runTimeoutSeconds`。另一种做法是等待确认的时间不计入运行时限（恢复时顺延期限），那会改变 `runTimeoutSeconds` 与 `deadlineAt` 的含义，本决策不做。
@@ -466,3 +466,86 @@ D37 让成员的文件经票据进出运行：字节不经过模型。但 agent 
 - 平台 compose 与 kind 上的验收（`host.yaml` 的 `externalTools`、`confirmTools`，PATH M、N）不在这一步。
 - 没有界面：被扣下的条数只在事件流与模型的回答里。
 - idp-web 侧的每次运行调用上限做不到（调用者断言里没有运行号），由步数上限兜底（平台 ADR-0003 附录 C 第 2 节第 4 条）。
+
+## 27. D45：模型提供者的可重试错误先重试再换候选，等待不越过运行（2026-11-19 决策与实施）
+
+修订 D29（路由与回退）；与 D46 一起修订 D3。
+
+起因：复现测试 `TestARunSurvivesOneRetryableErrorOfTheOnlyConfiguredModel`（R2）：一个候选模型答了一次 429（`Retry-After: 1`）、503 或断开连接，之后是好的，运行却以 `MODEL_ERROR` 失败，只发过 1 次请求。HOST 对可重试的错误（408、429、5xx、传输失败）原来只做一件事：不等待，立刻换路由里的下一个候选；只配一个模型时，一次 429 就让运行失败，而 `Retry-After` 根本没读。D40、D41 的真实模型运行是在单个本地模型上跑 84 到 120 次模型调用、约半小时一个运行：这样的运行一次抖动就全部作废，抖动的概率随调用次数线性增加。
+
+| # | 决策 | 理由 |
+|---|---|---|
+| D45-1 | **同一个候选先重试，再换下一个。** 每个候选至多 `attempts` 次请求（含第一次，缺省 3）；用完仍失败才走原来的路：下一个候选，或运行以 `MODEL_ERROR` 失败。不可重试的错误（400 等）行为不变；"非可重试的 4xx 使回退循环停止"这一条原有行为不动（见局限） | 重试是对同一个端点的短暂故障的回答，换候选是对它持续故障的回答，两者的代价不同 |
+| D45-2 | **等待：从 1 秒起每次翻倍，封顶 20 秒，带抖动**（取计算值的一半到全部之间的随机值，让同时失败的运行不同时回来）。提供者的 `Retry-After`（秒数或 HTTP 日期）比计算值长时取它，上限 60 秒；**`Retry-After` 超过上限就不在这里等**：有下一个候选就立刻试它，没有就失败，消息写明"提供者要求等待 N 秒，比本机愿意等的 M 秒更长" | 提供者说了多久后再来，比我们猜的准；但一个无限长的等待会把运行（和它占的租约）交给提供者 |
+| D45-3 | **流出了文字就不重试。** 已写进事件日志的文字增量收不回来：一次尝试在第一个文字增量之后失败，不再对同一候选重试（原来的换下一个候选照旧，被放弃的消息补上 `TEXT_MESSAGE_END`，日志保持良构）。只有推理和工具调用片段不写进日志，它们之后、文字之前的失败仍可重试。严格输出模式（`guards.output.strict`）也按"收到过文字"算，不为它另设规则 | 客户端已经读到的文字不能撤回；重试会让同一条回答出现两次或两个版本 |
+| D45-4 | **等待不越过运行。** 等待在运行的 `callCtx` 下进行（D46）：期限到了运行以 `RUN_TIMEOUT` 结束，所有者取消则以 `CANCELED` 结束，都不是等到等待结束。等待会超过期限而还有下一个候选时，不等，直接试下一个 | 期限是硬的（D35） |
+| D45-5 | **每步的请求数有上界且看得见**：上界 = 候选数 × `attempts`。每次等待之前写一条 `idp.host/model.retry {step, provider, model, attempt, of, code, waitMs, retryAfterMs}`；`idp.host/model.usage` 增 `attempts`（这一步一共发了多少次请求）。失败的尝试没有用量、不花 token，**也不占运行的步数**（重试在同一步里，`StartStep` 只调一次）；成功的那一步不再带前面失败的 `error_code`（原来回退成功后行里仍留着前一个候选的错误码） | 运维要能回答"这个运行是不是撞上了抖动"；预算只按真正的模型调用算 |
+| D45-6 | **设置放在 HOST 配置的 provider 条目**（`retry: {attempts 1..10, backoffSeconds, maxBackoffSeconds, maxRetryAfterSeconds}`），缺省不用配；加载时校验范围，写错的键名照旧被 `KnownFields` 拒绝。不放进发布件 | 哪个提供者怎样限流，是运维知道的事；放进发布件，作者就能给自己的 agent 多烧预算 |
+| D45-7 | **`Retry-After` 从各适配器的 HTTP 响应带到 harness**：`model.Error` 增 `RetryAfter`，由 `model.ClassifyHTTP` 读（只对可重试的状态）；OpenAI、Anthropic、Gemini 与 harness-worker 四个适配器都改用它。无法解析的值忽略，超过 24 小时的按 24 小时算 | 适配器是唯一看得见响应头的地方 |
+
+**取舍与边界**
+- 缺省 3 次、1 秒起，是"撑过一次短暂故障"的量，不是"等一次长时间故障"的量：长时间故障仍然换候选或失败。要等得更久的运维调 `attempts` 与 `maxBackoffSeconds`。
+- 失败的尝试之后换候选时，路由器的时延观测按每次尝试记，一个反复抖动的候选在 `latency` 策略下会被排到后面，这是想要的。
+- **不可重试的 4xx 使回退循环停止**（主候选答 400，不试后面的候选）：分析里的旁注，不在本决策范围，没有改。它在多候选且各候选对同一请求的接受度不同（例如上下文窗口不同）时会有影响。
+
+**实施**：`internal/model`（`Error.RetryAfter`、`ClassifyHTTP`、`ParseRetryAfter`、`RetryPolicy`）；`adapters/providers/*`；`internal/config`（`Provider.Retry`）；`cmd/idp-host`；`internal/harness`（`callModel` 的两层循环、`Harness.Retry`）；`internal/agui`（`CustomModelRetry`）。契约不变：事件名与事件字段不属于 schema（同 D44）。
+
+**验证**：复现 `TestARunSurvivesOneRetryableErrorOfTheOnlyConfiguredModel` 通过（未改断言）。新增：`TestRequestsToOneCandidateAreBoundedAndEachWaitIsReported`、`TestTheUsageEventSaysHowManyRequestsTheStepMade`、`TestAFailedAttemptConsumesNoStepAndNoTokens`、`TestARetryAfterLongerThanTheBackoffIsWaitedFor`（秒与日期）、`TestARetryAfterBeyondTheCapIsNotWaitedFor`、`TestTheNextCandidateIsTriedAfterTheRetriesOfTheFirstAreUsedUp`、`TestANonRetryableErrorIsNotRetried`、`TestNoRetryAfterTheFirstStreamedDelta`、`TestAFailureAfterReasoningButBeforeTextIsStillRetried`、`TestTextStreamedByAFailedCandidateIsClosedWhenTheNextCandidateAnswers`、`TestTheWaitBetweenAttemptsEndsAtACancel`、`TestTheWaitBetweenAttemptsEndsAtTheDeadline`、`TestAWaitThatWouldOutliveTheDeadlineMovesToTheNextCandidate`；`internal/model` 的 `TestParseRetryAfter`、`TestClassifyHTTPCarriesRetryAfter`、`TestRetryPolicyWait`；四个适配器的 `TestARetryAfterOfTheProviderReachesTheError`；`internal/config` 的 `TestProviderRetryAndIdleSettings`。每个控制手工拿掉一次、看对应测试失败、再恢复（D46 末尾的表）。
+
+**没有做的**：没有对真实模型验证（只用测试替身）；没有熔断（连续失败的提供者仍然每个运行各试各的）；没有按错误类型区分策略（429 与 5xx 同一套）；不可重试 4xx 的回退行为（见上）。
+
+## 28. D46：期限与取消到达进行中的调用（2026-11-19 决策与实施）
+
+修订 D3（运行状态机与租约）、D35（期限之后不再执行任何东西）。
+
+起因：复现测试 `TestARunEndsWithinAFewSecondsOfItsDeadlineWhateverItIsWaitingFor`、`TestACancelledRunEndsWithinAFewSecondsWhateverItIsWaitingFor`（R3）。期限只在认领时和循环开头检查，一次进行中的调用不受它约束：模型调用没有总时限（只有 2 分钟的响应头时限），响应头之后停住的流没有任何上限，而心跳一直续着租约；网关工具只受 `ToolTimeout`（60 秒）约束；运行中的取消只在下一次 `StartStep` 时才被看到，运行在这一步里结束就丢了。D40、D41 的运行是半小时、上百次调用，期限与取消要靠它们到达调用，而不是等调用自己回来。
+
+| # | 决策 | 理由 |
+|---|---|---|
+| D46-1 | **每个调用都在 `callCtx` 下进行。** `turn.ctx`（worker 的）只用于写库；`turn.callCtx` 在 worker 的 ctx 结束时、运行的期限到时（`context.AfterFunc` 式的计时器，原因 `errDeadline`）、所有者要求取消时（原因 `errCancelRequested`）结束。模型调用、网关 `tools/list` 与 `tools/call`、A2A、CMI（`Verify`、`Resolve`）、凭据续期、输出分类器都用它 | 结束之后还要写的东西（步、工具调用、运行的结局）必须能写，所以写库不用它 |
+| D46-2 | **取消靠 harness 自己问库。** 运行进行中每 `CancelPoll`（缺省 1 秒）调一次 `Store.CancelRequested`（主键上的一次不加锁读，同时校验认领）。认领已失效（`ErrFenced`）也结束 `callCtx` | 心跳是租约的三分之一（缺省 10 秒），达不到"几秒内"；一次主键读每秒一次，比每步一次更便宜的办法就没有了。它同时让内存存储的单元测试不需要 worker |
+| D46-3 | **期限：`RUN_TIMEOUT`，失败码与消息同原来的期限路径**（"the run exceeded its time limit"），在期限后约一秒内结束。**取消：`CANCELED`**，同 `StartStep` 处发现取消的路径 | 不为新路径造新的终态 |
+| D46-4 | **空闲超时：流在两次读取之间静默超过 `idleTimeoutSeconds`（缺省 60 秒，provider 条目）就取消请求**，错误是可重试的传输错误并带 `Idle` 标记，步的错误码为 `idle_timeout`；若还没有文字，按 D45-3 重试。适配器在响应头之后对读取计时，每次读到数据就重新计时：仍在发送的流不受限 | 响应头之后的停滞原来没有任何上界 |
+| D46-5 | **取消与最后一次模型调用。规则：答案存入之前看到的取消生效，之后看到的来得太晚。** 具体：模型调用返回后、`AppendMessages` 存答案之前，harness 再同步问一次库（除监视之外）；取消已请求则不存答案，已流出的文字补上 `TEXT_MESSAGE_END`，步记 `canceled`（token 照记），运行以 `CANCELED` 结束。答案的 `AppendMessages` 返回之后才到的取消，运行照常 `COMPLETED`（答案已存、可见，`Finish` 在同一次 worker 回合里紧接着发生）。两次检查之间仍有一个窗口（毫秒级），文档如实写明，不假装原子 | 取消不能因为答案恰好在最后一步到达而丢；又不能撤回已经存下并展示给用户的答案 |
+| D46-6 | **被截断的调用留下一致的状态。** 模型调用被期限或取消截断：已流出的文字补 `TEXT_MESSAGE_END`；步的行以错误码 `deadline` / `canceled` / `idle_timeout` 结束，三者可分；运行以 `RUN_ERROR` 收尾。工具调用被截断：调用记为 **`FAILED`**，结果写 `interrupted: …，工具可能已经完成也可能没有`，并照常追加工具消息（线程里每个工具调用都有回答，下一个运行不会被提供者以"tool_calls 后面没有 tool 消息"拒绝）；同一步里还没执行的 `CONFIRMED` 调用记为 `FAILED`（`not run: …`），被拒的 `DENIED`。**没有为"被中断"新增状态**：新状态要改表的 CHECK 约束（迁移）与契约，而 `FAILED` + 结果文字已经把事实说清楚；`finished_at` 因此被设置，工具调用接口里看得见 | 不改 schema、不改契约；运行已经终止，不存在"恢复时怎么办" |
+| D46-7 | **worker 自己的 ctx 结束（关停）或认领丢失时什么都不写**，同原来的 `ErrFenced`：`EXECUTING` 的调用留在 `EXECUTING`，恢复时怎么处理是 R1 的事，本决策不改 | 范围 |
+| D46-8 | **步数用尽时的交付与确认等待照旧。** 交付用同一个 `execute`，同样受期限约束（原来就在期限后不调用）；等待确认的运行不占 worker，`Run` 返回时监视随之停止；确认请求的过期时间仍取"请求时刻 + `confirmationTimeoutSeconds`"与期限中较早的（D35） | 本决策不改 D35，只让它对进行中的调用也成立 |
+
+**取舍与边界**
+- 取消每秒一次库读，运行数多时是每秒每个运行一次主键读；`CancelPoll` 目前不进配置文件（缺省值够用，需要时再开）。
+- 被取消时等待确认的调用（`PENDING_CONFIRMATION`）不在这里处理，与原来取消一个正在运行的运行时一样。
+- harness-worker 提供者也受空闲超时约束；它的协议没有心跳，一个思考很久不发数据的外部 harness 要把 `idleTimeoutSeconds` 调大。
+- 空闲超时对"仍在发 keep-alive 注释行"的服务器不触发（读到了字节）。
+
+**实施**：`internal/harness`（`turn.callCtx`、`watch`、`settle`、`interruptedCall`、`abandon`、`callModel`、`loop`）；`internal/model`（`IdleWatch`）；`adapters/providers/*`（`IdleTimeout`）；`adapters/store/postgres`（`CancelRequested`）；`internal/config`（`idleTimeoutSeconds`）。契约不变。
+
+**验证**：复现 `TestARunEndsWithinAFewSecondsOfItsDeadlineWhateverItIsWaitingFor`、`TestACancelledRunEndsWithinAFewSecondsWhateverItIsWaitingFor` 通过（未改断言）。新增：`TestAStalledStreamIsCutByTheIdleTimeoutAndRetried`、`TestAStreamThatStallsAfterTextIsCutNotRetriedAndClosed`、`TestAnInterruptedModelCallLeavesTheStepAndTheEventLogConsistent`（期限、取消）、`TestACancelDuringTheFinalModelCallEndsTheRunCanceledUnlessTheAnswerWasStored`（两侧）、`TestAnInterruptedToolCallIsRecordedAsSuchAndTheRestOfTheStepIsAnswered`（期限、取消）、`TestARunWaitingForConfirmationIsNotAffectedByTheWatch`、`TestIdleWatchCutsASilentBody`、四个适配器的 `TestAStreamThatStopsSendingFailsAsAnIdleTransportError`；集成（真实 PostgreSQL）`TestACancelOfARunningRunReachesTheModelCallThroughTheStoreOnPostgres`（store.CancelRun + worker 心跳）、`TestACancelThroughTheEndpointInterruptsAToolCallOnPostgres`（HTTP 取消接口）、`TestTheDeadlineReachesAModelCallOnPostgres`。
+
+**拿掉一个控制、看测试失败（D45、D46 共用）**
+
+| 控制 | 拿掉的东西 | 失败的测试 |
+|---|---|---|
+| 重试本身（D45-1） | `callModel`：重试条件恒为否（不重试同一候选） | `TestRequestsToOneCandidateAreBoundedAndEachWaitIsReported`、`TestTheUsageEventSaysHowManyRequestsTheStepMade`、`TestAFailedAttemptConsumesNoStepAndNoTokens`、`TestTheNextCandidateIsTriedAfterTheRetriesOfTheFirstAreUsedUp`、`TestARetryAfterLongerThanTheBackoffIsWaitedFor`、`TestARetryAfterBeyondTheCapIsNotWaitedFor`、复现 `TestARunSurvivesOneRetryableErrorOfTheOnlyConfiguredModel` 三个子例 |
+| 遵守 `Retry-After`（D45-2） | `RetryPolicy.Wait`：`max(d, retryAfter)` 改为 `d` | `TestRetryPolicyWait`、`TestARetryAfterLongerThanTheBackoffIsWaitedFor`、复现 R2（429 子例） |
+| `Retry-After` 上限（D45-2） | `RetryPolicy.Wait`：去掉超过 `MaxRetryAfter` 就返回不等待 | `TestRetryPolicyWait`、`TestARetryAfterBeyondTheCapIsNotWaitedFor` |
+| 流出文字后不重试（D45-3） | 去掉重试条件里的 `s.streamed()` | `TestNoRetryAfterTheFirstStreamedDelta`、`TestAStreamThatStallsAfterTextIsCutNotRetriedAndClosed` |
+| 等待随期限与取消结束（D45-4） | `turn.sleep`：去掉 `callCtx.Done()` 分支 | `TestTheWaitBetweenAttemptsEndsAtACancel`、`TestTheWaitBetweenAttemptsEndsAtTheDeadline` |
+| 等待会越过期限时先试下一个候选（D45-4） | 去掉 `!h.Now().Add(wait).Before(d)` 的分支 | `TestAWaitThatWouldOutliveTheDeadlineMovesToTheNextCandidate` |
+| 失败尝试的消息补 `TEXT_MESSAGE_END`（D45-3、D46-6） | 去掉失败尝试后的 `TextMessageEnd` | `TestNoRetryAfterTheFirstStreamedDelta`、`TestTextStreamedByAFailedCandidateIsClosedWhenTheNextCandidateAnswers`、`TestAStreamThatStallsAfterTextIsCutNotRetriedAndClosed`、`TestAnInterruptedModelCallLeavesTheStepAndTheEventLogConsistent` |
+| 成功的步不带前面失败的错误码（D45-5） | 去掉成功时的 `st.ErrorCode = ""` | `TestAFailedAttemptConsumesNoStepAndNoTokens` |
+| `model.usage` 的 `attempts`（D45-5） | 去掉 `"attempts"` 字段 | `TestTheUsageEventSaysHowManyRequestsTheStepMade`、`TestTheNextCandidateIsTriedAfterTheRetriesOfTheFirstAreUsedUp` |
+| `model.retry` 事件（D45-5） | 事件名换成 `model.routed` | `TestRequestsToOneCandidateAreBoundedAndEachWaitIsReported`、`TestAStalledStreamIsCutByTheIdleTimeoutAndRetried` |
+| 失败消息写明提供者要求等待多久（D45-2） | 去掉 `askedWait` 的附加说明 | `TestARetryAfterBeyondTheCapIsNotWaitedFor` |
+| `Retry-After` 从响应带到错误（D45-7） | `ClassifyHTTP` 不设 `RetryAfter` | `TestClassifyHTTPCarriesRetryAfter`，以及 openai、anthropic、gemini、harnessworker 各自的 `TestARetryAfterOfTheProviderReachesTheError` |
+| 配置校验（D45-6、D46-4） | `Load` 不调 `Provider.validate` | `TestProviderRetryAndIdleSettings` |
+| 空闲超时（D46-4） | 四个适配器各把 `NewIdleWatch(p.idle(), …)` 改成 `NewIdleWatch(0, …)`（不监视） | 各适配器的 `TestAStreamThatStopsSendingFailsAsAnIdleTransportError`，harness 的 `TestAStalledStreamIsCutByTheIdleTimeoutAndRetried` 与 `TestAStreamThatStallsAfterTextIsCutNotRetriedAndClosed`（都挂住，40 秒测试超时后失败） |
+| 期限计时器（D46-1） | `watch`：不创建期限计时器 | 复现 `TestARunEndsWithinAFewSecondsOfItsDeadlineWhateverItIsWaitingFor`、`TestTheWaitBetweenAttemptsEndsAtTheDeadline`、`TestAnInterruptedModelCallLeavesTheStepAndTheEventLogConsistent`、`TestAnInterruptedToolCallIsRecordedAsSuchAndTheRestOfTheStepIsAnswered`；集成 `TestTheDeadlineReachesAModelCallOnPostgres` |
+| 取消监视（D46-2） | `watch`：发现取消请求时不结束 `callCtx` | 复现 `TestACancelledRunEndsWithinAFewSecondsWhateverItIsWaitingFor`、`TestTheWaitBetweenAttemptsEndsAtACancel`、`TestAnInterruptedModelCallLeavesTheStepAndTheEventLogConsistent`、`TestAnInterruptedToolCallIsRecordedAsSuchAndTheRestOfTheStepIsAnswered` |
+| 存储的 `CancelRequested`（D46-2） | Postgres 的 `CancelRequested` 恒答否 | 集成 `TestACancelOfARunningRunReachesTheModelCallThroughTheStoreOnPostgres`、`TestACancelThroughTheEndpointInterruptsAToolCallOnPostgres`（运行以 COMPLETED 结束） |
+| 存答案之前的取消检查（D46-5） | 去掉 `AppendMessages` 之前的同步 `CancelRequested`（轮询调成一小时） | `TestACancelDuringTheFinalModelCallEndsTheRunCanceledUnlessTheAnswerWasStored` |
+| 工具调用走 `callCtx`（D46-1） | `execute`：`CallTool` 用 `t.ctx` | 复现 R3 取消的工具子例（`TestACancelledRunEndsWithinAFewSecondsWhateverItIsWaitingFor`）、`TestAnInterruptedToolCallIsRecordedAsSuchAndTheRestOfTheStepIsAnswered` |
+| 被中断的工具调用记为 FAILED（D46-6） | `interruptedCall` 不记录 | `TestAnInterruptedToolCallIsRecordedAsSuchAndTheRestOfTheStepIsAnswered` |
+| 同一步其余调用得到回答（D46-6） | `dispatch` 不调 `abandon` | `TestAnInterruptedToolCallIsRecordedAsSuchAndTheRestOfTheStepIsAnswered` |
+| 被中断的模型调用结束步的行（D46-6） | `loop`：被中断时不 `FinishStep` | `TestAnInterruptedModelCallLeavesTheStepAndTheEventLogConsistent` |
+
+**没有做的**：（R1、R4 的复现测试在 `internal/harness/repro_pending_test.go` 与 `tests/integration/repro_pending_test.go`，构建标签 `repro`，不属于 `make test`；它们故意失败，用 `go test -tags repro ./internal/harness/ ./tests/integration/` 运行。）R1（恢复时重做 `EXECUTING` 的调用；助手消息与工具调用记录分两次写）与 R4（被截断的回答使运行失败）按决定不在此处理，对应的复现测试仍然失败；没有在 compose 或 kind 上、也没有用真实模型验证；没有为被中断的工具调用新增状态（见 D46-6）；`CancelPoll` 没有进配置。

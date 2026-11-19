@@ -58,7 +58,12 @@ CI 与 `deploy/e2e.sh` 里的第三方镜像（PostgreSQL、Keycloak、trivy）�
 ```yaml
 providers:
   - {name: local, kind: openai, baseUrl: http://127.0.0.1:8080/v1}
-  - {name: claude, kind: anthropic, baseUrl: https://api.anthropic.com, apiKeyFile: /run/secrets/anthropic}
+  - {name: claude, kind: anthropic, baseUrl: https://api.anthropic.com, apiKeyFile: /run/secrets/anthropic,
+     idleTimeoutSeconds: 60,        # D46: a response silent this long between two reads is cut and counts as a transport error (default 60)
+     retry: {attempts: 3,           # D45: requests in all per candidate model before the next candidate or failure, 1..10 (default 3; 1 = never retry)
+             backoffSeconds: 1,     #      the wait before the first retry, doubling after that, with jitter (default 1)
+             maxBackoffSeconds: 20, #      cap of a computed wait (default 20)
+             maxRetryAfterSeconds: 60}}   # a provider's Retry-After above this is not waited for (default 60, at most 600)
 gateways:
   - name: edge
     endpoint: https://mcp.example.com/mcp
@@ -86,6 +91,8 @@ cmi:   # optional (ADR-0001 D32): releases with context.cmi = true resolve a Con
     auth: {mode: static, apiKeyFile: /etc/idp/cmi-writer.key}   # the WRITER identity (CMI role cmi-writer); required when enabled; static | delegation, same shape as cmi.auth;
                                                                 # a static key file is read on every write, so a refreshed token is picked up
 ```
+
+provider 的 `retry` 与 `idleTimeoutSeconds`（ADR D45、D46）都可以不配：可重试的错误（HTTP 408、429、5xx、传输失败、流静默超时）先对同一个候选模型重试，等待从 1 秒起翻倍、封顶 20 秒、带抖动，提供者的 `Retry-After` 更长时取它（超过 `maxRetryAfterSeconds` 就不等：换下一个候选或失败）；已经流出文字之后不重试；等待随运行的期限与取消结束。设置放在 provider 条目而不在发布件里：限流策略是运维知道的事，发布件作者不应能为自己的 agent 多烧预算。运行的期限与取消也到达进行中的模型与工具调用：期限到了运行在约一秒内以 `RUN_TIMEOUT` 结束，所有者取消的运行在约一秒内（每秒向库询问一次）以 `CANCELED` 结束。
 
 `cmi.remember` 是纯配置：运营方打开后，**所有** `context.cmi = true` 的 agent 都会被记住（契约不变；按 agent 退出需要改契约，见 ADR D33）。写入在运行终态之后异步进行，失败只记日志并计入 `idp_host_memory_writes_total{outcome}`（written / replayed / rejected / failed / auth_failed / no_credential），绝不影响运行。
 

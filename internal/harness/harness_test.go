@@ -121,6 +121,12 @@ func (m *memStore) StartStep(_ context.Context, _ *run.Claim, maxSteps int, _ in
 	return m.rc.Run.StepCount, m.rc.Run.CancelRequested, m.appendEvents([]agui.Event{agui.StepStarted(run.StepName(m.rc.Run.StepCount))})
 }
 
+func (m *memStore) CancelRequested(context.Context, *run.Claim) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.rc.Run.CancelRequested, m.check()
+}
+
 func (m *memStore) FinishStep(_ context.Context, _ *run.Claim, st run.Step, events []agui.Event) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -286,7 +292,7 @@ func setup(t *testing.T) *env {
 	t.Cleanup(down.Close)
 	dp, _ := openai.New(openai.Config{Name: "down", BaseURL: down.URL + "/v1", HTTP: hc})
 	gw := &Gateway{Name: "edge", Endpoint: xs.URL + "/mcp", Client: &mcpclient.Client{HTTP: mcpclient.NewHTTPClient(5*time.Second, nil), Info: mcpclient.ClientInfo{Name: "idp-host", Version: "test"}}}
-	h := &Harness{Providers: model.NewRegistry(p, dp), Gateways: map[string]*Gateway{"edge": gw}, Log: slog.New(slog.NewTextHandler(io.Discard, nil)), DeltaFlush: time.Nanosecond}
+	h := &Harness{Retry: map[string]model.RetryPolicy{"down": {Backoff: time.Millisecond, MaxBackoff: 5 * time.Millisecond}}, Providers: model.NewRegistry(p, dp), Gateways: map[string]*Gateway{"edge": gw}, Log: slog.New(slog.NewTextHandler(io.Discard, nil)), DeltaFlush: time.Nanosecond}
 	return &env{model: fm, mcp: fx, h: h}
 }
 

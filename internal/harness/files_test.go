@@ -127,7 +127,7 @@ func TestFileReferencesTheRunDoesNotHaveAreRefused(t *testing.T) {
 	m := newMem(filesDef(), user("x"), run.Input{Attachments: filesInput().Attachments}) // no delivery
 	m.fileTickets = &run.FileTickets{Read: []string{readTicket}}
 	e.h.Store = m
-	turn := &turn{h: e.h, ctx: context.Background(), claim: claim, rc: &m.rc, def: filesDef(), visible: map[string]bool{}, frontend: map[string]bool{}}
+	turn := &turn{h: e.h, ctx: context.Background(), callCtx: context.Background(), claim: claim, rc: &m.rc, def: filesDef(), visible: map[string]bool{}, frontend: map[string]bool{}}
 	e.h.defaults()
 	if err := turn.prepareTools(); err != nil {
 		t.Fatal(err)

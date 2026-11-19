@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func load(t *testing.T, yaml string) (*File, error) {
@@ -224,5 +225,37 @@ func TestGatewayToolPatternsAreValidatedAtLoad(t *testing.T) {
 	}
 	if _, err := load(t, gw(`, externalTool: ["web__*"]`)); err == nil {
 		t.Error("a misspelt key must be refused, not ignored")
+	}
+}
+
+// D45, D46: a provider that sets nothing gets the defaults, one that sets the retry and idle settings gets them as the
+// harness and the adapters read them, and a setting that makes no sense is refused when the file is loaded.
+func TestProviderRetryAndIdleSettings(t *testing.T) {
+	f, err := load(t, "providers:\n  - {name: plain, kind: openai, baseUrl: http://127.0.0.1:1/v1}\n"+
+		"  - {name: tuned, kind: openai, baseUrl: http://127.0.0.1:1/v1, idleTimeoutSeconds: 90, retry: {attempts: 5, backoffSeconds: 0.5, maxBackoffSeconds: 10, maxRetryAfterSeconds: 120}}\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := f.Providers[0].RetryPolicy().WithDefaults(); p.Attempts != 3 || p.Backoff != time.Second || p.MaxBackoff != 20*time.Second || p.MaxRetryAfter != time.Minute || f.Providers[0].IdleTimeout() != 0 {
+		t.Errorf("defaults %+v idle %v", p, f.Providers[0].IdleTimeout())
+	}
+	if p := f.Providers[1].RetryPolicy(); p.Attempts != 5 || p.Backoff != 500*time.Millisecond || p.MaxBackoff != 10*time.Second || p.MaxRetryAfter != 2*time.Minute || f.Providers[1].IdleTimeout() != 90*time.Second {
+		t.Errorf("tuned %+v idle %v", p, f.Providers[1].IdleTimeout())
+	}
+	for name, setting := range map[string]string{
+		"more attempts than allowed": "retry: {attempts: 11}",
+		"negative attempts":          "retry: {attempts: -1}",
+		"negative backoff":           "retry: {backoffSeconds: -1}",
+		"backoff above its cap":      "retry: {backoffSeconds: 30, maxBackoffSeconds: 10}",
+		"Retry-After cap too large":  "retry: {maxRetryAfterSeconds: 601}",
+		"negative idle timeout":      "idleTimeoutSeconds: -1",
+		"idle timeout too large":     "idleTimeoutSeconds: 4000",
+	} {
+		if _, err := load(t, "providers:\n  - {name: p, kind: openai, baseUrl: http://127.0.0.1:1/v1, "+setting+"}\n"); err == nil || !strings.Contains(err.Error(), "provider p") {
+			t.Errorf("%s: accepted (%v)", name, err)
+		}
+	}
+	if _, err := load(t, "providers:\n  - {name: p, kind: openai, baseUrl: http://127.0.0.1:1/v1, retry: {attemps: 2}}\n"); err == nil {
+		t.Error("a misspelled retry setting must be refused, not ignored")
 	}
 }

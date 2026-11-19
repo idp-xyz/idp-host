@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"idp-host/internal/model"
 )
 
 // File is the document.
@@ -124,7 +126,52 @@ type Provider struct {
 	// External says whether what is sent to this provider leaves the enterprise (D43). Absent means it does: a provider
 	// is the enterprise's own only when the operator says so (external: false).
 	External *bool `yaml:"external"`
+	// Retry says how the host retries a request this provider answered with a retryable error before any text was
+	// streamed (D45); every field is optional and the defaults need no configuration.
+	Retry Retry `yaml:"retry"`
+	// IdleTimeoutSeconds is how long a response may stay silent between two chunks before the call fails as a retryable
+	// transport error (D46); 0 means 60. It does not bound a call that is still sending.
+	IdleTimeoutSeconds float64 `yaml:"idleTimeoutSeconds"`
 }
+
+// Retry is the retry policy toward one provider (D45). Zero values take the defaults in internal/model.
+type Retry struct {
+	Attempts             int     `yaml:"attempts"`             // requests in all per candidate, 1..10 (default 3; 1 = never retry)
+	BackoffSeconds       float64 `yaml:"backoffSeconds"`       // the wait before the first retry, doubling after that (default 1)
+	MaxBackoffSeconds    float64 `yaml:"maxBackoffSeconds"`    // cap of a computed wait (default 20)
+	MaxRetryAfterSeconds float64 `yaml:"maxRetryAfterSeconds"` // a Retry-After above this is not waited for (default 60, at most 600)
+}
+
+// validate checks the provider's retry and idle settings (D45, D46).
+func (p Provider) validate() error {
+	r := p.Retry
+	switch {
+	case r.Attempts < 0 || r.Attempts > 10:
+		return errors.New("retry.attempts must be within [1, 10] (0 = default 3)")
+	case r.BackoffSeconds < 0 || r.BackoffSeconds > 60:
+		return errors.New("retry.backoffSeconds must be within (0, 60] (0 = default 1)")
+	case r.MaxBackoffSeconds < 0 || r.MaxBackoffSeconds > 300:
+		return errors.New("retry.maxBackoffSeconds must be within (0, 300] (0 = default 20)")
+	case r.MaxRetryAfterSeconds < 0 || r.MaxRetryAfterSeconds > 600:
+		return errors.New("retry.maxRetryAfterSeconds must be within (0, 600] (0 = default 60)")
+	case r.BackoffSeconds > 0 && r.MaxBackoffSeconds > 0 && r.MaxBackoffSeconds < r.BackoffSeconds:
+		return errors.New("retry.maxBackoffSeconds must not be below retry.backoffSeconds")
+	case p.IdleTimeoutSeconds < 0 || p.IdleTimeoutSeconds > 3600:
+		return errors.New("idleTimeoutSeconds must be within (0, 3600] (0 = default 60)")
+	}
+	return nil
+}
+
+func seconds(f float64) time.Duration { return time.Duration(f * float64(time.Second)) }
+
+// RetryPolicy is the provider's retry settings as the harness uses them.
+func (p Provider) RetryPolicy() model.RetryPolicy {
+	return model.RetryPolicy{Attempts: p.Retry.Attempts, Backoff: seconds(p.Retry.BackoffSeconds),
+		MaxBackoff: seconds(p.Retry.MaxBackoffSeconds), MaxRetryAfter: seconds(p.Retry.MaxRetryAfterSeconds)}
+}
+
+// IdleTimeout is the provider's idle timeout (zero = the adapter's default).
+func (p Provider) IdleTimeout() time.Duration { return seconds(p.IdleTimeoutSeconds) }
 
 // IsExternal: unless declared otherwise, a provider is outside the enterprise.
 func (p Provider) IsExternal() bool { return p.External == nil || *p.External }
@@ -188,6 +235,9 @@ func Load(path string) (*File, error) {
 		}
 		if p.BaseURL == "" {
 			return nil, fmt.Errorf("provider %s: baseUrl is required", p.Name)
+		}
+		if err := p.validate(); err != nil {
+			return nil, fmt.Errorf("provider %s: %w", p.Name, err)
 		}
 		if p.APIKey, err = secret(p.APIKey, p.APIKeyFile); err != nil {
 			return nil, fmt.Errorf("provider %s: %w", p.Name, err)

@@ -670,6 +670,26 @@ func (s *Store) Heartbeat(ctx context.Context, c *run.Claim, lease time.Duration
 	})
 }
 
+// CancelRequested reports whether the owner asked to cancel the claimed run (D46). It reads the run without locking it, so
+// that the harness can ask every second while it writes; it answers run.ErrFenced for a claim that is no longer current.
+func (s *Store) CancelRequested(ctx context.Context, c *run.Claim) (bool, error) {
+	var requested bool
+	err := s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
+		var status, owner string
+		var epoch int64
+		var until *time.Time
+		if err := tx.QueryRow(ctx, `SELECT status, fencing_epoch, coalesce(lease_owner, ''), lease_until, cancel_requested FROM runs WHERE id = $1`, c.RunID).
+			Scan(&status, &epoch, &owner, &until, &requested); err != nil {
+			return err
+		}
+		if status != run.StatusRunning || epoch != c.Epoch || owner != c.WorkerID || until == nil || !until.After(s.now()) {
+			return run.ErrFenced
+		}
+		return nil
+	})
+	return requested, err
+}
+
 // Context loads the run, its release, the thread and the unresolved tool calls.
 func (s *Store) Context(ctx context.Context, c *run.Claim) (*run.Context, error) {
 	var out run.Context

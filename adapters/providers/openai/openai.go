@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"go.opentelemetry.io/otel/propagation"
 
@@ -35,6 +36,9 @@ type Config struct {
 	MaxTokensField string
 	// NewMessageID mints assistant message ids (tests inject a deterministic one).
 	NewMessageID func() string
+	// IdleTimeout is how long a response may stay silent between two reads before the request is cancelled and the call
+	// fails as a retryable transport error (D46); zero means model.DefaultIdleTimeout.
+	IdleTimeout time.Duration
 	// AllowPlainHTTP permits http:// to non-loopback hosts (development only).
 	AllowPlainHTTP bool
 }
@@ -62,6 +66,14 @@ func New(cfg Config) (*Provider, error) {
 		cfg.NewMessageID = model.NewMessageID
 	}
 	return &Provider{cfg: cfg}, nil
+}
+
+// idle is the silence a response may keep (D46).
+func (p *Provider) idle() time.Duration {
+	if p.cfg.IdleTimeout > 0 {
+		return p.cfg.IdleTimeout
+	}
+	return model.DefaultIdleTimeout
 }
 
 // Name implements model.Provider.
@@ -283,7 +295,9 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 	if err != nil {
 		return nil, err
 	}
-	hr, err := http.NewRequestWithContext(ctx, http.MethodPost, p.cfg.BaseURL+"/chat/completions", bytes.NewReader(raw))
+	rctx, cancelReq := context.WithCancel(ctx) // cancelled by the idle watch (D46)
+	defer cancelReq()
+	hr, err := http.NewRequestWithContext(rctx, http.MethodPost, p.cfg.BaseURL+"/chat/completions", bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
 	}
@@ -303,23 +317,26 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10)) // read to classify it (D40), never kept
-		return nil, model.ClassifyBody(resp.StatusCode, body)
+		return nil, model.ClassifyHTTP(resp.StatusCode, resp.Header, body, time.Now())
 	}
+	watch := model.NewIdleWatch(p.idle(), cancelReq)
+	defer watch.Stop()
+	stream := watch.Wrap(resp.Body)
 	acc := &accumulator{}
 	mt := strings.ToLower(strings.TrimSpace(strings.Split(resp.Header.Get("Content-Type"), ";")[0]))
 	if mt == "application/json" { // a server that ignored stream: true
-		body, err := io.ReadAll(io.LimitReader(resp.Body, model.MaxResponse))
+		raw, err := io.ReadAll(io.LimitReader(stream, model.MaxResponse))
 		if err != nil {
-			return nil, &model.Error{Code: "transport", Retryable: true}
+			return nil, watch.StreamError(ctx)
 		}
 		var c chunk
-		if err := json.Unmarshal(body, &c); err != nil || c.Error != nil {
+		if err := json.Unmarshal(raw, &c); err != nil || c.Error != nil {
 			return nil, &model.Error{Code: "decode"}
 		}
 		acc.apply(&c, onDelta)
 		return acc.response(p.cfg.NewMessageID())
 	}
-	sc := bufio.NewScanner(resp.Body)
+	sc := bufio.NewScanner(stream)
 	sc.Buffer(make([]byte, 64<<10), 4<<20)
 	var data []string
 	total := 0
@@ -361,10 +378,7 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 		return nil, err
 	}
 	if err := sc.Err(); err != nil {
-		if ctx.Err() != nil {
-			return nil, &model.Error{Code: "canceled"}
-		}
-		return nil, &model.Error{Code: "transport", Retryable: true}
+		return nil, watch.StreamError(ctx)
 	}
 	return acc.response(p.cfg.NewMessageID())
 }
