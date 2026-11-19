@@ -168,6 +168,8 @@ type Input struct {
 	// was not screened. ContextTrigger says why it was screened (the agui.Screen* constants).
 	ContextCeiling string `json:"contextCeiling,omitempty"`
 	ContextTrigger string `json:"contextTrigger,omitempty"`
+	// ContextVia names the sub-agents and remote agents that made the run outward (D48), for the refresh's event.
+	ContextVia []string `json:"contextVia,omitempty"`
 	// ExternalTools: the release may call a tool that sends content outside the enterprise.
 	ExternalTools bool `json:"externalTools,omitempty"`
 }

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -21,6 +22,9 @@ type FilePolicy struct {
 	// ExternalTools are the gateways' external-tool patterns by gateway name (D44): a release that may call one of them is
 	// screened like one that may use an external model.
 	ExternalTools map[string][]string
+	// Release loads the release of a local sub-agent that a release embeds, by agent id and digest (D48). Nil, or an
+	// error, means the sub-agent cannot be judged and counts as sending content out.
+	Release func(ctx context.Context, tenant, agentID, digest string) (*agent.Document, error)
 }
 
 // ContextAttachmentsWithheld is the caller-context entry that tells the model which files it was not given, so that it
@@ -67,26 +71,47 @@ func (p FilePolicy) hasExternalTools(doc *agent.Document) bool {
 	return tools.MatchesAny(p.ExternalTools[tools.Gateway])
 }
 
-// trigger says why the run's content is screened against the ceiling: "" when it is not (D44).
-func (p FilePolicy) trigger(doc *agent.Document) string {
-	var why []string
-	if len(p.externalModels(doc)) > 0 {
-		why = append(why, agui.ScreenExternalModel)
-	}
-	if p.hasExternalTools(doc) {
-		why = append(why, agui.ScreenExternalTools)
-	}
-	return strings.Join(why, "+")
+// Outward is what the HOST decided at run creation about a run's content leaving the enterprise (D44, D48).
+type Outward struct {
+	// Trigger says why the run is screened against the ceiling: "" when it is not. Parts joined by "+".
+	Trigger string
+	// Models are the providers outside the enterprise the release itself may use (D43).
+	Models []string
+	// Tools: the release itself may call a tool that sends content outside the enterprise (D44).
+	Tools bool
+	// Via names the sub-agents (by path of names) and remote agents that make the run count as outward and why, so that
+	// an operator can tell why an agent no longer sees confidential data (D48). Never any content.
+	Via []string
 }
 
-// screen splits the attachments of a run of doc into those it gets and those it does not. Nothing is withheld from a
-// release that only uses the enterprise's own models and no external tool, or below the ceiling.
-func (p FilePolicy) screen(tenant string, doc *agent.Document, atts []run.Attachment) (kept, withheld []run.Attachment, ceiling string) {
+// outward decides whether a run of doc may send content outside the enterprise. This is the one place it is computed
+// (D48): the release's own models and tools as D43 and D44 decided, any local sub-agent it can reach that qualifies in
+// the same way, and any remote A2A agent. A task the parent writes for a sub-agent is free text that cannot be screened,
+// so the parent must never be given what it could write into one.
+func (p FilePolicy) outward(ctx context.Context, tenant string, doc *agent.Document) Outward {
+	o := Outward{Models: p.externalModels(doc), Tools: p.hasExternalTools(doc)}
+	var why []string
+	if len(o.Models) > 0 {
+		why = append(why, agui.ScreenExternalModel)
+	}
+	if o.Tools {
+		why = append(why, agui.ScreenExternalTools)
+	}
+	if o.Via = p.viaSubagents(ctx, tenant, doc); len(o.Via) > 0 {
+		why = append(why, agui.ScreenSubagent)
+	}
+	o.Trigger = strings.Join(why, "+")
+	return o
+}
+
+// screen splits the attachments of a run into those it gets and those it does not. Nothing is withheld from a run that
+// is not outward, or below the ceiling.
+func (p FilePolicy) screen(tenant string, o Outward, atts []run.Attachment) (kept, withheld []run.Attachment, ceiling string) {
 	ceiling = "internal"
 	if p.Ceiling != nil {
 		ceiling = p.Ceiling(tenant)
 	}
-	if len(atts) == 0 || p.trigger(doc) == "" {
+	if len(atts) == 0 || o.Trigger == "" {
 		return atts, nil, ceiling
 	}
 	limit, _ := run.SensitivityRank(ceiling)
@@ -101,11 +126,15 @@ func (p FilePolicy) screen(tenant string, doc *agent.Document, atts []run.Attach
 }
 
 // withheldEvents records each withheld file on the run's stream: which file, how it is classified, and the ceiling.
-func withheldEvents(withheld []run.Attachment, ceiling string, external []string, trigger string) []agui.Event {
+func withheldEvents(withheld []run.Attachment, ceiling string, o Outward) []agui.Event {
 	var out []agui.Event
 	for _, a := range withheld {
-		out = append(out, agui.Custom(agui.CustomAttachmentWithheld, map[string]any{"ref": a.Ref, "name": a.Name, "sensitivity": levelOf(a),
-			"ceiling": ceiling, "externalModels": external, "trigger": trigger}))
+		payload := map[string]any{"ref": a.Ref, "name": a.Name, "sensitivity": levelOf(a),
+			"ceiling": ceiling, "externalModels": o.Models, "trigger": o.Trigger}
+		if len(o.Via) > 0 {
+			payload["via"] = o.Via
+		}
+		out = append(out, agui.Custom(agui.CustomAttachmentWithheld, payload))
 	}
 	return out
 }

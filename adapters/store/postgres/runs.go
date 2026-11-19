@@ -1096,7 +1096,7 @@ func (s *Store) CreateChildRun(ctx context.Context, c *run.Claim, in run.ChildRu
 				}
 			}
 			input := run.Input{Tools: []agui.Tool{}, Context: parent.Input.Context, MaxOutputTokens: parent.Input.MaxOutputTokens,
-				ContextCeiling: parent.Input.ContextCeiling, ContextTrigger: parent.Input.ContextTrigger}
+				ContextCeiling: parent.Input.ContextCeiling, ContextTrigger: parent.Input.ContextTrigger, ContextVia: parent.Input.ContextVia}
 			if input.Context == nil {
 				input.Context = []agui.Context{}
 			}

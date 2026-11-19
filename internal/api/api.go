@@ -600,10 +600,15 @@ func (a *API) createRun(r *http.Request, p authorization.Principal, ref, key str
 	// Its ticket is dropped here, before anything is stored: the run cannot fetch it, and the model is told only its name.
 	var withheld []run.Attachment
 	ceiling := ""
-	opts.Attachments, withheld, ceiling = a.Files.screen(p.Tenant, doc, opts.Attachments)
+	files := a.Files
+	if files.Release == nil && a.Store != nil {
+		files.Release = a.Store.GetReleaseByDigest
+	}
+	outw := files.outward(r.Context(), p.Tenant, doc)
+	opts.Attachments, withheld, ceiling = files.screen(p.Tenant, outw, opts.Attachments)
 	// D44: the same trigger (a model outside the enterprise, or a tool that sends content out) screens the CMI context
 	// entries; the ceiling is recorded in the run's input so that a refresh applies the rule the run was created under.
-	trigger := a.Files.trigger(doc)
+	trigger := outw.Trigger
 	tickets := opts.Tickets()
 	if tickets != nil {
 		// D37: a member's files go to the sandbox through tool calls the HOST executes, with tickets it keeps sealed
@@ -615,9 +620,9 @@ func (a *API) createRun(r *http.Request, p authorization.Principal, ref, key str
 		}
 	}
 	input := run.Input{Tools: in.Tools, Context: in.Context, ForwardedProps: run.WithoutFileOptions(in.ForwardedProps), ToolExecution: opts.ToolExecution, MaxOutputTokens: opts.MaxOutputTokens,
-		Delivery: opts.Delivery != nil, ExternalTools: a.Files.hasExternalTools(doc)}
+		Delivery: opts.Delivery != nil, ExternalTools: outw.Tools}
 	if trigger != "" {
-		input.ContextCeiling, input.ContextTrigger = ceiling, trigger
+		input.ContextCeiling, input.ContextTrigger, input.ContextVia = ceiling, trigger, outw.Via
 	}
 	for _, at := range opts.Attachments {
 		at.Ticket = ""
@@ -638,9 +643,8 @@ func (a *API) createRun(r *http.Request, p authorization.Principal, ref, key str
 		return nil, false, err
 	}
 	if len(withheld) > 0 {
-		external := a.Files.externalModels(doc)
-		a.Log.Info("attachments withheld from a run that may send content outside the enterprise", "tenant", p.Tenant, "agent", ag.ID, "files", len(withheld), "ceiling", ceiling, "external", external, "trigger", trigger)
-		extra = append(extra, withheldEvents(withheld, ceiling, external, trigger)...)
+		a.Log.Info("attachments withheld from a run that may send content outside the enterprise", "tenant", p.Tenant, "agent", ag.ID, "files", len(withheld), "ceiling", ceiling, "external", outw.Models, "trigger", trigger, "via", outw.Via)
+		extra = append(extra, withheldEvents(withheld, ceiling, outw)...)
 	}
 	out, replayed, err := a.Store.CreateRun(r.Context(), p.Tenant, postgres.CreateRunInput{ThreadID: in.ThreadID, RunID: in.RunID, AgentRef: ag.ID, Owner: p.Subject,
 		IdempotencyKey: key, Messages: in.Messages, Input: input, Credential: cred, FileTickets: tickets, TraceID: observability.TraceID(r.Context()),
@@ -725,8 +729,8 @@ func (a *API) resolveContext(r *http.Request, p authorization.Principal, doc *ag
 	input.Context = append(input.Context, entries...)
 	events = append(events, agui.Custom(agui.CustomContextResolved, map[string]any{"packageId": pkg.PackageID, "digest": pkg.Digest, "items": len(pkg.Items), "appended": len(entries), "tokens": pkg.Tokens}))
 	if withheld != nil && withheld.Withheld > 0 {
-		a.Log.Info("CMI context entries withheld from a run that may send content outside the enterprise", "tenant", p.Tenant, "count", withheld.Withheld, "ceiling", input.ContextCeiling, "trigger", input.ContextTrigger)
-		events = append(events, withheld.Event(input.ContextTrigger))
+		a.Log.Info("CMI context entries withheld from a run that may send content outside the enterprise", "tenant", p.Tenant, "count", withheld.Withheld, "ceiling", input.ContextCeiling, "trigger", input.ContextTrigger, "via", input.ContextVia)
+		events = append(events, withheld.Event(input.ContextTrigger, input.ContextVia))
 	}
 	return pkg.PackageID, events, nil
 }

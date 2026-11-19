@@ -1920,8 +1920,10 @@ func TestHostEndToEnd(t *testing.T) {
 		if ev, _ = eventsOf(r["runId"].(string)); ev[agui.CustomContextWithheld]["trigger"] != "external-tools" {
 			t.Fatalf("%v", ev)
 		}
-		// 4. a child run: the parent has no external tool and was not screened; the child has one, so it is given none of the
-		// parent's CMI entries, only the count
+		// 4. a child run (the second line, D44-10): the parent was created while the host did not yet list the tool as external,
+		// so its context was not screened; by the time it delegates the operator has listed it, and the child, which has the
+		// tool, is given none of the parent's CMI entries, only the count
+		e.host.Files = api.FilePolicy{Local: map[string]bool{"fake": true}}
 		e.harness.Gateways["edge"].ExternalTools = []string{"su*"}
 		e.publish("xhelper", definition("edge", []string{"sum"}, nil))
 		e.publish("xlead", withCMI([]string{"echo"}, agent.SubagentRef{Name: "xhelper", Description: "Helps."}))
@@ -1967,6 +1969,155 @@ func TestHostEndToEnd(t *testing.T) {
 			t.Fatalf("%v", children)
 		}
 		if ev, _ = eventsOf(children[0].(map[string]any)["runId"].(string)); ev[agui.CustomContextWithheld]["count"] != float64(3) || ev[agui.CustomContextWithheld]["inherited"] != true {
+			t.Fatalf("%v", ev)
+		}
+		// 5. D48: the parent has no external tool and its own model, but the sub-agent it can delegate to has one. The parent
+		// is screened as if it had the tool itself: a confidential entry and a confidential attachment never reach it, so it
+		// cannot write them into the task. The events say which sub-agent made it so.
+		e.host.Files = api.FilePolicy{Local: map[string]bool{"fake": true}, ExternalTools: map[string][]string{"edge": {"su*"}}}
+		ticket := func(kind, n string) string { return "eyJhbGciOiJFUzI1NiJ9.eyJraW5kIjoi" + kind + "In0." + n }
+		withFiles := func(thread, text string) map[string]any {
+			body := runBody(thread, text)
+			att := func(ref, name, level, n string) map[string]any {
+				m := map[string]any{"ref": ref, "name": name, "mediaType": "text/plain", "size": 12, "sha256": strings.Repeat("ef", 32), "ticket": ticket("read", n)}
+				if level != "" {
+					m["sensitivity"] = level
+				}
+				return m
+			}
+			body["forwardedProps"] = map[string]any{"idp.host/attachments": []any{att("file-secret", "并购方案.txt", "confidential", "c2VjcmV0"), att("file-plain", "notes.txt", "", "cGxhaW4")}}
+			return body
+		}
+		storedInput := func(id string) string {
+			conn, err := pgx.Connect(context.Background(), e.ownerURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close(context.Background())
+			var input string
+			if err := conn.QueryRow(context.Background(), `SELECT input::text FROM runs WHERE id = $1`, id).Scan(&input); err != nil {
+				t.Fatal(err)
+			}
+			return input
+		}
+		// what the parent's own model requests (the ones without the child's task) and the child's contain
+		saw := func(from int) (parentSaw, childSaw string) {
+			for _, turn := range e.model.History()[from:] {
+				var text []string
+				child := false
+				for _, m := range turn {
+					child = child || m.Role == "user" && m.Content == "child task"
+					if m.Role == "developer" || m.Role == "system" || m.Role == "user" {
+						text = append(text, m.Content)
+					}
+				}
+				if child {
+					childSaw += strings.Join(text, "\n")
+				} else {
+					parentSaw += strings.Join(text, "\n")
+				}
+			}
+			return
+		}
+		e.model.Script = func(msgs []fakemodel.Message, tools []string) fakemodel.Turn {
+			last := msgs[len(msgs)-1]
+			if last.Role == "user" && strings.Contains(last.Content, "delegate") {
+				for _, name := range []string{"agent__xhelper", "agent__xcalc"} {
+					for _, t := range tools {
+						if t == name {
+							return fakemodel.Turn{ToolCalls: []fakemodel.Call{{Name: name, Args: `{"input":"child task"}`}}}
+						}
+					}
+				}
+			}
+			return fakemodel.DefaultScript(msgs, tools)
+		}
+		before = len(e.model.History())
+		r = e.must(202, "POST", "/v1/agents/xlead/runs", "carol", withFiles("d48-1", "please delegate"), "Idempotency-Key", "d48-1")
+		e.drive()
+		parent = r["runId"].(string)
+		if got := e.must(200, "GET", "/v1/runs/"+parent, "carol", nil); got["status"] != run.StatusCompleted {
+			t.Fatalf("%v", got)
+		}
+		parentSaw, childSaw = saw(before)
+		for _, text := range []string{parentSaw, childSaw} {
+			if strings.Contains(text, "BODY-DEAL") || strings.Contains(text, "BODY-UNLABELLED") || strings.Contains(text, "eyJ") {
+				t.Fatalf("withheld content reached a model request: %q", text)
+			}
+		}
+		if !strings.Contains(parentSaw, "BODY-OPEN") || !strings.Contains(parentSaw, "2 context entries") || !strings.Contains(parentSaw, "并购方案.txt") || !strings.Contains(parentSaw, "NOT given to you") {
+			t.Fatalf("the parent was not told what was withheld: %q", parentSaw)
+		}
+		if input := storedInput(parent); strings.Contains(input, "eyJ") || strings.Contains(input, "file-secret") || !strings.Contains(input, "file-plain") {
+			t.Fatalf("the stored input: %s", input)
+		}
+		ev, raw = eventsOf(parent)
+		via, _ := ev[agui.CustomContextWithheld]["via"].([]any)
+		if ev[agui.CustomContextWithheld]["trigger"] != "subagent" || ev[agui.CustomContextWithheld]["count"] != float64(2) || len(via) != 1 || !strings.Contains(via[0].(string), "xhelper") ||
+			ev[agui.CustomAttachmentWithheld]["trigger"] != "subagent" || !strings.Contains(fmt.Sprint(ev[agui.CustomAttachmentWithheld]["via"]), "xhelper") || strings.Contains(raw, "BODY-DEAL") || strings.Contains(raw, "eyJ") {
+			t.Fatalf("%s", raw)
+		}
+		// the replay of the same request is still the same run
+		if again := e.must(200, "POST", "/v1/agents/xlead/runs", "carol", withFiles("d48-1", "please delegate"), "Idempotency-Key", "d48-1"); again["runId"] != parent {
+			t.Fatal("replay returned another run")
+		}
+		// 6. the control: a sub-agent with the enterprise's own model and no external tool does not make the parent outward
+		e.publish("xcalc", definition("edge", []string{"echo"}, nil))
+		e.publish("xlead2", withCMI([]string{"echo"}, agent.SubagentRef{Name: "xcalc", Description: "Calculates."}))
+		before = len(e.model.History())
+		r = e.must(202, "POST", "/v1/agents/xlead2/runs", "carol", withFiles("d48-2", "please delegate"), "Idempotency-Key", "d48-2")
+		e.drive()
+		parentSaw, childSaw = saw(before)
+		if !strings.Contains(parentSaw, "BODY-DEAL") || !strings.Contains(parentSaw, "BODY-UNLABELLED") || strings.Contains(parentSaw, "NOT given to you") || !strings.Contains(childSaw, "BODY-DEAL") {
+			t.Fatalf("the control run should see everything: %q", parentSaw)
+		}
+		if input := storedInput(r["runId"].(string)); !strings.Contains(input, "file-secret") || strings.Contains(input, api.ContextAttachmentsWithheld) {
+			t.Fatalf("the control run should have both files: %s", input)
+		}
+		if ev, _ = eventsOf(r["runId"].(string)); ev[agui.CustomContextWithheld] != nil || ev[agui.CustomAttachmentWithheld] != nil {
+			t.Fatalf("%v", ev)
+		}
+		// 7. the operator takes the tool off externalTools: the same release (it is immutable) gets everything again
+		e.host.Files = api.FilePolicy{Local: map[string]bool{"fake": true}, ExternalTools: map[string][]string{"edge": {"web__*"}}}
+		before = len(e.model.History())
+		r = e.must(202, "POST", "/v1/agents/xlead/runs", "carol", withFiles("d48-3", "please delegate"), "Idempotency-Key", "d48-3")
+		e.drive()
+		if parentSaw, _ = saw(before); !strings.Contains(parentSaw, "BODY-DEAL") || strings.Contains(parentSaw, "NOT given to you") {
+			t.Fatalf("%q", parentSaw)
+		}
+		if ev, _ = eventsOf(r["runId"].(string)); ev[agui.CustomContextWithheld] != nil {
+			t.Fatalf("%v", ev)
+		}
+		// 8. a sub-agent whose release cannot be read counts as outward
+		e.publish("xghost", definition("edge", []string{"echo"}, nil))
+		e.publish("xlead3", withCMI([]string{"echo"}, agent.SubagentRef{Name: "xghost", Description: "Not there."}))
+		conn, err := pgx.Connect(context.Background(), e.ownerURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tag, err := conn.Exec(context.Background(), `UPDATE agent_releases SET envelope = NULL WHERE agent_id = (SELECT id FROM agents WHERE name = 'xghost')`); err != nil || tag.RowsAffected() != 1 {
+			t.Fatal(tag, err)
+		}
+		conn.Close(context.Background())
+		before = len(e.model.History())
+		r = e.must(202, "POST", "/v1/agents/xlead3/runs", "carol", runBody("d48-4", "what is the deal?"), "Idempotency-Key", "d48-4")
+		e.drive()
+		if parentSaw, _ = saw(before); strings.Contains(parentSaw, "BODY-DEAL") || !strings.Contains(parentSaw, "BODY-OPEN") {
+			t.Fatalf("%q", parentSaw)
+		}
+		if ev, _ = eventsOf(r["runId"].(string)); !strings.Contains(fmt.Sprint(ev[agui.CustomContextWithheld]["via"]), "xghost: its release cannot be read") {
+			t.Fatalf("%v", ev)
+		}
+		// 9. a remote A2A agent: the task text leaves the HOST
+		remoteLead := withCMI([]string{"echo"}, agent.SubagentRef{Name: "xpeer", Description: "Elsewhere.", A2A: &agent.A2ARef{CardURL: e.api.URL + "/a2a/agents/xhelper/.well-known/agent-card.json"}})
+		e.publish("xlead4", remoteLead)
+		before = len(e.model.History())
+		r = e.must(202, "POST", "/v1/agents/xlead4/runs", "carol", runBody("d48-5", "what is the deal?"), "Idempotency-Key", "d48-5")
+		e.drive()
+		if parentSaw, _ = saw(before); strings.Contains(parentSaw, "BODY-DEAL") || !strings.Contains(parentSaw, "BODY-OPEN") {
+			t.Fatalf("%q", parentSaw)
+		}
+		if ev, _ = eventsOf(r["runId"].(string)); !strings.Contains(fmt.Sprint(ev[agui.CustomContextWithheld]["via"]), "remote agent xpeer") {
 			t.Fatalf("%v", ev)
 		}
 	})

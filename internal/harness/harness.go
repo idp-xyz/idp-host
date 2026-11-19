@@ -2008,7 +2008,7 @@ func (t *turn) verifyContext() (bool, error) {
 					entries = s.Context()
 					if s.Withheld > 0 {
 						event["refreshedWithheld"] = s.Withheld
-						refreshEvents = append(refreshEvents, s.Event(t.rc.Run.Input.ContextTrigger))
+						refreshEvents = append(refreshEvents, s.Event(t.rc.Run.Input.ContextTrigger, t.rc.Run.Input.ContextVia))
 					}
 				}
 				t.rc.Run.Input.Context = append(kept, entries...)

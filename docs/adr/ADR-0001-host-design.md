@@ -634,3 +634,64 @@ D37 让成员的文件经票据进出运行：字节不经过模型。但 agent 
 **没有做的**：
 - **端到端幂等键**（选择点 2）：HOST 带稳定的键（运行号加调用号）、网关转发、上游去重，要改 HOST、网关与每个上游，上游还要保存结果用于去重；对现有两个上游，D47-1 已经够用。接第三方服务时再议（有的第三方接口自己支持幂等键，那时网关可以映射过去），记在对外互通的 ADR 里。
 - 没有在 compose 或 kind 上验收，没有用真实模型验证；没有在真实的 SIGTERM 下运行进程（宽限期用 `Worker.Run` 的 ctx 取消模拟）。
+
+## 30. D48：能把内容送出企业的不只是运行自己的发布件，还有它能委派到的子 agent（2026-11-19 决策与实施，平台 ADR-0003 D7 的"已知缺口"、附录 D 任务 H2）
+
+修订 D43 的"没有做的"第一条（本地子 agent 不查）与 D44 取舍里的"子运行只看对外工具，不看模型"，以及"任务文字带出数据的缺口仍在"。决策依据：平台 `ADR-0003-appendix-d-phase2-plan.md` 第 4.2 节、选择点 5（取 (a)）。
+
+起因：一个没有对外工具的 agent（用企业自有模型）拿到机密的 CMI 条目和高于上限的附件。它的发布件引用了一个有联网搜索的本地子 agent，模型调用 `agent__<名字>`，委派的任务是它自己写的文字。D44-10 只管子运行**继承**什么，不管父运行**写**什么：父 agent 读了机密条目，把"并购方案里写的 X 公司……"写进任务，子 agent 就拿它去搜。远程 A2A 子 agent 更直接：任务文字离开 HOST。任务文字是自由文本，在委派时筛不了。能做到的是让父运行从头就看不到高于上限的东西。
+
+**D48 之前，哪些情形已经触发筛选**（附件与 CMI 条目共用一个触发：`FilePolicy.trigger`，`attachments.go:71`，由 `createRun` 在 `api.go:603`、`606` 用于附件，在 `api.go:620`（写入 input）与 `721`（`resolveContext`）用于 CMI）：
+
+| 发布件能把内容送到… | 附件 | CMI 条目 | 依据（D48 之前的代码与测试） |
+|---|---|---|---|
+| 外部模型（自己的 `model.provider`） | 筛 | 筛 | `externalModels`（`attachments.go:32`）；`TestFilesAboveTheCeilingAreWithheldFromExternalModels`、`TestResolveContextScreensCMIEntriesOfAnExternalRun`、集成 `cmi-above-the-ceiling` 步骤 1 |
+| 回退、路由候选 | 筛 | 筛 | `attachments.go:41`、`44-45`；同上测试里的两个子例（只测了附件，CMI 走同一个触发） |
+| 对外工具 | 筛 | 筛 | `hasExternalTools`（`attachments.go:65`）；`TestTheTriggerIsAnExternalModelOrAnExternalTool`、`TestFilesAboveTheCeilingAreWithheldFromRunsWithExternalTools`、集成步骤 3 |
+| 远程 A2A 子 agent | 筛 | 筛 | `externalModels` 把它记为 `a2a:<cardUrl>`（`attachments.go:50-51`），所以触发为 `external-model`；附件有测试（`attachments_test.go:49`），CMI 没有单独的测试，是同一个触发 |
+| **本地子 agent，其发布件用外部模型** | **不筛** | **不筛** | `externalModels` 只看 `doc.Definition.Subagents` 里的 `a2a`；D43 "没有做的"第一条 |
+| **本地子 agent，其发布件有对外工具** | **不筛** | **不筛**（只有子运行继承时的 D44-10） | `hasExternalTools` 只看自己的 `doc.Effective().Tools`；D44-10 在 `CreateChildRun` 里 |
+| **本地子 agent 的子 agent（任意层）** | **不筛** | **不筛** | 同上 |
+
+所以缺的格子是后三行（各两格）。ADR 里 D43 的验证写到"加远端 A2A 子 agent"，代码与测试都支持；"本地子 agent 不查"写在 D43 的"没有做的"里，也正是这里补上的。
+
+| # | 决策 | 理由 |
+|---|---|---|
+| D48-1 | **创建运行时，这个运行算"可能把内容送出企业"，当且仅当：发布件自己符合 D43/D44 的条件，或它能委派到的某个本地子 agent 符合（递归：子 agent 的子 agent），或它引用了远程 A2A 子 agent，或有本地子 agent 无法读取（算对外）。** 判断仍然只在一处：`FilePolicy.outward`（`internal/api/attachments.go`），返回 `Outward{Trigger, Models, Tools, Via}`；`createRun` 算一次，附件筛选（`screen`）、`input.ContextCeiling/ContextTrigger/ContextVia/ExternalTools`、CMI 筛选（`resolveContext`）、事件全部用它的结果。触发多一个值 `subagent`（可与 `external-model`、`external-tools` 用 `+` 连接） | 父运行看不到高于上限的东西，就写不进任务。不在委派时查任务文字：自由文本筛不了 |
+| D48-2 | **发布件对子 agent 只嵌入身份（名字、`agentId`、版本、摘要，D22），不嵌入它的模型、工具允许列表和它自己的子 agent。** 所以创建运行时按摘要读取被引用的发布件：`Store.GetReleaseByDigest(tenant, agentId, digest)`，一次主键内的查询，只读 `agent_releases` 的 envelope，状态 `APPROVED` 或 `SUPERSEDED`（与 `CreateChildRun` 能运行的发布件一致）。读取在 `FilePolicy.Release` 上注入，缺省接到存储；每个运行一次，没有子 agent 引用的发布件不读 | 发布件是不可变、按摘要寻址的，所以读到的就是委派时会运行的那一份；没有往发布件里再嵌一份摘要，不改契约、不改已发布的发布件 |
+| D48-3 | **读不到就算对外（fail closed）**：没有注入读取函数、发布件不存在、已不是可运行状态、envelope 为空或损坏，都按"该子 agent 对外"处理，事件里写 `its release cannot be read` | 与 D44 对未知级别的处理一致：不知道，就当会出去 |
+| D48-4 | **递归按 D22 的规则走，并有界。** D22：级别 d 的运行只有在 d < 它自己发布件的 `limits.maxSubagentDepth`（缺省 1，最大 5）时才有 `agent__*` 工具。所以走到的深度恰是运行能到达的深度，不是一个固定的层数：限制使某个子 agent 不可达时不计入（不会无故扣数据）。三道界：(1) 每个发布件的限制 ≤ 5（`Validate`），走法另设硬上限 `agent.MaxSubagentDepth`，超过的链按"无法判断"算对外；(2) 同一个（摘要，深度）只读一次，环（A 引用 B 引用 A，D22 在编译期按名字与 agentId 拒绝自引用，不同版本间的环不会出现，但存储里可能有）因此终止；(3) 一次判断最多读 `maxSubagentLoads`（64）个发布件，超过按"无法判断"算对外 | 终止与有界不依赖数据是否干净 |
+| D48-5 | **事件与告诉模型的话保持 D44 的形状，只增加原因。** `idp.host/attachment.withheld` 与 `idp.host/context.withheld` 在原因来自子 agent 或远程 agent 时多一个 `via`：字符串列表，每项一个原因，指名到子 agent 的路径（`web`、`research/web`）：`sub-agent web: may call an external tool`、`sub-agent ask: may use an external model (cloud)`、`remote agent partner: the task text leaves the HOST`、`sub-agent ghost: its release cannot be read, so it counts as sending content out`。`trigger` 含 `subagent`。模型读到的说明不变（只有条数、文件名与级别）。`via` 只有名字与固定的原因，没有任何被扣下内容。运维因此能回答"这个 agent 为什么读不到机密记忆" | 事件是运维的审计面（D44-7） |
+| D48-6 | **刷新照筛，原因随运行记下。** `run.Input` 增 `contextVia`（不属于契约），与 `contextCeiling`、`contextTrigger` 同时在创建时写入；`verifyContext` 刷新时用它们，`idp.host/context.withheld` 带同样的 `via`。子运行继承父运行的 `contextCeiling`、`contextTrigger`、`contextVia`，所以父运行被筛过，子运行拿到的就是筛过的 | D44-5：运行中途改配置不改变已创建运行的规则 |
+| D48-7 | **D44-10 保留，作为第二道。** 父运行创建后、委派前，运维把工具加进 `externalTools`（或父运行是在 D48 之前创建的），父运行的 context 没有筛过，子运行的发布件有对外工具时，继承来的 CMI 条目仍然全部去掉。D48 之后这是配置在运行期间改变的情形，不是常规路径 | 两道各自成立，互不依赖 |
+
+**决定在创建运行时做，不冻结进发布件。** 与 D44 对 `toolResults` 的理由一致：发布件不可变，而 `externalTools` 与 provider 的 `external` 是 HOST 配置，会变。冻结在编译时，一个今天无害的子 agent 明天因运维把它的工具列为对外而变得有害，发布件里的旧结论就成了漏洞；反过来，运维取消列出之后发布件还在扣数据，只有重新发布才能解开。运行创建时按当时的配置算，运行记下结果（`contextCeiling`、`contextTrigger`、`contextVia`），之后不变。代价是每次创建带子 agent 的运行多读几行 `agent_releases`（每个子 agent 一次，已按摘要定位），没有子 agent 引用的运行没有额外开销。
+
+**取舍与代价**：
+- **引用了能联网的子 agent 的 agent，自己再也读不到高于上限的机密数据。** 这是这个决定的本意，也是它的代价：一个"先读内部资料再决定搜什么"的 agent，一旦挂上联网子 agent，就读不到机密条目与附件了。运维有三个办法：(1) 把联网子 agent 拆出去，让需要机密数据的 agent 不引用它，让用户在两个 agent 之间自己传递（用户自己写进对话的内容不在这个控制之内，见"没有做的"）；(2) 把租户的 `files.tenants` 上限调高到该级别，代价是这个租户所有对外运行都能看到这一级；(3) 不再把工具列入 `externalTools`（只在确实不会把内容送出企业时）。事件里的 `via` 指明是哪个子 agent 造成的，所以第一步总是知道该拆谁。
+- **宁可多扣。** 读不到、深度超界、读取过多一律算对外；子 agent 的 `*` 允许列表算对外（D44-2）。
+- **不看子 agent 会不会真的被调用。** 引用即算，因为模型何时调用创建时不知道。
+- **`toolExecution: caller` 的运行照样算**（D44 同样处理）：调用方模式没有 `agent__*` 工具，多扣的代价小于漏判。
+- **契约不变。** 事件字段不属于 schema（同 D44、D45）；`run.Input` 不属于契约。
+
+**实施**：`internal/api/attachments.go`（`Outward`、`outward`、`screen` 改为接受 `Outward`、`withheldEvents`、`FilePolicy.Release`）；`internal/api/subagents.go`（`viaSubagents`，有界的递归）；`internal/api/api.go`（`createRun` 只算一次）；`adapters/store/postgres/agents.go`（`GetReleaseByDigest`）；`adapters/store/postgres/runs.go`（子运行继承 `contextVia`）；`internal/run`（`Input.ContextVia`）；`internal/cmiclient/screen.go`（`Screening.Event` 带 `via`）；`internal/harness`（刷新事件带 `via`）；`internal/agui`（`ScreenSubagent`）。没有改配置项与 README 的设置段：没有新设置；README 的 `externalTools` 与 `files` 的说明加了一句。
+
+**验证**：`internal/api` 的 `TestARunIsOutwardWhenAReachableSubagentOrARemoteAgentIs`（无子 agent、对照：自有模型且无对外工具的子 agent、对外工具、外部模型、两层、三层、D22 使之不可达的第三层、远程 agent、两层之下的远程 agent、读不到、自己的对外工具加子 agent、运维不再列出该工具、没有读取函数）、`TestTheWalkOverSubagentsTerminatesAndIsBounded`（环、超过 D22 最大深度的链、很宽的树的读取数）、`TestFilesAboveTheCeilingAreWithheldFromAParentWhoseSubagentIsOutward`（附件与 `via`，对照）、`TestCMIEntriesAreScreenedForAParentWhoseSubagentIsOutward`；`internal/harness` 的 `TestRefreshedContextOfAParentWithAnOutwardSubagentIsScreenedAndSaysWhy`；`TestHostEndToEnd/cmi-above-the-ceiling`（PostgreSQL，步骤 4 改为 D44-10 作为第二道，步骤 5–9 是 D48：父 agent 没有对外工具、子 agent 有，附件与 CMI 条目，断言父运行与子运行的每一次模型请求都不含被扣下的条目与票据，存下的 input 里没有被扣下的文件，事件带 `via` 并指名子 agent，同一请求重放得到同一个运行；对照：子 agent 用自有模型且没有对外工具，父运行与子运行都拿到所有数据；运维把工具移出 `externalTools` 后同一个（不可变的）发布件重新拿到数据；子 agent 的发布件读不到；远程 A2A 子 agent）。D44 步骤 4 原先断言的"父 agent 没有对外工具就拿到所有条目"正是这个缺口，现在不再成立，已改写。
+
+**拿掉一个控制、看测试失败**
+
+| 控制 | 拿掉的东西 | 失败的测试 |
+|---|---|---|
+| 整个子 agent 判断（D48-1） | `viaSubagents` 不走 | 集成 `cmi-above-the-ceiling`（父运行的模型请求里出现 `BODY-DEAL`）；`TestFilesAboveTheCeilingAreWithheldFromAParentWhoseSubagentIsOutward` 与矩阵里所有 `subagent` 的子例 |
+| 递归（D48-4） | 只看直接子 agent，不进入它们的子 agent | `TestARunIsOutwardWhenAReachableSubagentOrARemoteAgentIs` 的"两层""三层""两层之下的远程 agent"，`TestTheWalkOverSubagentsTerminatesAndIsBounded` 的超深度链与宽树 |
+| 远程 agent（D48-1、D48-5） | 不记 `remote agent` 的原因 | 矩阵里两个远程子例；集成步骤 9（`via` 里没有 `remote agent xpeer`） |
+| 读不到算对外（D48-3） | 读取失败或没有读取函数时当作不对外 | 矩阵里"读不到"与"没有读取函数"；集成步骤 8 |
+| 事件里的原因（D48-5） | 附件事件不写 `via` | `TestFilesAboveTheCeilingAreWithheldFromAParentWhoseSubagentIsOutward` |
+| 事件里的原因，CMI 与刷新（D48-5、D48-6） | `Screening.Event` 不写 `via` | `TestCMIEntriesAreScreenedForAParentWhoseSubagentIsOutward`、`TestRefreshedContextOfAParentWithAnOutwardSubagentIsScreenedAndSaysWhy` |
+| 原因随运行记下（D48-6） | `createRun` 不把 `outw.Via` 写进 input | 集成步骤 5（context 事件没有 `via`） |
+
+**没有做的**：
+- **沙箱工作区跨运行存在**：同一个成员在同一个线程里先用不对外的 agent 导入了机密文件，30 分钟内再让一个对外的 agent 接着用同一个工作区，文件还在（D43 记过，没有变）。
+- **成员自己粘贴进对话的文字**：用户把机密内容写进消息，它就在运行的输入里，任何筛选都看不见；D48 只管 HOST 从文件与 CMI 取来的东西。
+- 没有界面：被扣下的原因只在事件流里。
+- 平台 compose 的验收（PATH N 之后的一条）不在 HOST 仓库内做，见交付说明。

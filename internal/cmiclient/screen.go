@@ -76,8 +76,14 @@ func (s Screening) Note() string {
 }
 
 // Event records the screening on the run's stream.
-func (s Screening) Event(trigger string) agui.Event {
-	return agui.Custom(agui.CustomContextWithheld, map[string]any{"count": s.Withheld, "byLevel": s.ByLevel, "ceiling": s.Ceiling, "trigger": trigger})
+// via names the sub-agents or remote agents that made the run outward, when that is why (D48); it holds names and
+// reasons, never what was withheld.
+func (s Screening) Event(trigger string, via []string) agui.Event {
+	payload := map[string]any{"count": s.Withheld, "byLevel": s.ByLevel, "ceiling": s.Ceiling, "trigger": trigger}
+	if len(via) > 0 {
+		payload["via"] = via
+	}
+	return agui.Custom(agui.CustomContextWithheld, payload)
 }
 
 // DropInherited removes the CMI entries a child run inherited from a parent whose context was not screened (D44). An

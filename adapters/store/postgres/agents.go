@@ -462,3 +462,30 @@ func currentRelease(ctx context.Context, tx pgx.Tx, a *Agent) (string, *agent.En
 	}
 	return *a.CurrentReleaseID, env, doc, nil
 }
+
+// GetReleaseByDigest reads the release of an agent that a sub-agent reference embedded (D22), by the digest the parent
+// release pinned; the same releases a delegation may run. It is read when a run is created, to judge what the parent
+// must not be given (D48).
+func (s *Store) GetReleaseByDigest(ctx context.Context, tenant, agentID, digest string) (*agent.Document, error) {
+	var doc *agent.Document
+	err := s.InTenant(ctx, tenant, func(tx pgx.Tx) error {
+		var env *string
+		if err := tx.QueryRow(ctx, `SELECT envelope FROM agent_releases WHERE agent_id = $1 AND digest = $2 AND status IN ('APPROVED', 'SUPERSEDED') AND envelope IS NOT NULL`, agentID, digest).Scan(&env); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return fail("NOT_FOUND", "approved release not found")
+			}
+			return err
+		}
+		var e agent.Envelope
+		if err := json.Unmarshal([]byte(*env), &e); err != nil {
+			return err
+		}
+		d, err := agent.Open(&e)
+		if err != nil {
+			return err
+		}
+		doc = d
+		return nil
+	})
+	return doc, err
+}

@@ -180,6 +180,28 @@ func TestRefreshedContextIsScreenedWithTheCeilingRecordedAtCreation(t *testing.T
 	}
 }
 
+// D48: a run that was screened because of a sub-agent is screened the same way when its context is refreshed, and the
+// event of the refresh carries the reason recorded at creation.
+func TestRefreshedContextOfAParentWithAnOutwardSubagentIsScreenedAndSaysWhy(t *testing.T) {
+	d := def()
+	d.Context = agent.ContextPolicy{CMI: true, OnStale: "refresh"}
+	e := setup(t)
+	e.h.CMI, e.h.CMIKey = refreshCMI(t), "k"
+	why := []string{"sub-agent web: may call an external tool"}
+	m := newMem(d, user("please sum"), run.Input{Context: []agui.Context{{Description: "caller", Value: "mine"}}, ContextCeiling: "internal", ContextTrigger: agui.ScreenSubagent, ContextVia: why})
+	m.rc.Run.ContextPackageID = "pkg_1"
+	e.h.Store = m
+	if err := e.h.Run(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	if seen := contextSeen(e); strings.Contains(seen, "BODY-2") || strings.Contains(seen, "BODY-3") || !strings.Contains(seen, "BODY-1") {
+		t.Fatalf("%s", seen)
+	}
+	if w := eventNamed(m, agui.CustomContextWithheld); len(w) != 1 || w[0]["trigger"] != "subagent" || fmt.Sprint(w[0]["via"]) != fmt.Sprint(why) {
+		t.Fatalf("%v", w)
+	}
+}
+
 // D44: the store judges a child's release by the external-tool patterns the harness hands it.
 func TestChildRunsAreCreatedWithTheGatewaysExternalToolPatterns(t *testing.T) {
 	e := setup(t)

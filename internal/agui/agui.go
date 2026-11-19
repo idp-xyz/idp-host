@@ -354,7 +354,7 @@ const (
 	// what may reach an external model and the release may use one (D43).
 	CustomAttachmentWithheld = "idp.host/attachment.withheld"
 	// CustomContextWithheld: CMI context entries classified above the ceiling were not given to the run (D44):
-	// {count, byLevel, ceiling, trigger}.
+	// {count, byLevel, ceiling, trigger, via?}.
 	CustomContextWithheld = "idp.host/context.withheld"
 	// CustomInputGuardRaised: the release said toolResults off, but the run has external tools, so tool results are
 	// wrapped as untrusted anyway (D44): {configured, applied, reason}.
@@ -365,4 +365,7 @@ const (
 const (
 	ScreenExternalModel = "external-model"
 	ScreenExternalTools = "external-tools"
+	// ScreenSubagent: a sub-agent the release can delegate to, or a remote agent, makes the run outward (D48); the
+	// events' "via" says which.
+	ScreenSubagent = "subagent"
 )

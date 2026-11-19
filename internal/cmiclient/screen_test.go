@@ -60,7 +60,7 @@ func TestScreeningTellsTheModelCountsAndLevelsOnly(t *testing.T) {
 	if got := Screen([]Item{item("1", "public")}, "internal").Context(); len(got) != 1 || got[0].Description == ContextCMIWithheld {
 		t.Fatalf("%+v", got)
 	}
-	ev := s.Event(agui.ScreenExternalModel + "+" + agui.ScreenExternalTools)
+	ev := s.Event(agui.ScreenExternalModel+"+"+agui.ScreenExternalTools, nil)
 	v := ev["value"].(map[string]any)
 	if ev["name"] != agui.CustomContextWithheld || v["count"] != 3 || v["ceiling"] != "internal" || v["trigger"] != "external-model+external-tools" {
 		t.Fatalf("%v", ev)

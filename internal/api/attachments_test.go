@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -56,7 +57,7 @@ func TestFilesAboveTheCeilingAreWithheldFromExternalModels(t *testing.T) {
 		"ceiling restricted": {FilePolicy{Ceiling: func(string) string { return "restricted" }}, docWith(agent.ModelProfile{Provider: "cloud"}),
 			"public.txt,plain.txt,internal.txt,confidential.txt,restricted.txt", "", "cloud"},
 	} {
-		kept, withheld, _ := c.policy.screen("t1", c.doc, atts)
+		kept, withheld, _ := c.policy.screen("t1", c.policy.outward(context.Background(), "t1", c.doc), atts)
 		if names(kept) != c.kept || names(withheld) != c.withheld {
 			t.Errorf("%s: kept %s, withheld %s", name, names(kept), names(withheld))
 		}
@@ -71,10 +72,10 @@ func TestFilesAboveTheCeilingAreWithheldFromExternalModels(t *testing.T) {
 		}
 		return "internal"
 	}}
-	if kept, _, ceiling := perTenant.screen("t-high", docWith(agent.ModelProfile{Provider: "cloud"}), atts); names(kept) != "public.txt,plain.txt,internal.txt,confidential.txt" || ceiling != "confidential" {
+	if kept, _, ceiling := perTenant.screen("t-high", perTenant.outward(context.Background(), "t-high", docWith(agent.ModelProfile{Provider: "cloud"})), atts); names(kept) != "public.txt,plain.txt,internal.txt,confidential.txt" || ceiling != "confidential" {
 		t.Errorf("%s %s", names(kept), ceiling)
 	}
-	if kept, _, ceiling := perTenant.screen("t-other", docWith(agent.ModelProfile{Provider: "cloud"}), atts); names(kept) != "public.txt,plain.txt,internal.txt" || ceiling != "internal" {
+	if kept, _, ceiling := perTenant.screen("t-other", perTenant.outward(context.Background(), "t-other", docWith(agent.ModelProfile{Provider: "cloud"})), atts); names(kept) != "public.txt,plain.txt,internal.txt" || ceiling != "internal" {
 		t.Errorf("%s %s", names(kept), ceiling)
 	}
 	// the model is told names and levels, never anything that could be a reference to the file

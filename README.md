@@ -74,6 +74,8 @@ gateways:
     externalTools: ["web__*"]    # D44: patterns (path.Match) of the tools whose calls send content outside the enterprise; a release that may
                                  # call one (or allows "*") is screened against files.externalModelCeiling like one that may use an external
                                  # model: files and CMI context entries above the ceiling, or without a valid level, are not given to the run
+                                 # D48: the same for a run whose release can delegate to a sub-agent that qualifies (at any depth D22 allows), or
+                                 # to a remote A2A agent, or to a sub-agent whose release cannot be read; the events' "via" names which one
     confirmTools: ["web__web_open_url"]   # D44: patterns of the tools whose calls always wait for the member, whatever the release says
     neverResendTools: ["sandbox_write*"]  # D47: patterns of the tools whose call that was in progress when a worker stopped is never sent again, whatever
                                           # the gateway's annotations say (see below)
