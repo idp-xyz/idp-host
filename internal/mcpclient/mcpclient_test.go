@@ -107,3 +107,38 @@ func TestListToolsReadsTheAnnotationsThatSayACallMayBeRepeated(t *testing.T) {
 		}
 	}
 }
+
+// D51: ListTools reads one thing of a tool's _meta, the key the gateway sets, and only when it is the JSON boolean true;
+// the rest of _meta (the upstream's own) is never kept.
+func TestListToolsReadsTheExternalMarkerAndNothingElseOfMeta(t *testing.T) {
+	fake := fakemcp.New() // sum, echo, fail, slow
+	fake.Tools[0].Meta = map[string]any{ExternalMetaKey: true, "vendor/secret": "x"}
+	fake.Tools[1].Meta = map[string]any{ExternalMetaKey: "true"}
+	fake.Tools[2].Meta = map[string]any{ExternalMetaKey: 1}
+	fake.Tools[3].Meta = map[string]any{ExternalMetaKey: map[string]any{"v": true}}
+	fake.Tools = append(fake.Tools,
+		fakemcp.Tool{Name: "n", InputSchema: `{}`, Meta: map[string]any{ExternalMetaKey: nil}, Handle: fake.Tools[0].Handle},
+		fakemcp.Tool{Name: "f", InputSchema: `{}`, Meta: map[string]any{ExternalMetaKey: false}, Handle: fake.Tools[0].Handle},
+		fakemcp.Tool{Name: "other", InputSchema: `{}`, Meta: map[string]any{"io.idp.telos/internal": true, "external": true}, Handle: fake.Tools[0].Handle},
+		fakemcp.Tool{Name: "none", InputSchema: `{}`, Handle: fake.Tools[0].Handle})
+	srv := httptest.NewServer(fake.Handler())
+	defer srv.Close()
+	c := &Client{HTTP: NewHTTPClient(5*time.Second, nil), Info: ClientInfo{Name: "idp-host", Version: "test"}}
+	tools, err := c.ListTools(context.Background(), srv.URL+"/mcp", "")
+	if err != nil || len(tools) != 8 {
+		t.Fatal(err, tools)
+	}
+	for i, want := range []bool{true, false, false, false, false, false, false, false} {
+		if tools[i].External != want {
+			t.Errorf("%s: External %v, want %v", tools[i].Name, tools[i].External, want)
+		}
+		if tools[i].Meta != nil {
+			t.Errorf("%s: the upstream's _meta is kept: %s", tools[i].Name, tools[i].Meta)
+		}
+	}
+	for raw, want := range map[string]bool{`{"io.idp.telos/external":true}`: true, `{"io.idp.telos/external": true }`: true, `"io.idp.telos/external"`: false, `[true]`: false, `true`: false, ``: false, `{}`: false} {
+		if got := externalMarker(json.RawMessage(raw)); got != want {
+			t.Errorf("%q: %v", raw, got)
+		}
+	}
+}

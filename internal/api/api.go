@@ -21,6 +21,7 @@ import (
 	"idp-host/internal/authorization"
 	"idp-host/internal/cmiclient"
 	"idp-host/internal/credential"
+	"idp-host/internal/mcpclient"
 	"idp-host/internal/observability"
 	"idp-host/internal/run"
 	"idp-host/internal/transport"
@@ -41,6 +42,12 @@ type GatewayAuth struct {
 	Exchanger *credential.Exchanger
 	// ActorToken sends the HOST's own token as actor_token (Keycloak's delegation profile).
 	ActorToken bool
+	// Endpoint, Client and StaticBearer let the HOST read the gateway's tool catalogue when a run is created, to see which
+	// tools the gateway marks as sending content outside the enterprise (D51). Without a Client the catalogue cannot be
+	// read, and a release that has tools of this gateway counts as outward unless the operator's patterns already say so.
+	Endpoint     string
+	Client       *mcpclient.Client
+	StaticBearer string
 }
 
 // API serves the HOST.
@@ -66,6 +73,8 @@ type API struct {
 	StreamPoll time.Duration
 	// StreamKeepAlive is the keep-alive comment interval (default 15 s).
 	StreamKeepAlive time.Duration
+	// CatalogueTimeout bounds each tools/list a run's creation makes (D51); default 8 s.
+	CatalogueTimeout time.Duration
 
 	actorMu    chan struct{}
 	actorToken *credential.Token
@@ -604,7 +613,13 @@ func (a *API) createRun(r *http.Request, p authorization.Principal, ref, key str
 	if files.Release == nil && a.Store != nil {
 		files.Release = a.Store.GetReleaseByDigest
 	}
-	outw := files.outward(r.Context(), p.Tenant, doc)
+	// D51: which tools the gateway marks external is known only from its tools/list, so it is read here, with the caller's own
+	// credential, when the release has tools of a gateway the run reaches; a run whose tools the caller executes has none
+	var look Catalogue
+	if opts.ToolExecution == "" {
+		look = a.catalogue(r.Context(), doc.Effective().Tools.Gateway, cred)
+	}
+	outw := files.outward(r.Context(), p.Tenant, doc, look)
 	opts.Attachments, withheld, ceiling = files.screen(p.Tenant, outw, opts.Attachments)
 	// D44: the same trigger (a model outside the enterprise, or a tool that sends content out) screens the CMI context
 	// entries; the ceiling is recorded in the run's input so that a refresh applies the rule the run was created under.
@@ -650,6 +665,58 @@ func (a *API) createRun(r *http.Request, p authorization.Principal, ref, key str
 		IdempotencyKey: key, Messages: in.Messages, Input: input, Credential: cred, FileTickets: tickets, TraceID: observability.TraceID(r.Context()),
 		ReleaseID: releaseID, ExecutionRef: opts.ExecutionRef, ContextPackageID: packageID, Extra: extra})
 	return out, replayed, err
+}
+
+// catalogue returns the lookup of the gateways' catalogues for one run creation (D51). Each gateway is asked at most once
+// per creation, whatever the number of releases that use it. The caller's delegated credential (cred) is the run's own
+// gateway's; any other gateway can be asked only with a static credential, since a sub-agent run is handed no credential
+// for another gateway either. Any failure, a refusal of the credential included, is returned as an error: the caller then
+// counts the release as outward. The credential is not renewed here: a renewal that rotates the refresh token would
+// invalidate the one the run stores.
+func (a *API) catalogue(ctx context.Context, runGateway string, cred *credential.Token) Catalogue {
+	type answer struct {
+		tools map[string]bool
+		err   error
+	}
+	asked := map[string]answer{}
+	timeout := a.CatalogueTimeout
+	if timeout <= 0 {
+		timeout = 8 * time.Second
+	}
+	return func(gateway string) (map[string]bool, error) {
+		if got, ok := asked[gateway]; ok {
+			return got.tools, got.err
+		}
+		tools, err := a.listGateway(ctx, gateway, runGateway, cred, timeout)
+		asked[gateway] = answer{tools, err}
+		return tools, err
+	}
+}
+
+func (a *API) listGateway(ctx context.Context, gateway, runGateway string, cred *credential.Token, timeout time.Duration) (map[string]bool, error) {
+	auth, ok := a.Gateways[gateway]
+	if !ok || auth.Client == nil || auth.Endpoint == "" {
+		return nil, errors.New("the HOST cannot read this gateway's catalogue")
+	}
+	bearer := auth.StaticBearer
+	if bearer == "" && gateway == runGateway && cred != nil {
+		bearer = cred.AccessToken
+	}
+	if bearer == "" {
+		return nil, errors.New("no credential for this gateway")
+	}
+	lctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	listed, err := auth.Client.ListTools(lctx, auth.Endpoint, bearer)
+	if err != nil {
+		a.Log.Warn("a gateway's tool catalogue could not be read at run creation; its tools count as sending content out", "gateway", gateway, "error", err)
+		return nil, err
+	}
+	out := make(map[string]bool, len(listed))
+	for _, t := range listed {
+		out[t.Name] = t.External
+	}
+	return out, nil
 }
 
 // resolveContext asks the CMI for a package when the release wants one (D32) and appends its items

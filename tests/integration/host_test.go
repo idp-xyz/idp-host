@@ -192,10 +192,12 @@ func newEnv(t *testing.T) *env {
 	verifier, _ := identity.NewDevVerifier(profile, []byte(devSecret))
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	// metrics and tracing wrap the ResponseWriter: the stream must still flush through them
+	// D51: the API reads each gateway's catalogue when a run is created, as main wires it
+	catalogueClient := &mcpclient.Client{HTTP: mcpclient.NewHTTPClient(5*time.Second, nil), Info: mcpclient.ClientInfo{Name: "idp-host", Version: "it"}}
 	a := &api.API{Store: store, Auth: verifier, Log: log, Providers: []string{"fake"}, Version: "it", StreamPoll: 20 * time.Millisecond, Metrics: observability.NewMetrics(),
-		Gateways: map[string]api.GatewayAuth{"edge": {}, "delegated": {ActorToken: true,
+		Gateways: map[string]api.GatewayAuth{"edge": {Endpoint: xs.URL + "/mcp", Client: catalogueClient, StaticBearer: "static-key"}, "delegated": {ActorToken: true, Endpoint: xs2.URL + "/mcp", Client: catalogueClient,
 			Exchanger: &credential.Exchanger{TokenEndpoint: idp.URL, ClientID: "idp-host", ClientSecret: "host-secret", Audience: "gw", HTTP: idp.Client()}},
-			"session": {ActorToken: true, Exchanger: sessionX}}}
+			"session": {ActorToken: true, Exchanger: sessionX, Endpoint: xs3.URL + "/mcp", Client: catalogueClient}}}
 	tp, _, err := observability.Setup("idp-host-it", "it", log)
 	if err != nil {
 		t.Fatal(err)

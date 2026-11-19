@@ -218,6 +218,28 @@ type Tool struct {
 	// readOnlyHint and idempotentHint to decide whether a call interrupted mid-way may be sent again (D47); a tool that
 	// lists none is treated as neither.
 	Annotations ToolAnnotations `json:"annotations,omitzero"`
+	// External is the gateway's statement that the tool sends the caller's content outside the enterprise: the tool
+	// object's _meta carries ExternalMetaKey with the JSON boolean true (D51). It is read from that one key only, and only
+	// when it is exactly true; a missing key, any other value and every other key of _meta count for nothing, since the
+	// other keys come from the upstream. ListTools sets it; a Tool decoded any other way is not external.
+	External bool `json:"-"`
+	// Meta is the raw _meta as the gateway sent it. ListTools reads ExternalMetaKey from it and clears it, so that nothing
+	// of an upstream's own _meta travels further.
+	Meta json.RawMessage `json:"_meta,omitempty"`
+}
+
+// ExternalMetaKey is the key of a tool's _meta with which the gateway marks a tool of an external upstream (idp-mcp
+// ADR-0001 D50 to D53; HOST ADR-0001 D51).
+const ExternalMetaKey = "io.idp.telos/external"
+
+// externalMarker reports whether a tool's _meta marks it external: an object whose ExternalMetaKey is the JSON boolean
+// true. Anything else, including a _meta that is not an object, is false.
+func externalMarker(meta json.RawMessage) bool {
+	var m map[string]json.RawMessage
+	if len(meta) == 0 || json.Unmarshal(meta, &m) != nil {
+		return false
+	}
+	return string(bytes.TrimSpace(m[ExternalMetaKey])) == "true"
 }
 
 // ToolAnnotations are the hints of a tool the HOST uses; an absent hint is false, as in the MCP specification.
@@ -250,10 +272,12 @@ func (c *Client) ListTools(ctx context.Context, endpoint, bearer string) ([]Tool
 		if err := json.Unmarshal(raw, &res); err != nil || res.Tools == nil {
 			return nil, errors.New("tools/list result has no tools array")
 		}
-		for _, t := range res.Tools {
+		for i := range res.Tools {
+			t := &res.Tools[i]
 			if t.Name == "" {
 				return nil, errors.New("tools/list entry without a name")
 			}
+			t.External, t.Meta = externalMarker(t.Meta), nil
 		}
 		all = append(all, res.Tools...)
 		if len(all) > 1000 {

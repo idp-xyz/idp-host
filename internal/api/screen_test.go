@@ -40,7 +40,7 @@ func TestTheTriggerIsAnExternalModelOrAnExternalTool(t *testing.T) {
 		"external model and external tool":       {docWithTools("cloud", "edge", "web__web_fetch"), "external-model+external-tools", true},
 		"the patterns belong to another gateway": {docWithTools("onprem", "other", "web__web_search"), "", false},
 	} {
-		if got := p.outward(context.Background(), "t", c.doc).Trigger; got != c.want || p.hasExternalTools(c.doc) != c.tool {
+		if got := p.outward(context.Background(), "t", c.doc, nil).Trigger; got != c.want || p.hasExternalTools(c.doc) != c.tool {
 			t.Errorf("%s: %q %v", name, got, p.hasExternalTools(c.doc))
 		}
 	}
@@ -58,11 +58,11 @@ func TestTheTriggerIsAnExternalModelOrAnExternalTool(t *testing.T) {
 func TestFilesAboveTheCeilingAreWithheldFromRunsWithExternalTools(t *testing.T) {
 	atts := []run.Attachment{{Name: "a.txt", Sensitivity: "internal"}, {Name: "b.txt", Sensitivity: "confidential"}}
 	p := FilePolicy{Local: map[string]bool{"onprem": true}, ExternalTools: map[string][]string{"edge": {"web__*"}}}
-	kept, withheld, _ := p.screen("t1", p.outward(context.Background(), "t1", docWithTools("onprem", "edge", "web__web_search")), atts)
+	kept, withheld, _ := p.screen("t1", p.outward(context.Background(), "t1", docWithTools("onprem", "edge", "web__web_search"), nil), atts)
 	if names(kept) != "a.txt" || names(withheld) != "b.txt" {
 		t.Fatalf("%s | %s", names(kept), names(withheld))
 	}
-	if kept, withheld, _ = p.screen("t1", p.outward(context.Background(), "t1", docWithTools("onprem", "edge", "parcel__get")), atts); len(withheld) != 0 || len(kept) != 2 {
+	if kept, withheld, _ = p.screen("t1", p.outward(context.Background(), "t1", docWithTools("onprem", "edge", "parcel__get"), nil), atts); len(withheld) != 0 || len(kept) != 2 {
 		t.Fatalf("an internal tool changes nothing: %s | %s", names(kept), names(withheld))
 	}
 }

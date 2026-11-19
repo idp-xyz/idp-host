@@ -788,3 +788,88 @@ D37 让成员的文件经票据进出运行：字节不经过模型。但 agent 
 **拿掉一个控制、看测试失败**：把 `detail` 放回事件：`TestTheProvidersWordsReachOnlyTheHostLog`、`TestANonRetryableStream…` 失败；`ClassifyStreamError` 一律返回 `decode`：`TestClassifyStreamError`、`TestStreamErrorDetailIsBoundedAndClean`、三个适配器各自的 `TestAStreamErrorIsTheProvidersAndKeepsItsWords`、harness 的 `TestARetryableStreamErrorBeforeTextIsRetried`、`TestAStreamErrorAfterTextIsNotRetried`、`TestANonRetryableStreamError…`、`TestAStreamErrorThatSaysTheContextIsFullIsTheContextWindowError`。
 
 **仍不知道的**：那次 180.4 秒的失败，提供者到底说了什么（消息已丢，无法追溯），它是否真是流内错误事件，也可能是数据块损坏；本地模型服务（llama.cpp 一类）在长生成中途发出的错误事件的形状只按文档与适配器已有的解析推断，没有抓到真实样本。**下一次**：先在事件日志里找 `idp.host/model.error`（只有错误码，说明哪一步、第几次尝试），再用运行 ID 在 HOST 日志里找 `model call failed` 一行，其 `detail` 是提供者的话，或（错误码为 `decode` 时）读不懂的是哪一种数据块；若同一类 `provider_server` 反复出现，看模型服务自己的日志（那次 180 秒前后）。日志不是持久的审计记录：日志保留期短于要追查的时间，提供者的话就没了。
+
+## 33. D51：网关标出的外部工具与运维列出的对外工具一视同仁（2026-11-19 决策与实施，idp-mcp 互通 ADR 步骤 X2 的 D-X5；契约不变）
+
+修订 D44（谁算"对外工具"）、D48（子 agent 按同一规则判断）；沿用 D43、D44、D47、D49 的其余部分。
+
+起因：idp-mcp 的 D50 至 D53 让网关能接入企业之外的上游（合作方的 MCP 服务）。网关在 `tools/list` 的回答里给这类上游的每个工具标一个键：工具对象的 `_meta` 里 `"io.idp.telos/external": true`，值取自审核时钉住的上游类别，上游自己写的同名键被覆盖或去掉。到此为止，HOST 只认运维在 `gateways[].externalTools` 里列的工具；每接一个合作方，运维就得把对方的工具名抄进 HOST 配置，漏一个，这个工具读到的内容就不再被当作"可能出企业"，附件和 CMI 上下文也不筛。D51 让网关的标记在运维的列表算数的每一处都算数。
+
+**先说清楚今天谁在什么时候调 `tools/list`，缓存了什么（改动之前）**：
+
+| 谁 | 何时 | 凭据 | 缓存 |
+|---|---|---|---|
+| worker 里的 `turn.prepareTools` | 每次 worker 认领运行、起一个 turn 时一次（每个 turn 一次，不是每一步；等待确认、被中断后接手的 turn 再来一次）；401 时用续期的凭据重来一次 | 运行存下的委派凭据（`RunCredential`）或网关的静态凭据 | 无。结果只活在这个 turn 里（`t.visible`、`t.repeatable`、`t.fileProps`、模型看到的工具表） |
+| API 的 `createRun` | **从不调用**。它只换取凭据（`delegate`）并存进运行 | | |
+| 子 agent 的 `CreateChildRun` | 不调用；子运行自己起 turn 时才调 | 继承父运行的凭据（同一网关）；别的网关没有凭据 | |
+
+所以对外与否的判断（`FilePolicy.outward`，D44、D48）在创建运行时做，只看运维的静态模式和释放件的允许列表；标记要等 worker 的 `tools/list` 才知道，那时附件和 CMI 上下文早已定了。
+
+| # | 决策 | 理由 |
+|---|---|---|
+| D51-1 | **`mcpclient.ListTools` 读标记：只读 `_meta` 里的 `io.idp.telos/external`，只有它是 JSON 布尔 `true` 才算**（`Tool.External`）。字符串 `"true"`、数字 1、`null`、`false`、对象、数组、大小写不同的键、`_meta` 不是对象、缺这个键，都是内部。读完即丢弃整个 `_meta`：`_meta` 的其余键来自上游，不可信，HOST 不读、不留、不转发 | 只有网关会设这个键；一个值得信任的键也只该有一种写法。不为它新增信任：上游数据仍是数据 |
+| D51-2 | **创建运行时读目录，用调用者自己的凭据，对每个网关每次创建至多一次**（`API.catalogue`）。`createRun` 已有这个运行要用的凭据（委派凭据，或网关的静态凭据）；发布件有允许列表、网关已配置、运行由 HOST 执行工具（不是 `toolExecution: caller`）时，调 `tools/list`，超时 `CatalogueTimeout`（缺省 8 秒）。运维的模式已让发布件对外时不调（不需要）；没有允许列表或没有工具的发布件不调。`GatewayAuth` 增 `Endpoint`、`Client`、`StaticBearer`（`main` 照网关配置填）。这一步**不续期**凭据：续期可能轮换刷新令牌，会让运行存下的那个失效 | 唯一能在筛选之前知道标记的办法是问网关。用调用者自己的凭据，因为网关的目录因调用者而异（授权、可见性），HOST 自己的身份会看到别的目录。**代价与失败方式**：每次创建运行多一次到网关的往返（有工具的发布件），延迟加在创建请求上；每个网关每次创建只问一次，不论发布件与子 agent 有多少个；没有缓存，缓存会把"过时的知识"变成常态（见 D51-4）。网关慢或不通时创建请求最多多等超时那么久，运行仍会创建（见 D51-3），不会因此被拒 |
+| D51-3 | **看不到就按对外算（失败即关闭）。** 目录读取失败（网关不通、超时、凭据被拒——包括会话绑定网关的首个访问令牌被拒，不续期、没有凭据、`GatewayAuth` 没有 `Client`）：发布件按"有对外工具"处理，附件与 CMI 上下文照 D44 筛，运行照常创建。`Outward.Via` 写 `gateway <名>: its tool catalogue could not be read when the run was created, so its tools count as sending content out`。子 agent 的发布件用另一个网关、而本次没有那个网关的凭据（静态凭据除外）时，同样按"读不到"算；这样的子运行本来也拿不到那个网关的凭据，多扣的代价是看得见的一行 `via` | 与 D44 对没有级别的条目一致：不知道就当作最坏。多扣只让一次运行少看到些机密内容，漏判让机密内容出企业 |
+| D51-4 | **允许列表是工具名或 `*`（发布件校验如此），名字与 `*` 各自的规则**：名字在目录里且被标记，算对外；名字不在目录里（还不存在），算内部，因为不存在的东西不能被调用，真出现并被标记时由 D51-5 在 turn 里拦；`*` 按**目录现在**的内容算：有任何被标记的工具就对外，一个都没有就不是。**不**把"`*`"一律当作对外：运维的 `externalTools` 非空时 `*` 算对外（D44-2，不变）是因为那时运维说过有对外工具；标记没有这个先验，一律当对外会让每个允许 `*` 的发布件都被筛，而 D51-5 已经保证晚到的标记不会让未筛过的上下文出去 | 失败即关闭的另一半不是"多扣"，是"漏不了"：创建时可能错的知识，由 turn 里的闸兜住。一个无条件的规则会把一个窄的信号变成每个通配发布件的负担 |
+| D51-5 | **turn 里的闸：运行创建时没有筛过，而网关现在把某个工具标为外部——这次调用被拒，运行继续。** `prepareTools` 在 turn 的 `tools/list` 里记下每个工具是否对外（运维的模式或标记），其中"只有标记、没有模式"的另记（`turn.marked`）。判断"筛过没有"：运行的 input 里 `externalTools` 为真（创建时就判为对外，或子运行有对外工具而继承的 CMI 条目已被去掉），或 `contextCeiling` 非空（因别的原因筛过，同一个上限，附件与 CMI 条目都按它筛过）。两者都不是，而被调的工具是"只有标记"的：该调用记为 `DENIED`，结果文字 `not run: the gateway now marks this tool as one that sends content outside the enterprise, and this run was created without its context being screened for such a tool; start a new run`，写 `idp.host/tool.denied {…, marked: true}`；**在询问确认之前**拒，模型看到这句工具错误，别的工具照常。工具仍列在模型的工具表里，所以模型会尝试并得到这句话，而不是一个"没有这个工具" | 选择"拒绝这次调用"而不是"让运行失败"：未筛过的上下文只有在内容被送出时才有害，拒绝这一次调用就挡住了；运行的其余部分（内部工具、回答）没有风险，失败会把成员已经等了的结果也扔掉。选择"留在工具表里"而不是"藏起来"：模型被明确告知原因，成员在运行里看得到，而不是一个悄悄缺失的能力。创建时有目录的话这一闸只在两次访问之间目录变了时才触发 |
+| D51-6 | **标记在运维列表算数的每个地方都算数。** (a) 创建时"可能把内容送出企业"只在 `FilePolicy.outward`（经 `judgeTools`）一处算，附件、CMI 条目、`Input.ExternalTools`（D49 的"没有对外工具也没有来源就不检查"也读它）都由它来；(b) turn 里，`toolResults: off` 按 `wrap` 处理（D44-8）在"运行创建时判为对外"或"目录现在有可调用的对外工具"时生效，`idp.host/guard.raised` 多 `marked`：本 turn 目录里被标记的工具名；(c) D49 的来源收集看 `turn.external`（运维的模式或标记），不再只看模式；(d) 子运行：harness 把本 turn 目录里被标记的工具名（转义成 `path.Match` 模式）并入交给 `CreateChildRun` 的 `externalTools`，所以存储层判断子运行的发布件、去掉继承的 CMI 条目的规则不变（D44-10）；(e) 运维的 `confirmTools`、`neverResendTools`（D47）不变，标记不让工具被确认，也不影响重发 | "与运维列出的一样"是这条决定的全部；少了任何一处，标记的工具在那一处就是内部工具 |
+| D51-7 | **子 agent（D48）同一规则。** `viaSubagents` 对子 agent 的发布件用同一个 `judgeTools`，同一个网关的目录一次创建只读一次，结果进 `via`：`sub-agent <路径>: may call an external tool (marked by the gateway: <名>)` 或 `(the catalogue of gateway <名> could not be read, so its tools count as sending content out)`。允许标记工具的子 agent 使父运行对外，父运行就不会读到会写进委派任务的机密内容 | D48 的理由不变：任务文字是自由文本，无法筛 |
+| D51-8 | **事件说清是不是标记造成的。** 创建时，`Outward.Via` 先写自己发布件的原因：`tools marked by the gateway as sending content outside the enterprise: <至多 5 个名字，其余写"and N more">` 或目录读不到的那句；它进入 `idp.host/attachment.withheld`、`idp.host/context.withheld`（含刷新）的 `via`，进入 input 的 `contextVia` 与创建时的日志行。运维的模式造成的对外，`via` 与以前一样为空。`trigger` 的取值不变（`external-tools`）。turn 里：`guard.raised.marked`、`tool.denied.marked` | 运维要能回答"我没配置任何东西，为什么这个运行读不到机密附件"，答案是哪个网关标记了哪个工具；`via` 只放名字与原因，不放内容 |
+
+**规则表（情形 → 结果）**
+
+| 情形 | 创建运行时 | 运行的 turn 里 |
+|---|---|---|
+| 运维的 `externalTools` 匹配允许的工具，或允许 `*` 且运维列了模式 | 对外（D44），不读目录 | 与 D44 一样：包装结果、记来源 |
+| 允许的某个名字在网关目录里被标记（`_meta` 键为布尔 `true`） | 对外；附件与 CMI 条目按上限筛；`via` 写出被标记的工具 | 结果按 `wrap`（`off` 也是）；引用记为来源；`guard.raised` 带 `marked` |
+| 允许的名字在目录里，但没有标记，标记是字符串 `"true"`、1、`null`、`false`、对象、数组，或键写法不同 | 内部（与以前一样） | 内部 |
+| 允许 `*`，目录里至少有一个被标记 | 对外 | 同上 |
+| 允许 `*` 或某个名字，目录里现在没有被标记的匹配项 | 内部 | 内部；若 turn 里目录已变、出现被标记的工具：下一行 |
+| 创建时没有筛过（既非对外，`contextCeiling` 也为空），turn 里的目录显示被调的工具只有标记没有模式 | | **拒绝这次调用**（`DENIED`，`tool.denied.marked`），不问确认，不到网关，运行继续 |
+| 创建时因别的原因筛过（外部模型、子 agent、远端 agent），turn 里出现被标记的工具 | | 调用照常；结果包装，引用记为来源 |
+| 目录读不到（网关不通、超时、凭据被拒、没有凭据、没有 `Client`）：对运行自己的发布件和对子 agent 的发布件 | 对外（失败即关闭）；`via` 写读不到 | 与"对外"一样；turn 里自己的 `tools/list` 失败仍是 `GATEWAY_ERROR`，不变 |
+| 允许一个名字，网关目录里还没有它 | 内部 | 之后若被标记且运行未筛过：拒绝这次调用 |
+| 子 agent 的发布件允许被标记的工具 | 父运行对外（`trigger` 含 `subagent`，`via` 写子 agent 路径与工具名） | 子运行起来时，harness 把标记的名字交给存储层，继承的 CMI 条目照 D44-10 去掉 |
+| `toolExecution: caller` | 不读目录（运行不到网关）；运维的模式照旧 | 不适用 |
+| 发布件没有允许列表或没有网关 | 不读目录 | |
+
+**契约**：不变。`idp.telos.host` 1.11.0 的 schema 与示例不变，事件的新增字段（`via` 里的新条目文字、`guard.raised.marked`、`tool.denied.marked`）是自定义事件的可选字段，不在 schema 里；1.10.0 起 `ContextPolicy` 的描述把触发条件写成"HOST 配置 `gateways[].externalTools`"，与 D51 之后的行为不再逐字相符，是文字上的滞后，要不要为它发 1.11.1 由契约的维护者定。配置没有新字段、没有迁移、没有新指标。
+
+**取舍与边界**：
+- **创建请求多一次到网关的往返**（见 D51-2）。每个网关每次创建一次；有运维的模式命中、没有工具、`toolExecution: caller` 的运行不付。
+- **`*` 看的是目录现在的内容**（D51-4）。创建后才出现的标记工具由 D51-5 拦，代价是一次被拒的调用，不是泄漏。
+- **运维列表的"晚到"不拦。** D51-5 的拒绝只针对"只有标记"的工具：运维在运行创建之后才把某工具加进 `externalTools`（配置变了），该工具的调用仍照旧放行（D44-10 的第二道防线只管子运行）；这是 D44 已有的行为，D51 没有动它。若要同样拦，把 `t.marked[tc.Tool]` 换成 `t.external[tc.Tool]`，一行的改动，要不要另议
+- **别的网关的目录只在静态凭据时读得到。** 子 agent 的发布件用另一个网关，运行没有那个网关的凭据，按"读不到"算（D51-3）。
+- **会话绑定网关的首个访问令牌可能被网关拒**（D38 的测试网关就是这样），创建时按"读不到"算，运行多筛一次；turn 里 harness 会续期。要避免需要在创建时续期，会轮换刷新令牌，没有做。
+- **没有缓存。** 每次创建重读；一个短的 TTL 缓存可以省往返，代价是创建时的知识更久、更常过时，D51-5 兜得住但会多拒几次调用。要不要加，等看到往返的实测延迟再定。
+- **标记不改变确认与重发。** `confirmTools`、`neverResendTools` 仍是运维的事（D44-9、D47）。
+
+**实施**：`internal/mcpclient`（`Tool.External`、`ExternalMetaKey`、`externalMarker`，`ListTools` 读后清掉 `_meta`）；`internal/api`（`Catalogue`、`judgeTools`、`toolVerdict`、`FilePolicy.outward` 与 `viaSubagents` 增 `look` 参数，`API.catalogue`、`listGateway`、`GatewayAuth.Endpoint/Client/StaticBearer`、`API.CatalogueTimeout`，`createRun` 在 `outward` 之前建查询）；`internal/harness`（`turn.external`、`turn.marked`、`screened`、`hasOutwardTools`、`callableMarked`、`externalToolPatterns`、`escapePattern`；`classify` 里的拒绝；`guardedMessages` 的 `wrap`；来源收集）；`cmd/idp-host/main.go`（填 `GatewayAuth`）；`tests/fixtures/fakemcp`（`Tool.Meta`、`Server.Lists()`）。
+
+**验证**：`internal/mcpclient` 的 `TestListToolsReadsTheExternalMarkerAndNothingElseOfMeta`；`internal/api` 的 `TestTheGatewaysMarkerMakesAReleaseOutwardWithoutAnyOperatorPattern`、`TestTheMarkerAndAnUnreadableCatalogueCountForSubagents`、`TestTheCatalogueIsReadWithTheCallersCredentialOncePerGateway`；`internal/harness` 的 `TestAGatewayMarkedToolIsOutwardLikeOneTheOperatorListed`、`TestOnlyTheBooleanTrueUnderTheKeyMarksATool`、`TestAToolThatIsMarkedButWasNotWhenTheRunWasCreatedIsRefused`、`TestChildRunsAreCreatedWithTheToolsTheGatewayMarks`；`tests/integration` 的 `TestTheGatewaysExternalMarkerScreensARunOnPostgres`（没有任何运维配置：对照、四种不算数的标记、标记的运行附件与 CMI 条目被筛并且结果被包装、引用被记下、晚到的标记、网关读不到）。
+
+**拿掉一个控制、看测试失败**：
+
+| 控制 | 拿掉的做法 | 失败的测试 |
+|---|---|---|
+| 读标记（D51-1） | `ListTools` 一律把 `External` 置假 | `TestListToolsReadsTheExternalMarkerAndNothingElseOfMeta`、harness 的 `TestAGatewayMarkedToolIsOutwardLikeOneTheOperatorListed`、`TestAToolThatIsMarkedButWasNotWhenTheRunWasCreatedIsRefused`、`TestChildRunsAreCreatedWithTheToolsTheGatewayMarks`、api 的 `TestTheCatalogueIsReadWithTheCallersCredentialOncePerGateway` |
+| 只认布尔 `true`（D51-1） | 字符串 `"true"` 也算 | `TestListToolsReadsTheExternalMarkerAndNothingElseOfMeta`、`TestOnlyTheBooleanTrueUnderTheKeyMarksATool` |
+| 创建时用目录（D51-2、D51-4） | `judgeTools` 不看目录结果 | `TestTheGatewaysMarkerMakesAReleaseOutwardWithoutAnyOperatorPattern`、`TestTheMarkerAndAnUnreadableCatalogueCountForSubagents` |
+| 创建时读目录（D51-2） | `createRun` 不建查询（`look` 为空） | `TestTheGatewaysExternalMarkerScreensARunOnPostgres`（没有读目录、附件与 CMI 条目没有被筛） |
+| 失败即关闭（D51-3） | 目录读取失败按内部算 | `TestTheGatewaysMarkerMakesAReleaseOutwardWithoutAnyOperatorPattern`、`TestTheMarkerAndAnUnreadableCatalogueCountForSubagents` |
+| 子 agent 看标记（D51-7） | 子 agent 的判断不传查询 | `TestTheMarkerAndAnUnreadableCatalogueCountForSubagents` |
+| 每个网关只问一次（D51-2） | 不记已问的网关 | `TestTheCatalogueIsReadWithTheCallersCredentialOncePerGateway` |
+| turn 里的闸（D51-5） | 去掉拒绝的分支 | `TestAToolThatIsMarkedButWasNotWhenTheRunWasCreatedIsRefused`、`TestTheGatewaysExternalMarkerScreensARunOnPostgres` 的晚到子例 |
+| 别的原因筛过的运行不拒（D51-5） | `screened()` 只看 `externalTools` | `TestAToolThatIsMarkedButWasNotWhenTheRunWasCreatedIsRefused` |
+| 结果包装（D51-6b） | `wrap` 只看创建时的 `externalTools` | `TestAToolThatIsMarkedButWasNotWhenTheRunWasCreatedIsRefused`（别的原因筛过的运行） |
+| 来源收集（D51-6c） | 只看运维的模式 | `TestAGatewayMarkedToolIsOutwardLikeOneTheOperatorListed`、`TestAToolThatIsMarkedButWasNotWhenTheRunWasCreatedIsRefused` |
+| 子运行（D51-6d） | 不把标记的名字交给存储层 | `TestChildRunsAreCreatedWithTheToolsTheGatewayMarks` |
+
+
+**没有做的**：
+- **平台的 compose 与 kind 验收**（合作方上游经 idp-mcp 的端到端）不在本仓库内。
+- **目录的缓存**（见上）。
+- **运维列表晚到时的拒绝**（见上）。
+- **在创建时为会话绑定网关续期凭据**（见上）。
+- **在界面上说明"为什么这个运行读不到机密内容"**：`via` 在事件流里，idp-workspace 的展示另议。
+- **标记之外的上游信息**（上游自己的 `_meta`、注解）仍不被信任，也没有用到。

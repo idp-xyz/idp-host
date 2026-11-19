@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -200,6 +201,8 @@ type turn struct {
 	frontend   map[string]bool
 	visible    map[string]bool
 	stop       <-chan struct{}                      // closed when the worker was told to stop (D47); nil when there is no worker
+	external   map[string]bool                      // gateway tool -> it sends content outside the enterprise, by the operator's patterns or the gateway's marker, as listed now (D44, D51)
+	marked     map[string]bool                      // the part of external that is only the gateway's marker (D51): no pattern of the operator names it
 	repeatable map[string]bool                      // gateway tool -> its annotations as listed now say that calling it again does no harm (D47)
 	subagents  map[string]agent.EmbeddedSubagent    // by tool name (D22)
 	resources  map[string]map[string]agent.Resource // on-demand skill resources by skill and name (D23)
@@ -252,7 +255,7 @@ func (h *Harness) Run(ctx context.Context, c *run.Claim) error {
 		// D35: a run claimed after its deadline does nothing more, not even a call its owner confirmed
 		return h.fail(ctx, c, run.FailTimeout, timeoutMessage)
 	}
-	t := &turn{h: h, ctx: ctx, claim: c, rc: rc, def: rc.Release.Effective(), messages: rc.Messages, stop: run.StopChan(ctx), frontend: map[string]bool{}, visible: map[string]bool{}, repeatable: map[string]bool{},
+	t := &turn{h: h, ctx: ctx, claim: c, rc: rc, def: rc.Release.Effective(), messages: rc.Messages, stop: run.StopChan(ctx), frontend: map[string]bool{}, visible: map[string]bool{}, external: map[string]bool{}, marked: map[string]bool{}, repeatable: map[string]bool{},
 		subagents: map[string]agent.EmbeddedSubagent{}, resources: rc.Release.OnDemandResources()}
 	if rc.Run.Input.ToolExecution == run.ToolExecutionCaller {
 		// ADR-0001 D19: the caller executes every tool. No gateway tools are offered (the release's
@@ -572,6 +575,10 @@ func (t *turn) prepareTools() error {
 				continue
 			}
 			t.visible[tool.Name] = true
+			if byPattern := agent.MatchesTool(gw.ExternalTools, tool.Name); byPattern || tool.External {
+				t.external[tool.Name] = true
+				t.marked[tool.Name] = tool.External && !byPattern
+			}
 			if tool.SafeToRepeat() {
 				t.repeatable[tool.Name] = true
 			}
@@ -943,7 +950,7 @@ func (t *turn) delegate(tc run.ToolCall) error {
 		}
 		return t.answer(tc, run.CallDone, res.Text, "")
 	}
-	if _, err := t.h.Store.CreateChildRun(t.ctx, t.claim, run.ChildRunInput{ToolCallID: tc.ID, Agent: sub, Input: args.Input, Gateway: t.def.Tools.Gateway, ExternalTools: t.h.externalToolPatterns()}); err != nil {
+	if _, err := t.h.Store.CreateChildRun(t.ctx, t.claim, run.ChildRunInput{ToolCallID: tc.ID, Agent: sub, Input: args.Input, Gateway: t.def.Tools.Gateway, ExternalTools: t.externalToolPatterns()}); err != nil {
 		if errors.Is(err, run.ErrFenced) || t.ctx.Err() != nil {
 			return err
 		}
@@ -1088,7 +1095,7 @@ func (t *turn) execute(tc run.ToolCall) (bool, error) {
 	// D49: the citations of a tool that sends content outside the enterprise become sources of this run. The text the model
 	// reads is the result's text, as before; what is recorded here is never given to a model.
 	var src *run.SourceBatch
-	if agent.MatchesTool(t.gateway.ExternalTools, tc.Tool) {
+	if t.external[tc.Tool] {
 		if b := run.ParseCitations(res.StructuredContent); !b.Empty() {
 			src = &b
 		}
@@ -1664,6 +1671,12 @@ func (t *turn) classify(step int, msg agui.Message) ([]run.ToolCall, []agui.Even
 		case !t.visible[tc.Tool] && !t.hostTool(tc.Tool):
 			tc.State, tc.Result = run.CallDenied, "tool not available to this agent"
 			events = append(events, agui.Custom(agui.CustomToolDenied, map[string]any{"toolCallId": tc.ID, "tool": tc.Tool, "reason": tc.Result}))
+		case t.marked[tc.Tool] && !t.screened():
+			// D51: the gateway lists this tool as external now, but the run was created without screening its context for a
+			// tool that sends content out (the catalogue changed since, or was not as the HOST read it): the call is refused,
+			// before any confirmation is asked, and the rest of the run goes on
+			tc.State, tc.Result = run.CallDenied, "not run: the gateway now marks this tool as one that sends content outside the enterprise, and this run was created without its context being screened for such a tool; start a new run"
+			events = append(events, agui.Custom(agui.CustomToolDenied, map[string]any{"toolCallId": tc.ID, "tool": tc.Tool, "reason": tc.Result, "marked": true}))
 		case t.def.Confirmation.For(tc.Tool) == agent.ConfirmConfirm || t.hostRequiresConfirmation(tc.Tool):
 			tc.State = run.CallPendingConfirmation
 			tc.ConfirmationExpiresAt = now.Add(time.Duration(t.def.Limits.ConfirmationTimeoutSeconds) * time.Second)
@@ -1759,14 +1772,63 @@ func (t *turn) abandon(records []run.ToolCall, after int) error {
 }
 
 // externalToolPatterns are the gateways' external-tool patterns by gateway name, for the store to judge a child's release.
-func (h *Harness) externalToolPatterns() map[string][]string {
+// The tools the gateway marks external in this turn's listing count as patterns for the gateway the run uses (D51), so a
+// child that may call one is judged as one that may call a tool the operator lists.
+func (t *turn) externalToolPatterns() map[string][]string {
 	out := map[string][]string{}
-	for name, g := range h.Gateways {
+	for name, g := range t.h.Gateways {
 		if len(g.ExternalTools) > 0 {
-			out[name] = g.ExternalTools
+			out[name] = append([]string(nil), g.ExternalTools...)
+		}
+	}
+	if gw := t.def.Tools.Gateway; gw != "" {
+		for name := range t.marked {
+			out[gw] = append(out[gw], escapePattern(name))
 		}
 	}
 	return out
+}
+
+// escapePattern makes a tool name a path.Match pattern that matches that name only.
+func escapePattern(name string) string {
+	return strings.NewReplacer(`\`, `\\`, "*", `\*`, "?", `\?`, "[", `\[`).Replace(name)
+}
+
+// screened reports whether what the run was given was screened against the sensitivity ceiling when it was created, for
+// a model or a tool outside the enterprise or a sub-agent (D43, D44, D48), or is not the parent's unscreened context (a
+// child that has an outward tool is not handed it). Such a run may call a tool that sends content out.
+func (t *turn) screened() bool {
+	return t.rc.Run.Input.ExternalTools || t.rc.Run.Input.ContextCeiling != ""
+}
+
+// callableMarked lists the gateway-marked tools of this turn that the run may call, sorted.
+func (t *turn) callableMarked() []string {
+	if !t.screened() {
+		return nil
+	}
+	var out []string
+	for name := range t.marked {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// hasOutwardTools reports whether the run has a tool that sends content outside the enterprise: its release does by
+// what the HOST decided at creation (D44), or the gateway lists one now that the run may call (D51).
+func (t *turn) hasOutwardTools() bool {
+	if t.rc.Run.Input.ExternalTools {
+		return true
+	}
+	if !t.screened() {
+		return false
+	}
+	for name := range t.external {
+		if t.visible[name] {
+			return true
+		}
+	}
+	return false
 }
 
 // hostRequiresConfirmation reports whether the HOST's configuration makes calls of the tool wait for the member
@@ -1795,11 +1857,15 @@ func (t *turn) guardedMessages() ([]agui.Message, error) {
 	// D44: tool results of a run that may call a tool sending content outside the enterprise are always wrapped as
 	// untrusted. A release is immutable while the HOST's configuration is not, so the release's "off" is overridden here
 	// and not refused when the release is published.
-	if t.rc.Run.Input.ExternalTools && in.ToolResults == guard.ModeOff {
+	if t.hasOutwardTools() && in.ToolResults == guard.ModeOff {
 		in.ToolResults = guard.ModeWrap
 		if !t.flagged["raised"] {
 			t.flagged["raised"] = true
-			events = append(events, agui.Custom(agui.CustomInputGuardRaised, map[string]any{"configured": guard.ModeOff, "applied": guard.ModeWrap, "reason": "the run has tools that send content outside the enterprise"}))
+			raised := map[string]any{"configured": guard.ModeOff, "applied": guard.ModeWrap, "reason": "the run has tools that send content outside the enterprise"}
+			if marked := t.callableMarked(); len(marked) > 0 { // D51: say when it is the gateway's marker
+				raised["marked"] = marked
+			}
+			events = append(events, agui.Custom(agui.CustomInputGuardRaised, raised))
 		}
 	}
 	if in.ToolResults != guard.ModeOff || in.Context != guard.ModeOff {

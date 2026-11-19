@@ -76,6 +76,9 @@ gateways:
                                  # model: files and CMI context entries above the ceiling, or without a valid level, are not given to the run
                                  # D48: the same for a run whose release can delegate to a sub-agent that qualifies (at any depth D22 allows), or
                                  # to a remote A2A agent, or to a sub-agent whose release cannot be read; the events' "via" names which one
+                                 # D51: the list is for OUR OWN outward tools (web__*). A tool of an external upstream is outward without being
+                                 # listed: the gateway marks it in tools/list (_meta "io.idp.telos/external": true), and the HOST reads the marker
+                                 # (only that key, only the boolean true) when a run is created, with the caller's credential, and again each turn
     confirmTools: ["web__web_open_url"]   # D44: patterns of the tools whose calls always wait for the member, whatever the release says
     neverResendTools: ["sandbox_write*"]  # D47: patterns of the tools whose call that was in progress when a worker stopped is never sent again, whatever
                                           # the gateway's annotations say (see below)
@@ -101,6 +104,8 @@ provider 的 `retry` 与 `idleTimeoutSeconds`（ADR D45、D46）都可以不配�
 **worker 中断时进行中的工具调用（ADR D47，修订 D3）。** worker 停止或崩溃时，HOST 分不清"已经执行完但结果丢了"和"根本没发出去"，所以接手的 turn 对记为 `EXECUTING` 的网关工具调用只在重发无害时才重发：网关现在列出的该工具带 `readOnlyHint` 或 `idempotentHint`（`tools/list` 的 `annotations`），且没有被网关条目的 `neverResendTools`（模式语法与校验同 `externalTools`，匹配即永不重发，不看标注）点名。其余调用（没有标注、标注为假、网关已不再列出该工具、任何子智能体调用）不重发：模型收到一条工具错误，说明调用被中断、结果未知、可能已经做了也可能没有、重做之前先核实；运行的事件流记 `idp.host/tool.interrupted {toolCallId, tool, resent, reason}`（`resent: true` 的是被重发的那次重复；`reason` 为 `worker_stopped`，期限与取消打断的调用为 `deadline`、`canceled`），指标 `idp_host_tool_interruptions_total{resent, reason}` 同样计数。助手消息与它的工具调用记录在同一个事务里写入，工具调用的最终状态与它的工具消息也是；旧数据里缺的记录或工具消息，续跑时补建并照常执行。收到 SIGTERM 的 worker 不再认领运行，进行中的调用（模型调用、工具调用、远程智能体调用）做完，不开始任何新的调用，在下一个边界把运行交还（运行仍是 `RUNNING`，下一个 worker 立刻认领，不等租约过期）；超过 `IDP_HOST_STOP_GRACE`（缺省 `20s`；必须小于平台的终止宽限期：Kubernetes 清单的 `terminationGracePeriodSeconds` 为 30 秒，compose 的 host-worker 为 `stop_grace_period: 30s`）仍在进行的才被中断；`0` 表示立即中断。
 
 `cmi.remember` 是纯配置：运营方打开后，**所有** `context.cmi = true` 的 agent 都会被记住（契约不变；按 agent 退出需要改契约，见 ADR D33）。写入在运行终态之后异步进行，失败只记日志并计入 `idp_host_memory_writes_total{outcome}`（written / replayed / rejected / failed / auth_failed / no_credential），绝不影响运行。
+
+**网关标出的外部工具（ADR D51）。** 合作方上游的工具不必再抄进 `externalTools`：idp-mcp 在 `tools/list` 里给这类工具的 `_meta` 标 `"io.idp.telos/external": true`，HOST 只读这一个键、只认 JSON 布尔 `true`，别的值与别的键都不算，当作与运维列出的对外工具一样：创建运行时（用调用者自己的凭据，每个网关至多一次 `tools/list`，超时 `CatalogueTimeout`，缺省 8 秒）发现发布件允许这样的工具，附件与 CMI 上下文按上限筛，`via` 写明是网关标记的哪些工具；读不到网关的目录按对外算；运行时结果按 `wrap`、引用记为来源、子 agent 同一规则。创建时没有筛过、而网关事后才把被调的工具标为外部的运行，那次调用被拒（`idp.host/tool.denied`，`marked: true`），运行继续。`externalTools` 仍用于我们自己的对外工具（如 `web__*`）。契约不变。
 
 **运行的来源与引用核对（ADR D49，契约 1.11.0）。** 发布件的工具匹配网关的 `externalTools`（D44）时，HOST 读它的结果里的 `structuredContent.citations`（`{n, title, url, fetchedAt?, sha256?}`），把校验过的条目记成本次运行的来源：编号唯一、至多 100 条、只存标题与地址（不存摘录与页面正文）、标题是不可信的文字，只作数据保存和展示，不会进入任何模型请求；本地子 agent 找到的来源也记入父运行。运行完成时，HOST 在最终回答里找 `[n]`（`[1][2]`、`[1, 2]`；Markdown 链接、代码、`[x]`、`[2026]`、`[1-3]` 都不是引用），在来源里的记 `cited: true`，不在的列入 `unverifiedCitations`；只标记，不拦截、不改回答；既没有对外工具也没有来源的运行不检查。运行的表示（`GET /v1/runs/{id}`、线程的运行列表、`subruns`）多出可选的 `sources`（按 `n` 排序）与 `unverifiedCitations`；运行结束时事件流里有一条 `idp.host/run.sources`（完整列表与丢弃、冲突的计数）。没有新的设置；存储在迁移 `0010_run_sources.sql` 的表 `run_sources`（按租户的行级安全）。
 

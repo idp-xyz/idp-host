@@ -70,13 +70,13 @@ func TestARunIsOutwardWhenAReachableSubagentOrARemoteAgentIs(t *testing.T) {
 	for name, c := range cases {
 		pol := p
 		pol.Release = c.subs.release
-		o := pol.outward(context.Background(), "t", c.root)
+		o := pol.outward(context.Background(), "t", c.root, nil)
 		if o.Trigger != c.trig || (c.viaIn == "") != (len(o.Via) == 0) || !strings.Contains(strings.Join(o.Via, "\n"), c.viaIn) {
 			t.Errorf("%s: trigger %q via %q", name, o.Trigger, o.Via)
 		}
 	}
 	// no way to read releases at all: unknown, so outward
-	if o := p.outward(context.Background(), "t", node("onprem", "edge", nil, 0, "calc")); o.Trigger != "subagent" {
+	if o := p.outward(context.Background(), "t", node("onprem", "edge", nil, 0, "calc"), nil); o.Trigger != "subagent" {
 		t.Errorf("without a resolver: %q", o.Trigger)
 	}
 }
@@ -88,7 +88,7 @@ func TestTheWalkOverSubagentsTerminatesAndIsBounded(t *testing.T) {
 	// a release that names itself (a digest cycle that D22 forbids at compile time, but a store could hold one)
 	loop := tree{"d-a": node("onprem", "edge", nil, 5, "a")}
 	p.Release = loop.release
-	if o := p.outward(context.Background(), "t", node("onprem", "edge", nil, 5, "a")); o.Trigger != "" {
+	if o := p.outward(context.Background(), "t", node("onprem", "edge", nil, 5, "a"), nil); o.Trigger != "" {
 		t.Errorf("a cycle of harmless releases is not outward: %q %q", o.Trigger, o.Via)
 	}
 	// a chain longer than the deepest nesting D22 allows, every release claiming a limit above the largest D22 allows (a store could hold one)
@@ -97,7 +97,7 @@ func TestTheWalkOverSubagentsTerminatesAndIsBounded(t *testing.T) {
 		chain[fmt.Sprintf("d-n%d", i)] = node("onprem", "edge", nil, 9, fmt.Sprintf("n%d", i+1))
 	}
 	p.Release = chain.release
-	o := p.outward(context.Background(), "t", node("onprem", "edge", nil, 9, "n0"))
+	o := p.outward(context.Background(), "t", node("onprem", "edge", nil, 9, "n0"), nil)
 	if o.Trigger != "subagent" || !strings.Contains(strings.Join(o.Via, "\n"), "too many levels or releases") {
 		t.Errorf("a chain beyond the depth limit: %q %q", o.Trigger, o.Via)
 	}
@@ -116,7 +116,7 @@ func TestTheWalkOverSubagentsTerminatesAndIsBounded(t *testing.T) {
 		reads++
 		return wide.release(ctx, tenant, id, digest)
 	}
-	o = p.outward(context.Background(), "t", node("onprem", "edge", nil, 5, names...))
+	o = p.outward(context.Background(), "t", node("onprem", "edge", nil, 5, names...), nil)
 	if reads > maxSubagentLoads || o.Trigger != "subagent" {
 		t.Errorf("%d reads, %q", reads, o.Trigger)
 	}
@@ -128,7 +128,7 @@ func TestFilesAboveTheCeilingAreWithheldFromAParentWhoseSubagentIsOutward(t *tes
 	atts := []run.Attachment{{Name: "a.txt", Sensitivity: "internal"}, {Name: "b.txt", Sensitivity: "confidential"}}
 	p := FilePolicy{Local: map[string]bool{"onprem": true}, ExternalTools: map[string][]string{"edge": {"web__*"}},
 		Release: tree{"d-web": node("onprem", "edge", []string{"web__search"}, 0), "d-calc": node("onprem", "edge", []string{"sum"}, 0)}.release}
-	o := p.outward(context.Background(), "t", node("onprem", "edge", []string{"echo"}, 0, "web"))
+	o := p.outward(context.Background(), "t", node("onprem", "edge", []string{"echo"}, 0, "web"), nil)
 	kept, withheld, ceiling := p.screen("t", o, atts)
 	if names(kept) != "a.txt" || names(withheld) != "b.txt" {
 		t.Fatalf("%s | %s", names(kept), names(withheld))
@@ -138,7 +138,7 @@ func TestFilesAboveTheCeilingAreWithheldFromAParentWhoseSubagentIsOutward(t *tes
 	if v["trigger"] != "subagent" || fmt.Sprint(v["via"]) != "[sub-agent web: may call an external tool]" || strings.Contains(fmt.Sprint(v), "confidential content") {
 		t.Fatalf("%v", v)
 	}
-	if kept, withheld, _ = p.screen("t", p.outward(context.Background(), "t", node("onprem", "edge", []string{"echo"}, 0, "calc")), atts); len(withheld) != 0 || len(kept) != 2 {
+	if kept, withheld, _ = p.screen("t", p.outward(context.Background(), "t", node("onprem", "edge", []string{"echo"}, 0, "calc"), nil), atts); len(withheld) != 0 || len(kept) != 2 {
 		t.Fatalf("the control: %s | %s", names(kept), names(withheld))
 	}
 }

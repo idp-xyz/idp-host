@@ -314,10 +314,10 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 			return fmt.Errorf("gateway %s: %w", g.Name, err)
 		}
 		gw := &harness.Gateway{Name: g.Name, Endpoint: endpoint, ExternalTools: g.ExternalTools, ConfirmTools: g.ConfirmTools, NeverResendTools: g.NeverResendTools, Client: &mcpclient.Client{HTTP: mcpclient.NewHTTPClient(60*time.Second, tlsCfg), Info: mcpclient.ClientInfo{Name: "idp-host", Version: version}}}
-		auth := api.GatewayAuth{}
+		auth := api.GatewayAuth{Endpoint: endpoint, Client: gw.Client} // D51: the API reads the catalogue at run creation
 		switch g.Auth.Mode {
 		case "static":
-			gw.StaticBearer = g.Auth.APIKey
+			gw.StaticBearer, auth.StaticBearer = g.Auth.APIKey, g.Auth.APIKey
 		case "delegation":
 			if box == nil {
 				return fmt.Errorf("gateway %s: delegation needs IDP_HOST_CREDENTIAL_KEY", g.Name)

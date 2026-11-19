@@ -19,7 +19,10 @@ type Tool struct {
 	InputSchema string
 	// Annotations, when set, are listed as the tool's annotations (readOnlyHint, idempotentHint ...).
 	Annotations map[string]any
-	Handle      func(args map[string]any) (text string, isError bool)
+	// Meta, when set, is listed as the tool object's _meta (the gateway marks an external tool there). Any value goes, so
+	// that a test can send a marker that is not the boolean true.
+	Meta   map[string]any
+	Handle func(args map[string]any) (text string, isError bool)
 	// Structured, when set, gives the result's structuredContent.
 	Structured func(args map[string]any) any
 	// HandleAs, when set, answers instead of Handle and Structured with the caller's bearer too, for a tool whose answer
@@ -39,6 +42,7 @@ type Server struct {
 	mu            sync.Mutex
 	bearers       []string
 	calls         []Call
+	lists         int
 }
 
 // Call is one recorded tools/call.
@@ -80,6 +84,13 @@ func (s *Server) Calls() []Call {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]Call(nil), s.calls...)
+}
+
+// Lists returns how many tools/list requests were answered.
+func (s *Server) Lists() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lists
 }
 
 // Bearers returns every bearer seen, in order.
@@ -149,10 +160,16 @@ func (s *Server) Handler() http.Handler {
 				"resultType": "complete", "_meta": info}, nil, 200)
 		case "tools/list":
 			var tools []map[string]any
+			s.mu.Lock()
+			s.lists++
+			s.mu.Unlock()
 			for _, t := range s.Tools {
 				entry := map[string]any{"name": t.Name, "description": t.Description, "inputSchema": json.RawMessage(t.InputSchema)}
 				if t.Annotations != nil {
 					entry["annotations"] = t.Annotations
+				}
+				if t.Meta != nil {
+					entry["_meta"] = t.Meta
 				}
 				tools = append(tools, entry)
 			}
