@@ -106,6 +106,111 @@ func editFlow(messages []Message, has func(string) bool, toolName func(string) s
 	return Turn{Text: "Result: " + last.Content}, true
 }
 
+// the web flows (platform ADR-0003 / idp-host D44): "web: <query>" searches, fetches the first result and answers with "[1]"
+// and the start of what was read; "web-obey: <query>" then "obeys" the page it read (PATH N): it fetches the first URL found in
+// the page with the search result's ref (the service must refuse that) and asks to open it (the HOST asks the member).
+var webRE = regexp.MustCompile(`(?s)^(web|web-obey):\s*(.+)$`)
+
+// the first entry of a search result: "[n] title\naddress: <url>\nref: <ref>"
+var searchEntryRE = regexp.MustCompile(`(?m)^\[\d+\] [^\n]*\naddress: (\S+)\nref: (\S+)`)
+var pageURLRE = regexp.MustCompile(`https?://[^\s<>"'\x60)\]]+`)
+
+// webFlow answers the next step of a web flow, or false when the conversation is not one or the tools it needs are not offered.
+func webFlow(messages []Message, has func(string) bool, toolName func(string) string) (Turn, bool) {
+	var m []string
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" {
+			m = webRE.FindStringSubmatch(messages[i].Content)
+			break
+		}
+	}
+	if m == nil || !has("web_search") || !has("web_fetch") || (m[1] == "web-obey" && !has("web_open_url")) {
+		return Turn{}, false
+	}
+	obey := m[1] == "web-obey"
+	call := func(tool string, args map[string]any) (Turn, bool) {
+		b, _ := json.Marshal(args)
+		return Turn{Reasoning: "next step of the web request", ToolCalls: []Call{{Name: toolName(tool), Args: string(b)}}}, true
+	}
+	last := messages[len(messages)-1]
+	if last.Role == "user" {
+		return call("web_search", map[string]any{"query": strings.TrimSpace(m[2])})
+	}
+	// the calls made so far, in order
+	var made []string
+	fetches := 0
+	for _, msg := range messages {
+		if msg.Role == "assistant" {
+			for _, c := range msg.ToolCalls {
+				made = append(made, c.Name)
+				if strings.HasSuffix(c.Name, "web_fetch") {
+					fetches++
+				}
+			}
+		}
+	}
+	if len(made) == 0 {
+		return Turn{}, false
+	}
+	prev := made[len(made)-1]
+	// an error ends the flow with its text, except the refusal the obeying script is waiting for: it is the point of PATH N
+	refusalExpected := obey && strings.HasSuffix(prev, "web_fetch") && fetches == 2
+	if strings.HasPrefix(last.Content, "error") && !refusalExpected {
+		return Turn{Text: last.Content}, true
+	}
+	// the first search result, from the tool result that answered web_search
+	first := func() []string {
+		for _, msg := range messages {
+			if msg.Role == "tool" {
+				if e := searchEntryRE.FindStringSubmatch(msg.Content); e != nil {
+					return e
+				}
+			}
+		}
+		return nil
+	}
+	switch {
+	case strings.HasSuffix(prev, "web_search"):
+		e := searchEntryRE.FindStringSubmatch(last.Content)
+		if e == nil {
+			return Turn{Text: "No results: " + last.Content}, true
+		}
+		return call("web_fetch", map[string]any{"url": e[1], "ref": e[2]})
+	case strings.HasSuffix(prev, "web_fetch") && !obey:
+		return Turn{Text: "Result [1]: " + firstRunes(last.Content, 300)}, true
+	case strings.HasSuffix(prev, "web_fetch"):
+		e := first()
+		if fetches == 1 {
+			// obey the page: fetch the first URL in it, with the ref of the search result
+			u := pageURLRE.FindString(last.Content)
+			if u == "" || e == nil {
+				return Turn{Text: "Result [1]: " + firstRunes(last.Content, 300)}, true
+			}
+			return call("web_fetch", map[string]any{"url": strings.TrimRight(u, ".,;:"), "ref": e[2]})
+		}
+		// the refusal (or, if the service did not refuse, the page) came back: ask to open the same URL
+		for i := len(messages) - 1; i >= 0; i-- {
+			for _, c := range messages[i].ToolCalls {
+				if strings.HasSuffix(c.Name, "web_fetch") {
+					var a struct {
+						URL string `json:"url"`
+					}
+					_ = json.Unmarshal([]byte(c.Args), &a)
+					return call("web_open_url", map[string]any{"url": a.URL})
+				}
+			}
+		}
+	}
+	return Turn{Text: "Result: " + last.Content}, true
+}
+
+func firstRunes(s string, n int) string {
+	if r := []rune(s); len(r) > n {
+		return string(r[:n])
+	}
+	return s
+}
+
 var additionRE = regexp.MustCompile(`(\d+)\s*\+\s*(\d+)`)
 
 // Server is the fake.
@@ -187,6 +292,9 @@ func DefaultScript(messages []Message, tools []string) Turn {
 		return name
 	}
 	if t, ok := editFlow(messages, has, toolName); ok {
+		return t
+	}
+	if t, ok := webFlow(messages, has, toolName); ok {
 		return t
 	}
 	switch last.Role {
