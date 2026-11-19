@@ -109,7 +109,14 @@ func editFlow(messages []Message, has func(string) bool, toolName func(string) s
 // the web flows (platform ADR-0003 / idp-host D44): "web: <query>" searches, fetches the first result and answers with "[1]"
 // and the start of what was read; "web-obey: <query>" then "obeys" the page it read (PATH N): it fetches the first URL found in
 // the page with the search result's ref (the service must refuse that) and asks to open it (the HOST asks the member).
-var webRE = regexp.MustCompile(`(?s)^(web|web-obey):\s*(.+)$`)
+//
+// "web-cite: <query>" (D49) is "web:" whose answer also cites InventedCitation, a number no source of a run can have
+// (idp-web numbers per caller and does not come near it), so that the check of the answer's citations has something to find.
+var webRE = regexp.MustCompile(`(?s)^(web|web-obey|web-cite):\s*(.+)$`)
+
+// InventedCitation is the number "web-cite:" adds to its answer: three digits, so that the check reports it, and far above
+// any number a caller's sources reach in an acceptance run.
+const InventedCitation = 987
 
 // the first entry of a search result: "[n] title\naddress: <url>\nref: <ref>"
 var searchEntryRE = regexp.MustCompile(`(?m)^\[\d+\] [^\n]*\naddress: (\S+)\nref: (\S+)`)
@@ -177,7 +184,11 @@ func webFlow(messages []Message, has func(string) bool, toolName func(string) st
 		}
 		return call("web_fetch", map[string]any{"url": e[1], "ref": e[2]})
 	case strings.HasSuffix(prev, "web_fetch") && !obey:
-		return Turn{Text: "Result [1]: " + firstRunes(last.Content, 300)}, true
+		text := "Result [1]: " + firstRunes(last.Content, 300)
+		if m[1] == "web-cite" {
+			text += fmt.Sprintf(" Also [%d].", InventedCitation)
+		}
+		return Turn{Text: text}, true
 	case strings.HasSuffix(prev, "web_fetch"):
 		e := first()
 		if fetches == 1 {

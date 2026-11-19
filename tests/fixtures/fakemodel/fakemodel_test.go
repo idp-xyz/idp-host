@@ -113,3 +113,26 @@ func TestWebObeyFlow(t *testing.T) {
 		t.Fatalf("%+v", got)
 	}
 }
+
+// D49: "web-cite:" is the "web:" flow with the same calls, and its answer is the "web:" answer plus a citation of a number no
+// source can have; "web:" itself does not cite it.
+func TestWebCiteFlowAddsAnInventedCitationAndNothingElse(t *testing.T) {
+	tools := []string{"web__web_search", "web__web_fetch", "web__web_open_url"}
+	answer := func(prefix string) (calls []string, text string) {
+		user := Message{Role: "user", Content: prefix + ": what is new"}
+		t1 := DefaultScript([]Message{user}, tools)
+		conv := []Message{user, {Role: "assistant", ToolCalls: t1.ToolCalls}, {Role: "tool", Content: webSearchResult}}
+		t2 := DefaultScript(conv, tools)
+		conv = append(conv, Message{Role: "assistant", ToolCalls: t2.ToolCalls}, Message{Role: "tool", Content: "the page says 41,872"})
+		t3 := DefaultScript(conv, tools)
+		return []string{t1.ToolCalls[0].Args, t2.ToolCalls[0].Args}, t3.Text
+	}
+	plainCalls, plain := answer("web")
+	citeCalls, cite := answer("web-cite")
+	if strings.Join(plainCalls, "|") != strings.Join(citeCalls, "|") {
+		t.Fatalf("the calls differ: %v %v", plainCalls, citeCalls)
+	}
+	if cite != plain+" Also [987]." || strings.Contains(plain, "987") || InventedCitation != 987 {
+		t.Fatalf("%q %q", plain, cite)
+	}
+}
