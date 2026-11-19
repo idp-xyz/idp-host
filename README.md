@@ -49,6 +49,8 @@ IDP_LIVE_OPENAI_URL=http://127.0.0.1:8080/v1 IDP_LIVE_ANTHROPIC_URL=http://127.0
 go test ./internal/run -run TestContract -update   # 改了 AgentRelease / Run 后重新生成契约示例
 ```
 
+CI 与 `deploy/e2e.sh` 里的第三方镜像（PostgreSQL、Keycloak、trivy）先由 `deploy/pull-image.sh` 显式拉取并重试（最多 5 次，间隔 15、30、60、120 秒；本机已有则跳过），因为公共 registry 对匿名拉取按来源地址限流，而 CI 的 runner 与许多项目共用地址。
+
 `deploy/e2e.sh` 需要 idp-mcp 仓库构建的 `idp-mcp:dev` 与 `idp-fixture-upstream:local` 镜像（它们是 MCP 基础设施的发布件，HOST 只消费）。
 
 配置文件（`IDP_HOST_CONFIG`）登记模型端点与网关：

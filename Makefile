@@ -23,6 +23,7 @@ test-integration: pg-up
 
 pg-up:
 	@docker rm -f $(PG_NAME) >/dev/null 2>&1 || true
+	@bash deploy/pull-image.sh $(PG_IMAGE)
 	@docker run -d --name $(PG_NAME) -e POSTGRES_PASSWORD=test -p 127.0.0.1::5432 $(PG_IMAGE) >/dev/null
 	@for i in $$(seq 1 60); do docker exec $(PG_NAME) pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1 && break; sleep 0.5; done
 

@@ -91,6 +91,9 @@ printf 'pending\n' > .local/host.key; chmod 644 .local/host.key
 umask 077
 
 [[ "$MODE" == oidc ]] && SERVICES+=(keycloak)
+# the third-party images of these services (PostgreSQL, Keycloak), named by the compose file, pulled here with retries so that compose has nothing to pull
+mapfile -t THIRD < <("${C[@]}" config --images "${SERVICES[@]}")
+bash deploy/pull-image.sh "${THIRD[@]}"
 "${C[@]}" up -d --wait "${SERVICES[@]}"
 if [[ "$MODE" == oidc ]]; then
   for _ in $(seq 1 90); do "${CURL[@]}" -o /dev/null "$ISSUER/.well-known/openid-configuration" && break; sleep 2; done
