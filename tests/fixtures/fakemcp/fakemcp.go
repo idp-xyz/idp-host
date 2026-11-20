@@ -31,12 +31,18 @@ type Tool struct {
 	// Refuse, when it returns a reason, answers like the gateway does for arguments that fail the pinned schema:
 	// -32602 "Invalid arguments for tool <name>" with data.reason.
 	Refuse func(args map[string]any) string
+	// Delay holds every answer of the tool back this long, and DelayFor (when set, instead) as long as it says for the
+	// arguments: the call is recorded as started when it arrives and as ended when the answer is written, so that a test can
+	// tell which calls ran at the same time (Call.Start, Call.End, MaxInFlight).
+	Delay    time.Duration
+	DelayFor func(args map[string]any) time.Duration
 }
 
 // Server is the fake.
 type Server struct {
 	Tools         []Tool
 	RequireBearer string            // when set, calls must carry exactly this bearer
+	CallBearer    string            // when set, tools/call (not tools/list) must carry exactly this bearer, else 401
 	StreamResults bool              // answer tools/call as an SSE stream
 	Results       map[string]string // when set for a tool name, that text is returned instead of the handler's
 	mu            sync.Mutex
@@ -44,6 +50,8 @@ type Server struct {
 	traceparents  []string // the traceparent header of every tools/call, in the order of calls (D57)
 	calls         []Call
 	lists         int
+	inFlight      int
+	maxInFlight   int
 }
 
 // Call is one recorded tools/call.
@@ -51,6 +59,15 @@ type Call struct {
 	Name   string
 	Args   map[string]any
 	Bearer string
+	Start  time.Time // when the request arrived
+	End    time.Time // when its answer was written; zero while it is in progress
+}
+
+// MaxInFlight is the most tools/call requests that were in progress at the same moment.
+func (s *Server) MaxInFlight() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.maxInFlight
 }
 
 // New returns a server with the default tools: sum (a+b), echo (message), fail (isError), slow.
@@ -189,10 +206,40 @@ func (s *Server) Handler() http.Handler {
 				return
 			}
 			args, _ := req.Params["arguments"].(map[string]any)
+			if s.CallBearer != "" && bearer != s.CallBearer {
+				w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
 			s.mu.Lock()
-			s.calls = append(s.calls, Call{Name: name, Args: args, Bearer: bearer})
+			idx := len(s.calls)
 			s.traceparents = append(s.traceparents, r.Header.Get("Traceparent"))
+			s.calls = append(s.calls, Call{Name: name, Args: args, Bearer: bearer, Start: time.Now()})
+			s.inFlight++
+			if s.inFlight > s.maxInFlight {
+				s.maxInFlight = s.inFlight
+			}
 			s.mu.Unlock()
+			defer func() {
+				s.mu.Lock()
+				s.inFlight--
+				s.calls[idx].End = time.Now()
+				s.mu.Unlock()
+			}()
+			for _, t := range s.Tools {
+				if t.Name == name {
+					d := t.Delay
+					if t.DelayFor != nil {
+						d = t.DelayFor(args)
+					}
+					if d > 0 {
+						select {
+						case <-time.After(d):
+						case <-r.Context().Done():
+						}
+					}
+				}
+			}
 			for _, t := range s.Tools {
 				if t.Name == name && t.Refuse != nil {
 					if reason := t.Refuse(args); reason != "" {

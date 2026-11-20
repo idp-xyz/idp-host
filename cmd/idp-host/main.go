@@ -315,7 +315,7 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 		if err != nil {
 			return fmt.Errorf("gateway %s: %w", g.Name, err)
 		}
-		gw := &harness.Gateway{Name: g.Name, Endpoint: endpoint, ExternalTools: g.ExternalTools, ConfirmTools: g.ConfirmTools, NeverResendTools: g.NeverResendTools, Client: &mcpclient.Client{HTTP: mcpclient.NewHTTPClient(60*time.Second, tlsCfg), Info: mcpclient.ClientInfo{Name: "idp-host", Version: version}}}
+		gw := &harness.Gateway{Name: g.Name, Endpoint: endpoint, ExternalTools: g.ExternalTools, ConfirmTools: g.ConfirmTools, NeverResendTools: g.NeverResendTools, ParallelCalls: g.ParallelCalls, SequentialTools: g.SequentialTools, Client: &mcpclient.Client{HTTP: mcpclient.NewHTTPClient(60*time.Second, tlsCfg), Info: mcpclient.ClientInfo{Name: "idp-host", Version: version}}}
 		auth := api.GatewayAuth{Endpoint: endpoint, Client: gw.Client} // D51: the API reads the catalogue at run creation
 		switch g.Auth.Mode {
 		case "static":

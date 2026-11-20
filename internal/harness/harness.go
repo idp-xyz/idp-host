@@ -90,6 +90,11 @@ type Gateway struct {
 	// NeverResendTools are patterns of the tools whose call that was in progress when a worker stopped is not sent again
 	// by the worker that resumes the run, whatever the gateway's annotations say (D47).
 	NeverResendTools []string
+	// ParallelCalls is how many read-only calls of one step run at once toward this gateway (D53): 0 is the default (4), 1
+	// runs every call one at a time as before. SequentialTools are patterns of the tools that never run beside another call
+	// even though the gateway lists them as read-only (an upstream with a rate limit, a tool whose reads share a cursor).
+	ParallelCalls   int
+	SequentialTools []string
 }
 
 // credentialLeeway: a delegated credential this close to its expiry is renewed before a gateway call.
@@ -213,6 +218,9 @@ type turn struct {
 	external   map[string]bool                      // gateway tool -> it sends content outside the enterprise, by the operator's patterns or the gateway's marker, as listed now (D44, D51)
 	marked     map[string]bool                      // the part of external that is only the gateway's marker (D51): no pattern of the operator names it
 	repeatable map[string]bool                      // gateway tool -> its annotations as listed now say that calling it again does no harm (D47)
+	readOnly   map[string]bool                      // gateway tool -> the gateway lists it with readOnlyHint true: it may run beside other calls (D53)
+	credMu     sync.Mutex                           // guards cred and credErr: the calls of a group ask for the bearer at once (D53)
+	credErr    error                                // a renewal that failed for good: asked again, the answer is the same (D53)
 	subagents  map[string]agent.EmbeddedSubagent    // by tool name (D22)
 	resources  map[string]map[string]agent.Resource // on-demand skill resources by skill and name (D23)
 	waiting    bool                                 // a delegated call's child run has not ended yet
@@ -275,7 +283,7 @@ func (h *Harness) Run(ctx context.Context, c *run.Claim) (err error) {
 		// D35: a run claimed after its deadline does nothing more, not even a call its owner confirmed
 		return h.fail(ctx, c, run.FailTimeout, timeoutMessage)
 	}
-	t := &turn{h: h, ctx: ctx, claim: c, rc: rc, def: rc.Release.Effective(), messages: rc.Messages, stop: run.StopChan(ctx), frontend: map[string]bool{}, visible: map[string]bool{}, external: map[string]bool{}, marked: map[string]bool{}, repeatable: map[string]bool{},
+	t := &turn{h: h, ctx: ctx, claim: c, rc: rc, def: rc.Release.Effective(), messages: rc.Messages, stop: run.StopChan(ctx), frontend: map[string]bool{}, visible: map[string]bool{}, external: map[string]bool{}, marked: map[string]bool{}, repeatable: map[string]bool{}, readOnly: map[string]bool{},
 		subagents: map[string]agent.EmbeddedSubagent{}, resources: rc.Release.OnDemandResources()}
 	if rc.Run.Input.ToolExecution == run.ToolExecutionCaller {
 		// ADR-0001 D19: the caller executes every tool. No gateway tools are offered (the release's
@@ -563,7 +571,7 @@ func (t *turn) prepareTools() error {
 			return h.fail(t.ctx, t.claim, run.FailGateway, "gateway "+t.def.Tools.Gateway+" is not configured")
 		}
 		t.gateway = gw
-		bearer, err := t.gatewayBearer(false)
+		bearer, err := t.gatewayBearer()
 		if err != nil {
 			return t.credentialFailure(nil, err)
 		}
@@ -574,7 +582,7 @@ func (t *turn) prepareTools() error {
 			return errInterrupted
 		}
 		if mcpclient.Unauthorized(err) { // D38: renewed once; a credential the gateway still refuses ends the run
-			if bearer, err = t.gatewayBearer(true); err != nil {
+			if bearer, err = t.refusedBearer(bearer); err != nil {
 				return t.credentialFailure(nil, err)
 			}
 			lctx, cancel := context.WithTimeout(t.callCtx, h.ToolTimeout)
@@ -605,6 +613,9 @@ func (t *turn) prepareTools() error {
 			}
 			if tool.SafeToRepeat() {
 				t.repeatable[tool.Name] = true
+			}
+			if tool.Annotations.ReadOnlyHint {
+				t.readOnly[tool.Name] = true // D53: only the gateway's read-only statement, not idempotent
 			}
 			if props := fileProperties(tool.InputSchema); len(props) > 0 {
 				if t.fileProps == nil {
@@ -696,15 +707,8 @@ func (t *turn) fileArguments(tc run.ToolCall) (json.RawMessage, bool, string, er
 		if json.Unmarshal(raw, &v) != nil {
 			return nil, false, name + " must be a string", nil
 		}
-		if t.tickets == nil && (len(in.Attachments) > 0 || in.Delivery) {
-			tk, err := t.h.Store.FileTickets(t.ctx, t.claim)
-			if err != nil {
-				return nil, false, "", err
-			}
-			if tk == nil {
-				tk = &run.FileTickets{}
-			}
-			t.tickets = tk
+		if err := t.loadTickets(); err != nil {
+			return nil, false, "", err
 		}
 		var ticket string
 		switch format {
@@ -733,6 +737,22 @@ func (t *turn) fileArguments(tc run.ToolCall) (json.RawMessage, bool, string, er
 	return out, delivers, "", err
 }
 
+// loadTickets loads the run's file tickets once, when the run has files to attach or deliver.
+func (t *turn) loadTickets() error {
+	in := t.rc.Run.Input
+	if t.tickets == nil && (len(in.Attachments) > 0 || in.Delivery) {
+		tk, err := t.h.Store.FileTickets(t.ctx, t.claim)
+		if err != nil {
+			return err
+		}
+		if tk == nil {
+			tk = &run.FileTickets{}
+		}
+		t.tickets = tk
+	}
+	return nil
+}
+
 // delivered reads what a delivering call returned (structuredContent.deliveredFile) as the file.delivered event.
 func delivered(tc run.ToolCall, res *mcpclient.CallResult) (agui.Event, bool) {
 	var s struct {
@@ -752,12 +772,25 @@ func delivered(tc run.ToolCall, res *mcpclient.CallResult) (agui.Event, bool) {
 }
 
 // gatewayBearer returns the bearer for the gateway (D38): the static one, or the run's delegated credential, renewed with
-// its refresh token when it expires within credentialLeeway (or always, when force). A credential that has expired
-// and cannot be renewed, or a session that has ended, is a *run.Failure: the run ends with it.
-func (t *turn) gatewayBearer(force bool) (string, error) {
+// its refresh token when it expires within credentialLeeway. A credential that has expired and cannot be renewed, or a
+// session that has ended, is a *run.Failure: the run ends with it.
+func (t *turn) gatewayBearer() (string, error) { return t.bearerFor(false, "") }
+
+// refusedBearer is the bearer to use after the gateway refused the token `refused` (D38): the credential is renewed. D53:
+// the calls of a group may all be refused with the same token; the first one that gets here renews, and the others find the
+// credential already different from the one they were refused with and use the renewed one, so the authorization server
+// is asked once and no call renews a credential a sibling has just obtained.
+func (t *turn) refusedBearer(refused string) (string, error) { return t.bearerFor(true, refused) }
+
+func (t *turn) bearerFor(force bool, refused string) (string, error) {
 	gw, h := t.gateway, t.h
 	if gw.StaticBearer != "" {
 		return gw.StaticBearer, nil
+	}
+	t.credMu.Lock()
+	defer t.credMu.Unlock()
+	if t.credErr != nil {
+		return "", t.credErr
 	}
 	if t.cred == nil {
 		tok, err := h.Store.RunCredential(t.ctx, t.claim)
@@ -765,6 +798,9 @@ func (t *turn) gatewayBearer(force bool) (string, error) {
 			return "", err
 		}
 		t.cred = tok
+	}
+	if force && t.cred.AccessToken != refused {
+		return t.cred.AccessToken, nil // renewed meanwhile by a call that was refused with the same token (D53)
 	}
 	now := h.Now()
 	valid := t.cred.ExpiresAt.IsZero() || now.Before(t.cred.ExpiresAt)
@@ -775,8 +811,9 @@ func (t *turn) gatewayBearer(force bool) (string, error) {
 		if valid && !force {
 			return t.cred.AccessToken, nil
 		}
-		return "", &run.Failure{Code: run.FailCredential, Message: "the delegated credential expired at " + t.cred.ExpiresAt.UTC().Format(time.RFC3339) +
+		t.credErr = &run.Failure{Code: run.FailCredential, Message: "the delegated credential expired at " + t.cred.ExpiresAt.UTC().Format(time.RFC3339) +
 			" and cannot be renewed: send the request again"}
+		return "", t.credErr
 	}
 	rctx, cancel := context.WithTimeout(t.callCtx, 15*time.Second)
 	tok, err := gw.Refresh(rctx, t.cred.RefreshToken)
@@ -786,14 +823,16 @@ func (t *turn) gatewayBearer(force bool) (string, error) {
 	}
 	if err != nil {
 		if errors.Is(err, credential.ErrSessionEnded) {
-			return "", &run.Failure{Code: run.FailCredential, Message: "the user's session has ended (signed out, idle too long or at its maximum length), " +
+			t.credErr = &run.Failure{Code: run.FailCredential, Message: "the user's session has ended (signed out, idle too long or at its maximum length), " +
 				"so the run can no longer act for them: sign in and send the request again"}
+			return "", t.credErr
 		}
 		if valid && !force { // the authorization server did not answer: the current credential still works for now
 			h.Log.Warn("renewing the delegated credential failed", "run", t.claim.RunID, "error", err)
 			return t.cred.AccessToken, nil
 		}
-		return "", &run.Failure{Code: run.FailCredential, Message: "the delegated credential could not be renewed: " + err.Error()}
+		t.credErr = &run.Failure{Code: run.FailCredential, Message: "the delegated credential could not be renewed: " + err.Error()}
+		return "", t.credErr
 	}
 	if err := h.Store.SaveCredential(t.ctx, t.claim, tok); err != nil {
 		return "", err
@@ -877,7 +916,11 @@ func sanitize(err error) string {
 
 // resolveDecided executes confirmed calls and answers rejected or expired ones.
 func (t *turn) resolveDecided() error {
-	for _, tc := range t.rc.ToolCalls {
+	calls := t.rc.ToolCalls
+	if t.gateway != nil && t.gateway.parallelLimit() > 1 {
+		calls = t.inCallOrder(calls) // D53: what is left of a step is answered in the order the model asked for it
+	}
+	for _, tc := range calls {
 		switch tc.State {
 		case run.CallConfirmed:
 			if _, err := t.execute(tc); err != nil {
@@ -991,18 +1034,24 @@ func (t *turn) delegate(tc run.ToolCall) error {
 
 // readResource answers a resource__read call from the release's own content.
 func (t *turn) readResource(tc run.ToolCall) error {
+	state, result, errText := t.resourceResult(tc)
+	return t.answer(tc, state, result, errText)
+}
+
+// resourceResult is what a resource__read call comes to; it reads the release only.
+func (t *turn) resourceResult(tc run.ToolCall) (state, result, errText string) {
 	var args struct {
 		Skill string `json:"skill"`
 		Name  string `json:"name"`
 	}
 	if err := json.Unmarshal([]byte(tc.Arguments), &args); err != nil {
-		return t.answer(tc, run.CallFailed, "", "skill and name are required")
+		return run.CallFailed, "", "skill and name are required"
 	}
 	r, ok := t.resources[args.Skill][args.Name]
 	if !ok {
-		return t.answer(tc, run.CallFailed, "", fmt.Sprintf("no on-demand resource %s/%s", args.Skill, args.Name))
+		return run.CallFailed, "", fmt.Sprintf("no on-demand resource %s/%s", args.Skill, args.Name)
 	}
-	return t.answer(tc, run.CallDone, r.Content, "")
+	return run.CallDone, r.Content, ""
 }
 
 // answer appends the tool message for a call and marks the call resolved.
@@ -1032,6 +1081,20 @@ func (t *turn) answerSourced(tc run.ToolCall, state, result, errText string, src
 	return nil
 }
 
+// callOutcome is what a gateway call came to (D53), before anything of it is written: the one-at-a-time path and a
+// group's committer write it the same way.
+type callOutcome struct {
+	state, result, errText string
+	src                    *run.SourceBatch // D49
+	deliver                *agui.Event      // the file.delivered event of a delivering call
+	res                    *mcpclient.CallResult
+	ok                     bool  // the call went through and the tool did not report an error
+	interrupted            bool  // the deadline or a cancel reached the call (D46)
+	failure                error // the credential cannot be used (D38), or a store error from asking for it: the run ends with it
+	err                    error // a store error before the call was sent
+	skipped                bool  // a group's call that was not started
+}
+
 // execute runs a confirmed or automatic call: a sub-agent delegation, a resource read, or a gateway
 // call whose result is recorded.
 func (t *turn) execute(tc run.ToolCall) (bool, error) {
@@ -1059,36 +1122,74 @@ func (t *turn) execute(tc run.ToolCall) (bool, error) {
 	if err := h.Store.UpdateToolCall(t.ctx, t.claim, tc.ID, run.CallExecuting, "", false, nil); err != nil {
 		return false, err
 	}
-	bearer, err := t.gatewayBearer(false)
-	if errors.Is(err, errInterrupted) {
+	t.ensureLimits()
+	o := t.invoke(t.callCtx, tc, args, delivers)
+	t.lastResult = o.res
+	return t.settleOutcome(tc, o)
+}
+
+// settleOutcome writes what a call came to: the call's final state with its tool message (D47), the sources (D49) and the
+// delivered file's event. A call the deadline or a cancel reached is recorded as interrupted (D46), a credential that
+// cannot be used ends the run (D38).
+func (t *turn) settleOutcome(tc run.ToolCall, o callOutcome) (bool, error) {
+	switch {
+	case o.interrupted:
 		return false, t.interruptedCall(&tc)
+	case o.err != nil:
+		return false, o.err
+	case o.failure != nil:
+		return false, t.credentialFailure(&tc, o.failure)
+	}
+	if o.deliver != nil {
+		if err := t.h.Store.AppendEvents(t.ctx, t.claim, []agui.Event{*o.deliver}); err != nil {
+			return false, err
+		}
+	}
+	return o.ok, t.answerSourced(tc, o.state, o.result, o.errText, o.src)
+}
+
+// invoke sends a gateway call with the run's credential, once more with a renewed one when the gateway refuses it
+// (D38), and decides what the call came to. It writes nothing and changes nothing of the turn that a sibling call reads:
+// the calls of a group run it at once (D53). ctx is what the call is bounded by (the turn's call context, or the group's).
+func (t *turn) invoke(ctx context.Context, tc run.ToolCall, args json.RawMessage, delivers bool) callOutcome {
+	h := t.h
+	reached := func() bool { return t.callCtx.Err() != nil } // D46: the deadline or a cancel
+	bearer, err := t.gatewayBearer()
+	if errors.Is(err, errInterrupted) {
+		return callOutcome{interrupted: true}
 	}
 	if err != nil {
-		return false, t.credentialFailure(&tc, err)
+		return callOutcome{failure: err}
 	}
 	start := h.Now()
-	cctx, cancel := context.WithTimeout(t.callCtx, h.ToolTimeout)
+	cctx, cancel := context.WithTimeout(ctx, h.ToolTimeout)
 	res, err := t.gateway.Client.CallTool(cctx, t.gateway.Endpoint, bearer, tc.Tool, args)
 	cancel()
-	if err != nil && t.callCtx.Err() != nil {
-		return false, t.interruptedCall(&tc) // D46: the deadline or a cancel reached the call
+	if err != nil && reached() {
+		return callOutcome{interrupted: true}
+	}
+	if err != nil && ctx.Err() != nil {
+		return callOutcome{skipped: true} // the group was given up by its own committer: nothing is recorded for this call
 	}
 	if mcpclient.Unauthorized(err) {
 		// D38: the gateway refused the credential before it reached the tool, so the call is made again once with a
 		// renewed one; a refusal after that ends the run instead of handing the model an error it cannot fix
-		if bearer, err = t.gatewayBearer(true); errors.Is(err, errInterrupted) {
-			return false, t.interruptedCall(&tc)
+		if bearer, err = t.refusedBearer(bearer); errors.Is(err, errInterrupted) {
+			return callOutcome{interrupted: true}
 		} else if err != nil {
-			return false, t.credentialFailure(&tc, err)
+			return callOutcome{failure: err}
 		}
-		cctx, cancel := context.WithTimeout(t.callCtx, h.ToolTimeout)
+		cctx, cancel := context.WithTimeout(ctx, h.ToolTimeout)
 		res, err = t.gateway.Client.CallTool(cctx, t.gateway.Endpoint, bearer, tc.Tool, args)
 		cancel()
-		if err != nil && t.callCtx.Err() != nil {
-			return false, t.interruptedCall(&tc)
+		if err != nil && reached() {
+			return callOutcome{interrupted: true}
+		}
+		if err != nil && ctx.Err() != nil {
+			return callOutcome{skipped: true}
 		}
 		if mcpclient.Unauthorized(err) {
-			return false, t.credentialFailure(&tc, refusedCredential())
+			return callOutcome{failure: refusedCredential()}
 		}
 	}
 	outcome := "ok"
@@ -1097,11 +1198,9 @@ func (t *turn) execute(tc run.ToolCall) (bool, error) {
 		if h.Metrics != nil {
 			h.Metrics.ToolCall(t.gateway.Name, outcome, h.Now().Sub(start))
 		}
-		return false, t.answer(tc, run.CallFailed, "", "tool call failed: "+t.toolCallError(err))
+		return callOutcome{state: run.CallFailed, errText: "tool call failed: " + t.toolCallError(err)}
 	}
-	t.ensureLimits()
 	text := t.redactTickets(res.Text(t.limits.ToolResultBytes))
-	t.lastResult = res
 	if res.IsError {
 		outcome = "tool_error"
 	}
@@ -1109,24 +1208,22 @@ func (t *turn) execute(tc run.ToolCall) (bool, error) {
 		h.Metrics.ToolCall(t.gateway.Name, outcome, h.Now().Sub(start))
 	}
 	if res.IsError {
-		return false, t.answer(tc, run.CallFailed, text, "the tool reported an error")
+		return callOutcome{state: run.CallFailed, result: text, errText: "the tool reported an error", res: res}
 	}
+	o := callOutcome{state: run.CallDone, result: text, res: res, ok: true}
 	if delivers {
 		if ev, ok := delivered(tc, res); ok {
-			if err := h.Store.AppendEvents(t.ctx, t.claim, []agui.Event{ev}); err != nil {
-				return false, err
-			}
+			o.deliver = &ev
 		}
 	}
 	// D49: the citations of a tool that sends content outside the enterprise become sources of this run. The text the model
 	// reads is the result's text, as before; what is recorded here is never given to a model.
-	var src *run.SourceBatch
 	if t.external[tc.Tool] {
 		if b := run.ParseCitations(res.StructuredContent); !b.Empty() {
-			src = &b
+			o.src = &b
 		}
 	}
-	return true, t.answerSourced(tc, run.CallDone, text, "", src)
+	return o
 }
 
 type streamer struct {
@@ -1905,7 +2002,21 @@ func (t *turn) classify(step int, msg agui.Message) ([]run.ToolCall, []agui.Even
 func (t *turn) dispatch(records []run.ToolCall, interrupts []map[string]any) (string, error) {
 	h := t.h
 	frontend, stopped := false, false
-	for i, tc := range records {
+	for i := 0; i < len(records); i++ {
+		tc := records[i]
+		if end := t.groupEnd(records, i); end > i {
+			// D53: consecutive calls that only read run at once; their answers are written in the order of the calls
+			switch err := t.executeGroup(records[i:end]); {
+			case errors.Is(err, errStopped):
+				stopped = true // the calls of the group that were not started stay CONFIRMED for the next worker
+			case errors.Is(err, errInterrupted):
+				return "", t.abandon(records, end-1)
+			case err != nil:
+				return "", err
+			}
+			i = end - 1
+			continue
+		}
 		switch tc.State {
 		case run.CallDenied:
 			// the reason was decided by classify and stored with the record (D47), so a worker that finds the record

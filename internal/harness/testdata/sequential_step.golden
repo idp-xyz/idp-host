@@ -1,0 +1,47 @@
+THREAD
+{"id":"u1","role":"user","content":"go"}
+{"id":"msg#a","role":"assistant","toolCalls":[{"id":"call_1_0","type":"function","function":{"name":"read","arguments":"{\"id\":\"a\"}"}},{"id":"call_1_1","type":"function","function":{"name":"read","arguments":"{\"id\":\"b\"}"}},{"id":"call_1_2","type":"function","function":{"name":"plain","arguments":"{\"id\":\"p\"}"}},{"id":"call_1_3","type":"function","function":{"name":"nowhere","arguments":"{}"}},{"id":"call_1_4","type":"function","function":{"name":"read","arguments":"{\"id\":\"c\",\"fail\":true}"}},{"id":"call_1_5","type":"function","function":{"name":"read","arguments":"{\"id\":\"d\"}"}}]}
+{"id":"tool_call_1_0","role":"tool","content":"read a","toolCallId":"call_1_0"}
+{"id":"tool_call_1_1","role":"tool","content":"read b","toolCallId":"call_1_1"}
+{"id":"tool_call_1_2","role":"tool","content":"plain p","toolCallId":"call_1_2"}
+{"id":"tool_call_1_3","role":"tool","toolCallId":"call_1_3","error":"tool not available to this agent"}
+{"id":"tool_call_1_4","role":"tool","content":"read c failed","toolCallId":"call_1_4","error":"the tool reported an error"}
+{"id":"tool_call_1_5","role":"tool","content":"read d","toolCallId":"call_1_5"}
+{"id":"msg#b","role":"assistant","content":"done"}
+EVENTS
+{"runId":"run_1","threadId":"thr_1","type":"RUN_STARTED"}
+{"stepName":"step-1","type":"STEP_STARTED"}
+{"parentMessageId":"msg#a","toolCallId":"call_1_0","toolCallName":"read","type":"TOOL_CALL_START"}
+{"delta":"{\"id\":\"a\"}","toolCallId":"call_1_0","type":"TOOL_CALL_ARGS"}
+{"toolCallId":"call_1_0","type":"TOOL_CALL_END"}
+{"parentMessageId":"msg#a","toolCallId":"call_1_1","toolCallName":"read","type":"TOOL_CALL_START"}
+{"delta":"{\"id\":\"b\"}","toolCallId":"call_1_1","type":"TOOL_CALL_ARGS"}
+{"toolCallId":"call_1_1","type":"TOOL_CALL_END"}
+{"parentMessageId":"msg#a","toolCallId":"call_1_2","toolCallName":"plain","type":"TOOL_CALL_START"}
+{"delta":"{\"id\":\"p\"}","toolCallId":"call_1_2","type":"TOOL_CALL_ARGS"}
+{"toolCallId":"call_1_2","type":"TOOL_CALL_END"}
+{"parentMessageId":"msg#a","toolCallId":"call_1_3","toolCallName":"nowhere","type":"TOOL_CALL_START"}
+{"delta":"{}","toolCallId":"call_1_3","type":"TOOL_CALL_ARGS"}
+{"toolCallId":"call_1_3","type":"TOOL_CALL_END"}
+{"parentMessageId":"msg#a","toolCallId":"call_1_4","toolCallName":"read","type":"TOOL_CALL_START"}
+{"delta":"{\"id\":\"c\",\"fail\":true}","toolCallId":"call_1_4","type":"TOOL_CALL_ARGS"}
+{"toolCallId":"call_1_4","type":"TOOL_CALL_END"}
+{"parentMessageId":"msg#a","toolCallId":"call_1_5","toolCallName":"read","type":"TOOL_CALL_START"}
+{"delta":"{\"id\":\"d\"}","toolCallId":"call_1_5","type":"TOOL_CALL_ARGS"}
+{"toolCallId":"call_1_5","type":"TOOL_CALL_END"}
+{"name":"idp.host/model.usage","type":"CUSTOM","value":{"attempts":1,"completionTokens":7,"model":"fake-1","promptTokens":40,"provider":"fake","step":1}}
+{"stepName":"step-1","type":"STEP_FINISHED"}
+{"name":"idp.host/tool.denied","type":"CUSTOM","value":{"reason":"tool not available to this agent","tool":"nowhere","toolCallId":"call_1_3"}}
+{"content":"read a","messageId":"tool_call_1_0","role":"tool","toolCallId":"call_1_0","type":"TOOL_CALL_RESULT"}
+{"content":"read b","messageId":"tool_call_1_1","role":"tool","toolCallId":"call_1_1","type":"TOOL_CALL_RESULT"}
+{"content":"plain p","messageId":"tool_call_1_2","role":"tool","toolCallId":"call_1_2","type":"TOOL_CALL_RESULT"}
+{"content":"error: tool not available to this agent","messageId":"tool_call_1_3","role":"tool","toolCallId":"call_1_3","type":"TOOL_CALL_RESULT"}
+{"content":"read c failed","messageId":"tool_call_1_4","role":"tool","toolCallId":"call_1_4","type":"TOOL_CALL_RESULT"}
+{"content":"read d","messageId":"tool_call_1_5","role":"tool","toolCallId":"call_1_5","type":"TOOL_CALL_RESULT"}
+{"stepName":"step-2","type":"STEP_STARTED"}
+{"messageId":"msg#b","role":"assistant","type":"TEXT_MESSAGE_START"}
+{"delta":"done","messageId":"msg#b","type":"TEXT_MESSAGE_CONTENT"}
+{"messageId":"msg#b","type":"TEXT_MESSAGE_END"}
+{"name":"idp.host/model.usage","type":"CUSTOM","value":{"attempts":1,"completionTokens":7,"model":"fake-1","promptTokens":110,"provider":"fake","step":2}}
+{"stepName":"step-2","type":"STEP_FINISHED"}
+{"outcome":{"type":"success"},"runId":"run_1","threadId":"thr_1","type":"RUN_FINISHED"}

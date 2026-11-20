@@ -247,6 +247,26 @@ func TestNeverResendToolsIsReadAndValidatedAtLoad(t *testing.T) {
 	}
 }
 
+// D53: parallelCalls (0 is the default, 1 is one call at a time, at most 32) and sequentialTools (the same patterns as the
+// other tool lists) are read and validated at load, and both are optional.
+func TestParallelCallsAndSequentialToolsAreReadAndValidatedAtLoad(t *testing.T) {
+	gw := func(extra string) string {
+		return "gateways:\n  - {name: web, endpoint: \"https://gw/mcp\", auth: {mode: static, apiKey: k}" + extra + "}\n"
+	}
+	f, err := load(t, gw(`, parallelCalls: 6, sequentialTools: ["db_*"]`))
+	if err != nil || f.Gateways[0].ParallelCalls != 6 || len(f.Gateways[0].SequentialTools) != 1 {
+		t.Fatalf("%+v %v", f.Gateways, err)
+	}
+	if f, err = load(t, gw("")); err != nil || f.Gateways[0].ParallelCalls != 0 || f.Gateways[0].SequentialTools != nil {
+		t.Fatalf("optional: %v", err)
+	}
+	for _, bad := range []string{`parallelCalls: -1`, `parallelCalls: 33`, `sequentialTools: ["["]`, `sequentialTools: [""]`} {
+		if _, err := load(t, gw(", "+bad)); err == nil || !strings.Contains(err.Error(), strings.SplitN(bad, ":", 2)[0]) {
+			t.Errorf("%s: %v", bad, err)
+		}
+	}
+}
+
 // D45, D46: a provider that sets nothing gets the defaults, one that sets the retry and idle settings gets them as the
 // harness and the adapters read them, and a setting that makes no sense is refused when the file is loaded.
 func TestProviderRetryAndIdleSettings(t *testing.T) {

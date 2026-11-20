@@ -285,6 +285,11 @@ type Gateway struct {
 	// NeverResendTools are patterns of the tools whose call, if it was in progress when a worker stopped, is never sent
 	// again whatever the gateway's annotations say (D47): the operator's way to tighten what the catalog claims.
 	NeverResendTools []string `yaml:"neverResendTools"`
+	// ParallelCalls is how many calls of one step that only read run at once toward this gateway (D53): 0 is the default (4),
+	// 1 runs every call one at a time, at most 32. SequentialTools are patterns of the tools that never run beside another
+	// call although the gateway lists them as read-only; it is not neverResendTools, which says nothing about running together.
+	ParallelCalls   int      `yaml:"parallelCalls"`
+	SequentialTools []string `yaml:"sequentialTools"`
 }
 
 // GatewayAuth is how the HOST authenticates to the gateway on the user's behalf.
@@ -535,7 +540,10 @@ func Load(path string) (*File, error) {
 		default:
 			return nil, fmt.Errorf("gateway %s: auth.mode must be delegation or static", g.Name)
 		}
-		for key, patterns := range map[string][]string{"externalTools": g.ExternalTools, "confirmTools": g.ConfirmTools, "neverResendTools": g.NeverResendTools} {
+		if g.ParallelCalls < 0 || g.ParallelCalls > 32 {
+			return nil, fmt.Errorf("gateway %s: parallelCalls must be within [0, 32] (0 is the default, 1 is one call at a time)", g.Name)
+		}
+		for key, patterns := range map[string][]string{"externalTools": g.ExternalTools, "confirmTools": g.ConfirmTools, "neverResendTools": g.NeverResendTools, "sequentialTools": g.SequentialTools} {
 			for _, pat := range patterns {
 				if _, err := pathpkg.Match(pat, ""); pat == "" || err != nil {
 					return nil, fmt.Errorf("gateway %s: %s pattern %q is not a valid tool name pattern", g.Name, key, pat)

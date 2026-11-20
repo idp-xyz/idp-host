@@ -1299,3 +1299,82 @@ D37 让成员的文件经票据进出运行：字节不经过模型。但 agent 
 **验证**：`make test`、`make test-integration PG_NAME=idp-host-prefix-pg` 全绿；`gofmt -l` 无输出；`go vet ./...` 与 `go vet -tags repro ./...` 干净。新测试在 `internal/harness/context_notes_test.go`（留提示：请求是下一个请求的前缀、最新的最后、写明步数、批丢、在底的堆积、没有窗口、默认关）与 `internal/config/context_test.go`（`keepBudgetNotes` 读进设置）；没有窗口的多步黄金（D58）不变，并在没有窗口设了 `KeepNotes` 时同样通过。
 
 **没有做的**：没有对真实的 Strata 服务量：**第一次量就该看 D54 的 `server_cache_n`：批之外的步，它应当约等于上一步的提示 token 数减几个（轮次边界在头之前）**；如果不是，先查聊天模板对 `developer` 角色的渲染（上面 (c)）。没有对着 Strata 的聊天模板验证旧提示的渲染不变；最后两步工具列表变的情形（D41，上面 (d)）没有处理，那两步会整个重读（没有改 D41）；没有用存活的会话（`live`）：它含生成的 token，下一个请求渲染得不同；预测器里提示的角色按"一条消息"算，位置按估算；`--prompt-cache-every` 小于块时的效果依赖块大小，这里的块 8,192 是从两个检查点位置对出来的，不是读的配置；没有给 Anthropic 与 Gemini 的适配器做任何事（D59-5：不要给它们打开）；一个运行恢复（D47）时旧提示不在了（`turn` 重建），第一步按 `start` 批处理，前缀变一次；批把"旧提示"丢掉后，提示的步数号不再连续，只在写明步数的那一条里有意义，这是有意的。
+
+## 41. D53：一步里只读的工具调用同时执行（2026-11-19 决策与实施；编号顺序说明：D53 先于 D54 起草，但在 D54 至 D59 之后并入，所以排在这里）
+
+修订 D4 的"逐个……执行"（逐个过允许列表与确认策略仍是逐个，只读调用的执行可以同时）；沿用 D41（每步调用数上限）、D46（期限与取消）、D47（停止与续跑）、D49（来源）、D51（标记工具的拒绝）、D52（视图按位置与 id 指代结果）。契约不变（没有新的 REST 字段、事件与状态）。
+
+**先说期望。** 2026-11-19 在本机模型上对电子表格任务的测量：637 步里 **634 步只要求一个工具调用，3 步要求两个**；工具执行占时间的 12%，模型占 85% 到 88%。所以**对这些任务，这个改动今天几乎省不下时间**，上面的数字没有给它任何依据，写在这里是为了不让它被当成已经测到的提速。要它有两个原因：一是模型被告知"相互独立的查询一起问"以后（办公技能的文字由别人在改）一步会有多个调用；二是联网任务：一步可以读几个页面，每次读最长 15 秒（idp-web 的 `web_fetch`，一次结果最多 12 KiB），逐个读就是 N 倍。多个调用的步在测量里只占 0.5%，所以任何关于"提速多少"的说法在有联网任务的测量以前都没有依据；本决策实测的只是机制：三个各 2 秒的只读调用，一步里 2.01 秒完成（逐个是 6 秒）。
+
+**起点**（读代码得到，不是假设）：
+
+- `dispatch` 按记录的顺序对每个 `CONFIRMED` 调用调 `execute`，一个调用做完才开始下一个；`DENIED` 的调用原位回答；有待确认的调用不执行，步在最后以 `AWAITING_INPUT` 停下；调用者的工具（`FRONTEND`）不执行；委派（`DELEGATED`）把步停在等子 agent。D41 的上限在 `classify` 里：第 `MaxToolCallsPerStep` 个以后的调用被记成 `DENIED`、原因 "too many tool calls in one step"。
+- 每个调用的回答（`answerSourced`）是一个事务：调用的最终状态、工具消息、来源（D49）、事件（`TOOL_CALL_RESULT`），所以**线程里工具消息的顺序就是回答写入的顺序**；`execute` 在发请求前把调用记成 `EXECUTING`（不写事件）。
+- D46：期限与取消结束 `callCtx`；进行中的调用记为 `FAILED`（"interrupted: …"，事件 `tool.interrupted`），它之后的调用由 `abandon` 回答"not run"。D47：收到停止后不开始新调用，进行中的做完，没开始的留在 `CONFIRMED`；worker 死时留在 `EXECUTING` 的调用，接手的 worker 只在网关现在列出它为 `readOnlyHint` 或 `idempotentHint` 且不在 `neverResendTools` 里时重发（`mayResend`）。
+- 提供者对工具结果顺序的要求，逐个适配器查过：OpenAI 兼容的请求按 `tool_call_id` 配对，没有要求顺序，但本地模型服务（vLLM、llama.cpp）的聊天模板常按顺序配对；Anthropic 把连续的工具结果并进一条 user 消息，按 `tool_use_id` 配对，顺序没有硬性要求；**Gemini 没有调用 id，`functionResponse` 按名字配对（适配器用 `callNames` 从 id 找回名字），同名的两个调用只能靠顺序区分**，所以结果必须按调用的顺序。三家都应该按调用的顺序给，所以 D53 的保证是线程与事件日志里的顺序等于调用的顺序，不论谁先做完。
+- 能不能让模型一步要多个调用：OpenAI 兼容的请求**没有**设 `parallel_tool_calls`（用提供者的缺省，OpenAI 为真；设成假才会禁止），只设了 `tool_choice: "auto"`；Anthropic 的请求没有 `tool_choice`，因而没有 `disable_parallel_tool_use`；Gemini 的请求没有 `toolConfig`。请求里没有任何东西阻止多个调用，也没有任何东西鼓励它（工具说明、预算提示里都没有提）。模型要不要一次问多个，取决于模型和技能的文字。
+
+**决策**
+
+| # | 决策 | 理由 |
+|---|---|---|
+| D53-1 | **分组规则。** 一步里的调用按顺序分成由**连续的**调用构成的组，组里的每个调用都要满足：状态是 `CONFIRMED`（自动：没有待确认、没有被拒、不是调用者的工具、不是子 agent 委派），并且是**网关调用且网关现在列出它 `readOnlyHint: true`、运维没有在 `sequentialTools` 里点名**，或者是 HOST 自己的 `resource__read`。至少两个这样的调用才成组；`DENIED` 的调用不拆组（它只是等着在自己的位置被回答）；其余一概照旧：一个一个、按顺序。下表给出每种调用的去向 | 见下 |
+| D53-2 | **只读，不是幂等。** D47 重发用"只读或幂等"，因为重发的问题是"做两次有没有害处"；同时执行的问题是"两个调用会不会互相影响"，两个幂等的写入（对同一个文件各写一次）重复做无害，但同时做，结果取决于谁后到。所以只看 `readOnlyHint`。**没有标注的工具永不与别的调用同时执行**，标注为假的同样，网关不再列出的工具也不 | 测试 `TestIdempotentIsNotReadOnly…`、`TestAToolWithoutAnnotations…` |
+| D53-3 | **`sequentialTools` 是单独的设置，不复用 `neverResendTools`。** 两者回答的是不同的问题：`neverResendTools`：这个调用在 worker 死时做到一半，能不能再发一次；`sequentialTools`：这个工具能不能与别的调用同时执行。一个只读工具可以允许重发，却不能同时执行（上游有限流、几次读共用一个游标）；一个不愿被重发的工具（每次调用计费）完全可以同时执行。复用一个列表，运维要么为了不让一个工具并发而禁止它重发，要么相反。`sequentialTools` 与 `externalTools`、`confirmTools`、`neverResendTools` 同样是网关条目下的 `path.Match` 模式，同样在加载时校验；`parallelCalls`（0 为缺省 4，1 为关闭，最多 32）也在网关条目下，因为同时在途的请求数是每个网关的承受能力，不是每个发布件的 | `TestSequentialToolsKeepAReadOnlyToolAlone`（同一个测试里还断言 `neverResendTools` 不拦同时执行）、`TestParallelCallsAndSequentialToolsAreReadAndValidatedAtLoad` |
+| D53-4 | **并发有界。** 一组里最多 `parallelCalls` 个调用同时在途（一个信号量；调用结束就放出位置，不等它的回答写入）；超出的等位置，按顺序拿。组之间不重叠：下一个组或下一个单个调用在这个组的调用都**回答完**之后才开始。每步的调用数上限（D41）、每个调用的超时（`ToolTimeout`）、预算（步数、token）都在原来的地方，和以前一样：上限在 `classify`，超时是每个调用自己的 `context.WithTimeout`，预算在步开始时 | `TestNoMoreCallsThanTheBoundAreInFlight` |
+| D53-5 | **回答按调用的顺序写入，且每个在它和它之前的都完成时立刻写。** 一个提交的 goroutine 按调用的顺序等每个调用的结果，写 `AnswerToolCall`（状态、消息、来源、事件，一个事务，D47、D49）。所以：线程和事件日志里 `tool` 消息与 `TOOL_CALL_RESULT` 的顺序等于调用的顺序；调用的状态变化和事件和逐个执行时相同，`EXECUTING` 本来就不写事件；D52 的视图按位置与 id 指代，看到的线程与逐个执行时相同（`TestTheSettingAtOneAndTheGroupLeave…` 对一个记录下的步，用 D53 之前的代码写的 golden 文件，在设置为 1 与为 4 时逐字节比较线程与事件日志）。**为什么不是"全组做完后一起写"：** worker 死在组的中间时，已经完成的前几个调用的回答已经落库，不用重做；**为什么不是"各自完成就写"：** 线程里的顺序会随完成的先后变，Gemini 按顺序配对会配错。代价：一个调用完成了但它前面的还没完成，它的结果在内存里等着；这时 worker 死，它被重发（见下） | `TestAnswersAreWrittenInTheOrderOfTheCallsWhateverOrderTheyFinishIn` |
+| D53-6 | **D47：worker 在组的中间死去。** 每个调用在**自己开始时**记为 `EXECUTING`，所以留在库里的永远是一个前缀已回答（`DONE`/`FAILED`）、其后若干 `EXECUTING`（在途的，或已完成但还没轮到写的）、再后是 `CONFIRMED`（没开始的）。这正是 D47 已经处理的状态：`EXECUTING` 的只读调用被重发（`tool.interrupted {resent: true}`），`CONFIRMED` 的照常执行；每个调用在线程里恰好一条工具消息，来源在回答的那个事务里记录，所以重发不会重复。续跑剩下的调用时，按助手消息里调用的顺序处理（`inCallOrder`；库按 `step, created_at, id` 列出，同一步的调用 `created_at` 相同，所以实际顺序是调用 id 的顺序，不是调用的顺序）；**续跑本身仍然是逐个执行**，没有分组（见"没有做的"） | `TestAWorkerDyingDuringAGroup…`（内存与 PostgreSQL 各一个）、`TestWhatIsLeftOfAStepIsHandledInTheOrderOfTheCalls` |
+| D53-7 | **期限、取消、停止到达组里每一个调用。** 组里的调用用同一个 `callCtx`（组自己的 context 从它派生）；期限或取消到来时：**在途的调用各自记为 `FAILED` "interrupted: …"（与逐个时相同，每个一条 `tool.interrupted` 事件）；还没拿到位置的记为 `FAILED` "not run: … before this call started"；已经完成的照常写它们的结果**；组之后的调用由 `abandon` 回答 "not run"；然后运行照 D46 结束（`RUN_TIMEOUT` 或 `canceled`）。**停止（D47）**：不再给任何调用位置，在途的做完并按顺序写，没开始的留在 `CONFIRMED`，把运行交还；宽限期结束 `t.ctx` 取消：在途的调用被打断但不写任何东西（声明已经不是我们的），留在 `EXECUTING`。组的在途调用永远是一个前缀（位置按顺序给），所以停止之后没有"后面的做完了、前面的没开始"的状态 | `TestACancelDuringAGroupReachesEveryCall`、`TestTheDeadlineDuringAGroupReachesEveryCall`、`TestAStopDuringAGroupLetsTheCallsInFlightFinishAndStartsNoOther`、`TestTheEndOfTheGracePeriodCutsEveryCallOfAGroupShort`、PostgreSQL 上的取消与停止各一个 |
+| D53-8 | **一个调用失败不取消同组的其他调用**（它们是互不相关的读）：工具报告错误、网关拒绝参数、调用出错，都只记这个调用的 `FAILED` 与它的错误，别的照常。被 D51 的规则拒绝的、被策略拒绝的、不在目录里的调用，在 `classify` 里就记为 `DENIED`，在组里原位回答，不占位置，不拖住别人。**唯一结束整个组的是凭据**：运行的凭据不能用（续期失败、会话结束）时，运行以这个原因失败，与逐个时一样；组里还没回答的调用留在 `EXECUTING`/`CONFIRMED`，随运行结束 | `TestOneCallFailingLeavesTheOthersAnswered`、`TestADeniedCallIsAnsweredInItsPlace…`、`TestACredentialThatCannotBeRenewedEndsTheRunOnceForAGroup` |
+| D53-9 | **共享状态。** 逐个检查 `execute` 碰到的东西：`t.cred`（运行的委派凭据，D38）：N 个调用同时被网关拒绝（401）时，旧代码会各自续期 N 次，而且每次续期可能作废别的调用在用的令牌。现在取令牌与续期在一把锁里；续期的入口带上"被拒绝的那个令牌"，**锁里先看当前的令牌是否已经不是它：是，说明别的调用已经续过，直接用新的**；所以 N 个调用被同一个令牌拒绝，授权服务器只被问一次，别的调用得到的是刚续出的令牌。续期永久失败（会话结束、不可续）会被记住，别的调用不再各自去试（`TestACredentialThatCannotBeRenewed…`：试了 1 次，不是 3 次）。`t.tickets`（文件票据）与 `t.limits`：在任何调用开始之前加载，调用期间只读。`t.lastResult`（只有 D41 的打捞用）：只在逐个路径里写。`t.messages`：只有提交的 goroutine 追加。`mcpclient`：`Client` 无状态，共享一个 `http.Client`，请求之间没有共享的可变状态（读过）。**来源（D49）**：每个回答带着它的来源在自己的事务里记，`recordSources` 在事务里读出、合并、写回，而写回之前事务持有的锁（运行行的 `FOR UPDATE`，另有线程行的序号更新）把同一个运行的写排了队，所以并发的两个调用不会丢来源；提交的 goroutine 本来就是一个一个写，这一条保护的是两个进程写同一个运行的情形（`TestTwoAnswersWrittenAtTheSameMoment…`：8 个回答同时写，8 个来源都在。**去掉运行行的 `FOR UPDATE` 这个测试仍然通过，因为线程行的 `UPDATE threads SET message_seq` 先把它们排了队；所以这个测试证明的是"这个事务的整体"，不是某一把锁**）。指标：`observability` 的计数器与直方图带互斥，并发调用安全 | 各个测试 |
+
+**每种调用的去向**
+
+| 调用 | 在组里吗 | 怎样执行 |
+|---|---|---|
+| 网关工具，网关列出 `readOnlyHint: true`，不在 `sequentialTools` | 是 | 与别的这样的调用同时，最多 `parallelCalls` 个 |
+| 网关工具，只有 `idempotentHint`（`readOnlyHint` 假或缺） | 否 | 单个，按顺序 |
+| 网关工具，没有标注 | 否 | 单个，按顺序，旁边没有任何调用在跑 |
+| 网关工具，在 `sequentialTools` 里 | 否 | 单个，按顺序 |
+| `resource__read` | 是（只读 release 的内容，立刻回答） | 在组里原位回答 |
+| 需要成员确认的调用（策略或 `confirmTools`） | 否，拆开前后两组 | 等确认；步在最后以 `AWAITING_INPUT` 停下，同以前 |
+| `DENIED`（超出每步上限、D51、不在目录里、收尾阶段） | 不拆组，不占位置 | 在自己的位置原位回答 |
+| 调用者的工具（`FRONTEND`） | 否，拆组 | 不执行，同以前 |
+| 子 agent 委派（`DELEGATED`、A2A） | 否，拆组 | 同以前 |
+| 续跑时找到的 `EXECUTING`/`CONFIRMED`（`resolveDecided`） | 否 | 逐个；顺序按调用的顺序 |
+| 文件票据：读文件的工具 | 是（票据在组开始前加载） | 同时；模型读到的结果里票据被替换为 `[file ticket]` |
+
+**测过什么、没测什么**（`go test -race` 对 `internal/harness` 的测试整体运行）：竞态检测器覆盖了组里并发的 goroutine 之间共享的内存：`t.cred`、`t.tickets`、`t.limits`、`t.messages`、结果数组、内存版的 store 与网关夹具的记录。它**看不到**的：PostgreSQL 的行锁（那是库里的，竞态检测器不看；靠 PostgreSQL 上的测试：同一时刻写 8 个回答）、真实网关与上游对并发请求的反应（见下"部署要做的"）。
+
+- 时间：`TestThreeReadOnlyCallsOfTwoSecondsFinishInAboutTwoSeconds`：三个各 2 秒的只读调用，运行 2.01 秒（网关上同时 3 个在途），逐个是 6 秒；PostgreSQL 上四个各 400 毫秒的网页读取，运行 0.56 秒。
+- 记录的步在设置为 1 与为 4 时线程与事件日志逐字节相同，且等于 D53 之前的代码写的 golden 文件：`testdata/sequential_step.golden` 是在 a58b7ee（D52）上用 `IDP_WRITE_GOLDEN=1` 生成的，之后没有改过。
+
+**拿掉一个控制、看测试失败**（每一行都是先改代码、跑测试、记下失败的测试、再还原）：
+
+| 拿掉的控制 | 失败的测试 |
+|---|---|
+| 只读条件改成"只读或幂等" | `TestIdempotentIsNotReadOnlyTwoIdempotentWritesNeverRunTogether`（3 个幂等的写同时在途） |
+| 去掉只读条件（任何网关工具都成组） | `TestACallThatMayWriteRunsAloneBetweenTwoGroupsOfOne`、`TestIdempotentIsNotReadOnly…`、`TestAToolWithoutAnnotationsIsNeverRunBesideAnotherCall` |
+| 回答按完成的先后写，不按调用的顺序 | `TestAnswersAreWrittenInTheOrderOfTheCallsWhateverOrderTheyFinishIn`（线程 `[call_1_2 call_1_3 call_1_1 call_1_0]`） |
+| 去掉并发上限（信号量容量改成调用数） | `TestNoMoreCallsThanTheBoundAreInFlight`（8 个同时在途，0.3 秒做完） |
+| 续期不看"被拒绝的令牌是不是已经换了"（每个被拒的调用各自续期） | `TestACredentialRefusedForAWholeGroupIsRenewedOnce`（续期 4 次） |
+| 续期的永久失败不被记住 | `TestACredentialThatCannotBeRenewedEndsTheRunOnceForAGroup`（试了 3 次） |
+| 取消时不回答没开始的调用 | `TestACancelDuringAGroupReachesEveryCall`（调用 4、5 没有工具消息，状态仍是 `CONFIRMED`） |
+| 取消时不记录在途的调用 | 同一个测试（调用 0 到 3 没有答案，状态仍是 `EXECUTING`） |
+| 停止之后仍给调用位置 | `TestAStopDuringAGroupLetsTheCallsInFlightFinishAndStartsNoOther`（网关收到 4 个调用，不是 2 个） |
+| 续跑时不按调用的顺序（用库的顺序） | `TestAWorkerDyingDuringAGroupAndAnotherResumingAnswerEveryCallExactlyOnce`（线程 `[0 1 3 2]`） |
+| 设置为 1 仍然分组（`parallelLimit` 把 1 当缺省） | `TestTheSettingAtOneAndTheGroupLeave…`（设置为 1 时有 2 个调用在途） |
+
+**没有做的**：
+- **并行的写**：没有标注 `readOnlyHint` 的一律不并发，包括只幂等的；"这两个写互不相干"在 HOST 看不出来，网关的标注也不说。
+- **并行的子 agent**：同一步里的几个委派仍是一个接一个创建子运行（创建很快，子运行本来就在各自的 worker 上跑；真正的并行已经存在，只是 HOST 在 `AWAITING_SUBAGENT` 里等）；远程 A2A 调用仍是同步的、逐个的。
+- **跨步骤的并发**：下一步要看上一步的结果，没有可并发的东西；提前一步猜测不是 HOST 的事。
+- **续跑时的并发**：worker 死后接手，剩下的调用逐个执行（不分组）。这样续跑的状态（已回答的前缀、`EXECUTING`、`CONFIRMED`、成员确认过的）保持一种处理方式；代价是死过一次的步慢一些。
+- **模型端的鼓励**：HOST 不改请求去让模型多问（没有设 `parallel_tool_calls`，也不在说明里提）；办公技能的文字在别处改。
+- **按工具的并发上限**：只有每个网关一个 `parallelCalls`；idp-web 的 PDF 槽（见下）是上游的，HOST 不知道。
+
+**部署要做的**：
+
+- **网关（idp-mcp）**：无状态的 Streamable HTTP，每个请求独立，没有会话；缺省对平台客户端（HOST）没有限流（idp-mcp 的 `rateLimits` 只套在外部客户端与没列出的客户端上）；如果运维给 HOST 的客户端条目设了 `rateLimit`，同时在途的请求不改变每个窗口的请求总数，只是更集中。网关这边不用做什么。HOST 到网关的连接池每个主机保留 16 个空闲连接，`parallelCalls` 不超过 32，足够。
+- **idp-web**：三个工具都标 `readOnlyHint: true`，所以 `web_search` 与 `web_fetch` 现在会同时执行；`web_open_url` 按 README 的示例配置列在 `confirmTools` 里（D44，HOST 强制确认），等成员确认，不进组。要知道的：(1) **PDF 读取有两个槽**（`IDP_WEB_PDF_CONCURRENCY`，缺省 2，每个 Pod 的）：满了，调用最多等 2 秒然后 `pdf_busy`；一步里同时读 4 个 PDF，后两个多半得到 `pdf_busy`，逐个读时不会。运维要么把这个网关的 `parallelCalls` 设成不超过槽数，要么提高 `IDP_WEB_PDF_CONCURRENCY` 并把 Pod 的内存上限跟着调（每槽 192 MiB）。**本决策没有替运维改这个值**，缺省仍是 4。(2) 来源编号按调用者在库里的行锁（或内存里的锁）分配，同一个调用者的并发调用得到一致的编号，但**同一步里两个调用拿到的编号不一定按调用的顺序**（先到的先拿小号）；每个结果里的 `[n]` 与它的地址是对的，D49 记的来源也是对的，只是第二个调用的号可能小于第一个。(3) 搜索的滑动窗口限流是按调用者的窗口：并发的四个搜索与逐个的四个搜索占同样的额度，只是更集中，更容易撞上窗口。
+- **idp-sandbox**：`sandbox_read_file` 与 `sandbox_list_files` 标 `readOnlyHint: true`（`openWorldHint: false`），会与同组的别的读同时执行。读过代码：这两个读不占 `sandbox_run` 的并发槽（`MaxConcurrent`，满了回 `ErrCapacity`，那是对运行的），没有每工作区的互斥（"每个工作区一次一个"是对 `sandbox_run` 的，运行标注为非只读，永远单独执行）；Kubernetes 后端里每次读是一个小 Job（`transferOp`，大文件按 `readJobs = 3` 分块读），互相独立，所以同时执行是对的。要知道的：一步里 4 个读就是 4 个同时的 Job，运行命名空间有 ConfigMap 配额（写大文件才占，读不占）；运维看一眼 Job 的配额与调度能力，嫌多就把这个网关的 `parallelCalls` 调小，或把这两个工具放进 `sequentialTools`。`sandbox_create`、`sandbox_run`、`sandbox_import_file`、`sandbox_export_file` 标 `readOnlyHint: false`，`sandbox_write_file` 与 `sandbox_delete` 是 `readOnlyHint: false` 加 `idempotentHint: true`；都不进组，各自单独执行。
