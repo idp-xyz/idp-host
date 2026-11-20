@@ -41,6 +41,7 @@ type Server struct {
 	Results       map[string]string // when set for a tool name, that text is returned instead of the handler's
 	mu            sync.Mutex
 	bearers       []string
+	traceparents  []string // the traceparent header of every tools/call, in the order of calls (D57)
 	calls         []Call
 	lists         int
 }
@@ -98,6 +99,13 @@ func (s *Server) Bearers() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]string(nil), s.bearers...)
+}
+
+// Traceparents returns the traceparent header of every tools/call request, in the order of Calls ("" for a request without one).
+func (s *Server) Traceparents() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.traceparents...)
 }
 
 type request struct {
@@ -183,6 +191,7 @@ func (s *Server) Handler() http.Handler {
 			args, _ := req.Params["arguments"].(map[string]any)
 			s.mu.Lock()
 			s.calls = append(s.calls, Call{Name: name, Args: args, Bearer: bearer})
+			s.traceparents = append(s.traceparents, r.Header.Get("Traceparent"))
 			s.mu.Unlock()
 			for _, t := range s.Tools {
 				if t.Name == name && t.Refuse != nil {

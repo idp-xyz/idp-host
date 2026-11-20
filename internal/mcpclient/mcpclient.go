@@ -18,8 +18,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"go.opentelemetry.io/otel/propagation"
-
 	"idp-host/internal/observability"
 	"idp-host/internal/transport"
 )
@@ -139,7 +137,7 @@ func (c *Client) Call(ctx context.Context, endpoint, bearer, method string, para
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
-	observability.Propagator.Inject(ctx, propagation.HeaderCarrier(req.Header))
+	observability.InjectUnlessDenied(ctx, req.Header) // the gateway is ours; a call to an external tool is made without it (D57)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("gateway unreachable: %w", err)
@@ -337,7 +335,9 @@ func (r *CallResult) Text(limit int) string {
 }
 
 // CallTool calls one tool with JSON arguments.
-func (c *Client) CallTool(ctx context.Context, endpoint, bearer, name string, args json.RawMessage) (*CallResult, error) {
+func (c *Client) CallTool(ctx context.Context, endpoint, bearer, name string, args json.RawMessage) (res *CallResult, err error) {
+	ctx, end := observability.StartToolCall(ctx, name) // D57: a span per call when the run's turn is traced
+	defer func() { end(toolOutcome(res, err)) }()
 	params := map[string]any{"name": name}
 	if len(args) > 0 && string(args) != "null" {
 		params["arguments"] = args
@@ -348,12 +348,30 @@ func (c *Client) CallTool(ctx context.Context, endpoint, bearer, name string, ar
 	if err != nil {
 		return nil, err
 	}
-	var res CallResult
-	if err := json.Unmarshal(raw, &res); err != nil {
+	var out CallResult
+	if err := json.Unmarshal(raw, &out); err != nil {
 		return nil, errors.New("malformed tools/call result")
 	}
-	if res.Content == nil {
-		res.Content = []ContentBlock{}
+	if out.Content == nil {
+		out.Content = []ContentBlock{}
 	}
-	return &res, nil
+	return &out, nil
+}
+
+// toolOutcome is the outcome word of a tools/call for its span: what happened, never what was said.
+func toolOutcome(res *CallResult, err error) string {
+	var rpc *RPCError
+	switch {
+	case err == nil && res != nil && res.IsError:
+		return "tool_error"
+	case err == nil:
+		return "ok"
+	case Unauthorized(err):
+		return "unauthorized"
+	case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
+		return "interrupted"
+	case errors.As(err, &rpc):
+		return "rpc_error"
+	}
+	return "error"
 }

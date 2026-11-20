@@ -278,3 +278,23 @@ func TestProviderRetryAndIdleSettings(t *testing.T) {
 		t.Error("a misspelled retry setting must be refused, not ignored")
 	}
 }
+
+// D57: whether a provider is sent the trace context: what the operator says, else only a provider that is the
+// enterprise's own (external: false). A provider outside the enterprise is not, by default.
+func TestProviderTracePropagation(t *testing.T) {
+	f, err := load(t, "providers:\n"+
+		"  - {name: undeclared, kind: openai, baseUrl: http://127.0.0.1:1/v1}\n"+
+		"  - {name: external, kind: openai, baseUrl: http://127.0.0.1:1/v1, external: true}\n"+
+		"  - {name: ours, kind: openai, baseUrl: http://127.0.0.1:1/v1, external: false}\n"+
+		"  - {name: external-allowed, kind: openai, baseUrl: http://127.0.0.1:1/v1, external: true, tracePropagation: true}\n"+
+		"  - {name: ours-silent, kind: openai, baseUrl: http://127.0.0.1:1/v1, external: false, tracePropagation: false}\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"undeclared": false, "external": false, "ours": true, "external-allowed": true, "ours-silent": false}
+	for _, p := range f.Providers {
+		if p.PropagatesTrace() != want[p.Name] {
+			t.Errorf("%s: PropagatesTrace %v, want %v", p.Name, p.PropagatesTrace(), want[p.Name])
+		}
+	}
+}

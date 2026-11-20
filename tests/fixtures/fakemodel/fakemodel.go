@@ -24,7 +24,8 @@ type Turn struct {
 	Status    int // non-zero: answer this HTTP status instead
 	// ErrorCode is the code of the error answered with Status on the OpenAI wire (e.g. context_length_exceeded).
 	ErrorCode string
-	// CutOff answers on the OpenAI wire with finish_reason "length": the model ran out of context or output.
+	// CutOff answers on the OpenAI wire with finish_reason "length": the model ran out of context or output. With ToolCalls
+	// it is a cut-off answer whose calls (their Args may be cut JSON) were being written.
 	CutOff bool
 }
 
@@ -237,6 +238,7 @@ type Server struct {
 	AnthropicTokensPerMessage int
 	calls                     atomic.Int64
 	mu                        sync.Mutex
+	traceparents              []string
 	last                      []Message
 	history                   [][]Message // every request, including the host's budget note
 	lastTools                 []string
@@ -362,6 +364,23 @@ func DefaultScript(messages []Message, tools []string) Turn {
 
 // Handler serves both wire formats.
 func (s *Server) Handler() http.Handler {
+	routes := s.routes()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		s.traceparents = append(s.traceparents, r.Header.Get("Traceparent"))
+		s.mu.Unlock()
+		routes.ServeHTTP(w, r)
+	})
+}
+
+// Traceparents returns the traceparent header of every request in order ("" for one without it) (D57).
+func (s *Server) Traceparents() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.traceparents...)
+}
+
+func (s *Server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, r *http.Request) {
 		var data []map[string]any
@@ -593,6 +612,19 @@ func (s *Server) openai(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"error": map[string]any{"message": "no messages"}})
 		return
 	}
+	// like the real API: an assistant message with tool_calls must be followed by a tool message for each (D55)
+	for i, m := range req.Messages {
+		for _, c := range m.ToolCalls {
+			answered := false
+			for _, later := range req.Messages[i+1:] {
+				answered = answered || (later.Role == "tool" && later.ToolCallID == c.ID)
+			}
+			if !answered {
+				writeJSON(w, 400, map[string]any{"error": map[string]any{"type": "invalid_request_error", "message": "An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'. The following tool_call_ids did not have response messages: " + c.ID}})
+				return
+			}
+		}
+	}
 	turn := s.decide(msgs, tools)
 	if turn.Status != 0 {
 		failure := map[string]any{"message": "scripted failure"}
@@ -611,7 +643,7 @@ func (s *Server) openai(w http.ResponseWriter, r *http.Request) {
 		toolCalls = append(toolCalls, map[string]any{"index": i, "id": fmt.Sprintf("call_%d_%d", s.calls.Load(), i), "type": "function",
 			"function": map[string]any{"name": c.Name, "arguments": c.Args}})
 	}
-	if len(toolCalls) > 0 {
+	if len(toolCalls) > 0 && !turn.CutOff { // a cut-off answer keeps "length" whatever it carries (D55)
 		finish = "tool_calls"
 	}
 	usage := map[string]any{"prompt_tokens": 10 * len(msgs), "completion_tokens": 7, "total_tokens": 10*len(msgs) + 7}

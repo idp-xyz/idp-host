@@ -224,8 +224,10 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 	}
 	var providers []model.Provider
 	retry := map[string]model.RetryPolicy{} // D45
+	traceProviders := map[string]bool{}     // D57
 	for _, p := range cfg.Providers {
 		retry[p.Name] = p.RetryPolicy()
+		traceProviders[p.Name] = p.PropagatesTrace()
 		hc, err := model.NewHTTPClient(2*time.Minute, p.CAFile)
 		if err != nil {
 			return fmt.Errorf("provider %s: %w", p.Name, err)
@@ -428,6 +430,9 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 	defer cancelWorkers()
 	if workers > 0 {
 		h := &harness.Harness{Store: store, Providers: registry, Gateways: gateways, Classifiers: classifiers, A2A: a2aClient, CMI: cmiClient, CMIKey: cmiKey, CMIToken: cmiToken, Remember: remember, Retry: retry, ModelContext: cfg.ModelContext(), Metrics: worker.NewMetrics(metrics), Log: log}
+		if observability.Exporting() { // D57: the worker's spans are made when a collector is configured, and only then
+			h.Tracer, h.TraceProviders = tp.Tracer("idp-host/worker"), traceProviders
+		}
 		w := &worker.Worker{ID: env("IDP_HOST_INSTANCE", hostname), Store: store, Harness: h, Concurrency: workers, Lease: lease, StopGrace: stopGrace, Log: log}
 		wg.Add(1)
 		go func() {

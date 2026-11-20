@@ -15,8 +15,6 @@ import (
 	"strings"
 	"time"
 
-	"go.opentelemetry.io/otel/propagation"
-
 	"idp-host/internal/agui"
 	"idp-host/internal/model"
 	"idp-host/internal/observability"
@@ -206,7 +204,7 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 	if p.cfg.APIKey != "" {
 		hr.Header.Set("x-goog-api-key", p.cfg.APIKey)
 	}
-	observability.Propagator.Inject(ctx, propagation.HeaderCarrier(hr.Header))
+	observability.InjectIfAllowed(ctx, hr.Header) // only when the harness says this provider may receive it (D57)
 	req.Watch.Sent()
 	resp, err := p.cfg.HTTP.Do(hr)
 	if err != nil {
@@ -312,12 +310,12 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 	msg.Content = text.String()
 	stop := model.StopOther
 	switch {
+	case finish == "MAX_TOKENS": // D55: whatever it carries, an answer the limit stopped is not complete
+		stop = model.StopLength
 	case len(msg.ToolCalls) > 0:
 		stop = model.StopToolCalls
 	case finish == "STOP":
 		stop = model.StopEnd
-	case finish == "MAX_TOKENS":
-		stop = model.StopLength
 	}
 	return &model.Response{Message: msg, StopReason: stop, Usage: usage, Reasoning: reasoning.String()}, nil
 }

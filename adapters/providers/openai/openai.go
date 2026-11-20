@@ -16,8 +16,6 @@ import (
 	"strings"
 	"time"
 
-	"go.opentelemetry.io/otel/propagation"
-
 	"idp-host/internal/agui"
 	"idp-host/internal/model"
 	"idp-host/internal/observability"
@@ -295,6 +293,7 @@ func (a *accumulator) call(idx int, tc wireToolCall) {
 func (a *accumulator) response(msgID string) (*model.Response, error) {
 	msg := agui.Message{ID: msgID, Role: agui.RoleAssistant, Content: a.content.String()}
 	sort.Ints(a.order)
+	cut := a.finish == "length"
 	for n, idx := range a.order {
 		c := *a.calls[idx]
 		if c.ID == "" {
@@ -303,19 +302,21 @@ func (a *accumulator) response(msgID string) (*model.Response, error) {
 		if strings.TrimSpace(c.Function.Arguments) == "" {
 			c.Function.Arguments = "{}"
 		}
-		if c.Function.Name == "" || !json.Valid([]byte(c.Function.Arguments)) {
+		// an answer stopped by the output limit may have been writing this call: its arguments are cut, valid JSON or
+		// not, and the host drops the call (D55); a finished answer with unusable arguments is a schema error
+		if !cut && (c.Function.Name == "" || !json.Valid([]byte(c.Function.Arguments))) {
 			return nil, &model.Error{Code: "schema"}
 		}
 		msg.ToolCalls = append(msg.ToolCalls, c)
 	}
 	stop := model.StopOther
 	switch {
+	case cut: // D55: whatever it carries, an answer the limit stopped is not complete
+		stop = model.StopLength
 	case len(msg.ToolCalls) > 0:
 		stop = model.StopToolCalls
 	case a.finish == "stop" || a.finish == "end_turn":
 		stop = model.StopEnd
-	case a.finish == "length":
-		stop = model.StopLength
 	}
 	return &model.Response{Message: msg, StopReason: stop, Usage: a.usage, Reasoning: a.reasoning.String()}, nil
 }
@@ -337,7 +338,7 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 	if p.cfg.APIKey != "" {
 		hr.Header.Set("Authorization", "Bearer "+p.cfg.APIKey)
 	}
-	observability.Propagator.Inject(ctx, propagation.HeaderCarrier(hr.Header))
+	observability.InjectIfAllowed(ctx, hr.Header) // only when the harness says this provider may receive it (D57)
 	req.Watch.Sent()
 	resp, err := p.cfg.HTTP.Do(hr)
 	if err != nil {

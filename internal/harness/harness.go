@@ -20,6 +20,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"go.opentelemetry.io/otel/trace"
+
 	"idp-host/internal/a2a"
 	"idp-host/internal/agent"
 	"idp-host/internal/agui"
@@ -30,6 +32,7 @@ import (
 	"idp-host/internal/guard"
 	"idp-host/internal/mcpclient"
 	"idp-host/internal/model"
+	"idp-host/internal/observability"
 	"idp-host/internal/run"
 )
 
@@ -131,6 +134,13 @@ type Harness struct {
 	// (D33); nil disables. The write happens after the terminal transition and never affects the run.
 	Remember *cmiclient.Remember
 	memWG    sync.WaitGroup
+
+	// Tracer, when set, records the span of each turn of a run (continuing the trace of the request that created it), of
+	// each request to a model and of each gateway tool call (D57). nil: no span is made, no request carries a trace context
+	// and nothing is allocated for them. TraceProviders names the providers that are sent the W3C traceparent; one not
+	// listed is not (the default for a provider outside the enterprise).
+	Tracer         trace.Tracer
+	TraceProviders map[string]bool
 
 	// Retry is the retry policy toward each provider by name (D45); a provider without an entry gets the defaults.
 	Retry map[string]model.RetryPolicy
@@ -248,7 +258,7 @@ func (t *turn) guardMetric(kind, outcome string) {
 
 // Run executes one claim to its next resting state. It returns run.ErrFenced when the claim was
 // lost; any other error means the run was finished as failed (or the failure could not be stored).
-func (h *Harness) Run(ctx context.Context, c *run.Claim) error {
+func (h *Harness) Run(ctx context.Context, c *run.Claim) (err error) {
 	h.defaults()
 	rc, err := h.Store.Context(ctx, c)
 	if err != nil {
@@ -257,6 +267,8 @@ func (h *Harness) Run(ctx context.Context, c *run.Claim) error {
 		}
 		return h.fail(ctx, c, run.FailReleaseGone, "the run's release cannot be loaded: "+err.Error())
 	}
+	ctx, endTurn := h.startTurn(ctx, rc) // D57
+	defer func() { endTurn(err) }()
 	if run.Overdue(rc.Run.DeadlineAt, h.Now()) {
 		// D35: a run claimed after its deadline does nothing more, not even a call its owner confirmed
 		return h.fail(ctx, c, run.FailTimeout, timeoutMessage)
@@ -424,6 +436,9 @@ func (t *turn) stopping() bool {
 // no longer honours ends it too: the next write would be refused anyway.
 func (t *turn) watch() func() {
 	t.callCtx, t.stopCalls = context.WithCancelCause(t.ctx)
+	if t.h.Tracer != nil {
+		t.callCtx = observability.WithToolTrace(t.callCtx, t.toolTrace()) // D57: the gateway client starts a span per tools/call
+	}
 	done := make(chan struct{})
 	var timer *time.Timer
 	if d := t.rc.Run.DeadlineAt; !d.IsZero() {
@@ -957,7 +972,8 @@ func (t *turn) delegate(tc run.ToolCall) error {
 		}
 		return t.answer(tc, run.CallDone, res.Text, "")
 	}
-	if _, err := t.h.Store.CreateChildRun(t.ctx, t.claim, run.ChildRunInput{ToolCallID: tc.ID, Agent: sub, Input: args.Input, Gateway: t.def.Tools.Gateway, ExternalTools: t.externalToolPatterns()}); err != nil {
+	if _, err := t.h.Store.CreateChildRun(t.ctx, t.claim, run.ChildRunInput{ToolCallID: tc.ID, Agent: sub, Input: args.Input, Gateway: t.def.Tools.Gateway, ExternalTools: t.externalToolPatterns(),
+		Traceparent: observability.Traceparent(t.ctx)}); err != nil { // D57: the child's turn continues from this turn's span
 		if errors.Is(err, run.ErrFenced) || t.ctx.Err() != nil {
 			return err
 		}
@@ -1311,6 +1327,19 @@ func (t *turn) loop() error {
 		if resp.Message.Content != "" {
 			events = append(events, agui.TextMessageEnd(resp.Message.ID))
 		}
+		cutCalls := 0
+		if resp.StopReason == model.StopLength && len(resp.Message.ToolCalls) > 0 {
+			// D55: the output limit or the window stopped the answer while it wrote tool calls. Their arguments are cut (even
+			// where they parse), so none is run, recorded or streamed, and the stored message keeps only what was said: a
+			// stored call nobody answers would make the next request of the thread invalid for a provider.
+			cutCalls = len(resp.Message.ToolCalls)
+			names := make([]string, 0, cutCalls)
+			for _, c := range resp.Message.ToolCalls {
+				names = append(names, c.Function.Name)
+			}
+			resp.Message.ToolCalls = nil
+			events = append(events, agui.Custom(agui.CustomModelCutOff, map[string]any{"step": step, "finishReason": model.StopLength, "toolCalls": cutCalls, "tools": names}))
+		}
 		for _, call := range resp.Message.ToolCalls {
 			events = append(events, agui.ToolCallStart(call.ID, call.Function.Name, resp.Message.ID), agui.ToolCallArgs(call.ID, call.Function.Arguments), agui.ToolCallEnd(call.ID))
 		}
@@ -1329,14 +1358,26 @@ func (t *turn) loop() error {
 			if err := h.Store.AppendAssistantTurn(t.ctx, t.claim, resp.Message, calls, events); err != nil {
 				return err
 			}
-		} else if err := h.Store.AppendMessages(t.ctx, t.claim, []agui.Message{resp.Message}, events); err != nil {
-			return err
+		} else {
+			stored := []agui.Message{resp.Message}
+			if cutCalls > 0 && resp.Message.Content == "" {
+				stored = nil // nothing was said: an empty assistant message is refused by providers (D55)
+			}
+			if err := h.Store.AppendMessages(t.ctx, t.claim, stored, events); err != nil {
+				return err
+			}
 		}
-		t.messages = append(t.messages, resp.Message)
+		if cutCalls == 0 || resp.Message.Content != "" {
+			t.messages = append(t.messages, resp.Message)
+		}
 		if len(resp.Message.ToolCalls) == 0 {
 			if resp.StopReason == model.StopLength {
 				// D40: an answer the model could not finish is not an answer; say why instead of ending as completed
-				return h.fail(t.ctx, t.claim, run.FailModel, fmt.Sprintf("the model's answer was cut off: its context window or output limit is full (%d input tokens at step %d)", resp.Usage.PromptTokens, step))
+				msg := fmt.Sprintf("the model's answer was cut off: its context window or output limit is full (%d input tokens at step %d)", resp.Usage.PromptTokens, step)
+				if cutCalls > 0 {
+					msg += fmt.Sprintf("; it was writing %d tool call(s), which were not run", cutCalls)
+				}
+				return h.fail(t.ctx, t.claim, run.FailModel, msg)
 			}
 			return t.complete()
 		}
@@ -1496,8 +1537,14 @@ func (t *turn) callModel(step int) (*model.Response, run.Step, error) {
 	st.Provider, st.Model = refs[0].Provider, refs[0].Model
 	t.attempts, t.askedWait, t.askedCap, t.attemptLog = 0, 0, 0, nil
 	var lastErr error
-candidates:
+	var failed []run.CandidateFailure // D56: who did not answer, in the order asked
+	refused := -1                     // D56: the largest window (0: not known) of a candidate that refused the request as too big; -1: none did
 	for i, ref := range refs {
+		if refused >= 0 && !t.windowAbove(ref, refused) {
+			// D56: a candidate refused the request's size; one that is not known to hold more would refuse it too
+			h.Log.Warn("model candidate skipped: no larger context window than the one that refused the request", "run", t.claim.RunID, "step", step, "provider", ref.Provider, "model", ref.Model)
+			continue
+		}
 		p, ok := h.Providers.Get(ref.Provider)
 		if !ok {
 			lastErr = &model.Error{Code: "unknown_provider"}
@@ -1509,6 +1556,7 @@ candidates:
 			t.attempts++
 			msgID := h.NewMessageID()
 			mctx, cancel := context.WithCancel(t.callCtx)
+			mctx, endSpan := t.startModelSpan(mctx, step, attempt, ref) // D57
 			s := &streamer{t: t, msgID: msgID, last: h.Now(), cancel: cancel, out: t.output, strict: t.def.Guards.Output.Strict}
 			start := h.Now()
 			watch := model.NewStopwatch(h.Now) // D54: the adapter says when the request was sent and when the first output came
@@ -1517,7 +1565,7 @@ candidates:
 			cancel()
 			st.Latency = h.Now().Sub(start)
 			timing := watch.Timing()
-			t.logAttempt(ref, st.Latency, timing, err, s.blocked != "")
+			endSpan(t.logAttempt(ref, st.Latency, timing, err, s.blocked != ""), resp, timing)
 			cut := t.callCtx.Err() != nil // the deadline, a cancel or a stopped worker ended the call (D46)
 			h.Router.Observe(ref, st.Latency, err != nil && s.blocked == "" && !cut)
 			if ferr := s.finish(); ferr != nil {
@@ -1530,6 +1578,7 @@ candidates:
 			if err == nil {
 				resp.Message.ID = msgID
 				st.ErrorCode = "" // an earlier attempt or candidate failed (D45); the step did not
+				st.Failed = failed
 				st.PromptTokens, st.CompletionTokens, st.StopReason = resp.Usage.PromptTokens, resp.Usage.CompletionTokens, resp.StopReason
 				st.FirstOutput, st.FirstText, st.AfterFirst = timing.FirstOutput, timing.FirstText, timing.AfterFirst // D54: the successful attempt's
 				st.CachedTokens, st.CacheCreationTokens, st.Server = resp.Usage.CachedTokens, resp.Usage.CacheCreationTokens, resp.Usage.Server
@@ -1572,6 +1621,7 @@ candidates:
 			var me *model.Error
 			if !errors.As(err, &me) {
 				st.ErrorCode = "error"
+				failed = append(failed, run.CandidateFailure{Provider: ref.Provider, Model: ref.Model, Code: st.ErrorCode})
 				break
 			}
 			st.ErrorCode = errorCode(me)
@@ -1582,28 +1632,46 @@ candidates:
 				// D50: what the provider said is for the operator and goes to the host log only; the event says that there is
 				// something to look for, never what it is (the run's owner reads the event stream)
 				h.Log.Warn("model call failed", "run", t.claim.RunID, "step", step, "attempt", attempt, "provider", ref.Provider, "model", ref.Model, "code", st.ErrorCode, "detail", me.Detail)
-				if aerr := h.Store.AppendEvents(t.ctx, t.claim, []agui.Event{agui.Custom(agui.CustomModelError, map[string]any{"step": step, "provider": ref.Provider,
-					"model": ref.Model, "attempt": attempt, "code": st.ErrorCode})}); aerr != nil {
+			}
+			// what happens after this attempt (D45, D56): "retry" the same candidate, the "next_candidate", or "stop" the step
+			action, wait := "retry", time.Duration(0)
+			switch {
+			case !me.Retryable && me.Code != "transport":
+				action = "stop"
+				if t.ownFault(me, ref, refs[i+1:], refused) {
+					action = "next_candidate" // the error is this candidate's own, not the request's (D56)
+				}
+			case !me.Retryable || s.streamed() || attempt >= policy.Attempts:
+				action = t.afterRetries(refs[i+1:], refused)
+			default:
+				var ok bool
+				if wait, ok = policy.Wait(attempt, me.RetryAfter); !ok {
+					t.askedWait, t.askedCap = me.RetryAfter, policy.WithDefaults().MaxRetryAfter
+					h.Log.Warn("model provider asked to wait longer than this host does", "provider", ref.Provider, "retryAfter", me.RetryAfter)
+					action = t.afterRetries(refs[i+1:], refused)
+				} else if d := t.rc.Run.DeadlineAt; !d.IsZero() && i < len(refs)-1 && !h.Now().Add(wait).Before(d) {
+					action = t.afterRetries(refs[i+1:], refused) // the wait would outlive the run: the next candidate is asked now (with none left, the deadline ends the wait)
+				}
+			}
+			if me.Detail != "" || action != "retry" {
+				ev := map[string]any{"step": step, "provider": ref.Provider, "model": ref.Model, "attempt": attempt, "code": st.ErrorCode, "outcome": action}
+				if me.Fault != "" {
+					ev["fault"] = me.Fault
+				}
+				if aerr := h.Store.AppendEvents(t.ctx, t.claim, []agui.Event{agui.Custom(agui.CustomModelError, ev)}); aerr != nil {
 					return nil, st, aerr
 				}
 			}
-			if !me.Retryable && me.Code != "transport" {
-				break candidates
-			}
-			// D45: the same candidate is asked again, after a wait, when the error is one that passes and nothing of the
-			// answer has been streamed: text already written to the event log cannot be taken back, so an attempt that
-			// failed after its first text delta is not repeated (the next candidate may still be tried, as before).
-			if !me.Retryable || s.streamed() || attempt >= policy.Attempts {
+			if action != "retry" {
+				failed = append(failed, run.CandidateFailure{Provider: ref.Provider, Model: ref.Model, Code: st.ErrorCode})
+				if me.Code == model.CodeContextLength {
+					refused = max(refused, t.window(ref), 0)
+				}
+				if action == "stop" {
+					st.Failed = failed
+					return nil, st, lastErr
+				}
 				break
-			}
-			wait, ok := policy.Wait(attempt, me.RetryAfter)
-			if !ok {
-				t.askedWait, t.askedCap = me.RetryAfter, policy.WithDefaults().MaxRetryAfter
-				h.Log.Warn("model provider asked to wait longer than this host does", "provider", ref.Provider, "retryAfter", me.RetryAfter)
-				break
-			}
-			if d := t.rc.Run.DeadlineAt; !d.IsZero() && i < len(refs)-1 && !h.Now().Add(wait).Before(d) {
-				break // the wait would outlive the run: the next candidate is asked now (with none left, the deadline ends the wait)
 			}
 			if err := h.Store.AppendEvents(t.ctx, t.claim, []agui.Event{agui.Custom(agui.CustomModelRetry, map[string]any{"step": step, "provider": ref.Provider, "model": ref.Model,
 				"attempt": attempt, "of": policy.Attempts, "code": st.ErrorCode, "waitMs": wait.Milliseconds(), "retryAfterMs": me.RetryAfter.Milliseconds()})}); err != nil {
@@ -1625,12 +1693,50 @@ candidates:
 	if st.ErrorCode == "" {
 		st.ErrorCode = "error"
 	}
+	st.Failed = failed
 	return nil, st, lastErr
+}
+
+// window is the context window the HOST's configuration gives a candidate (D52), 0 when it says nothing.
+func (t *turn) window(ref agent.ModelRef) int {
+	return t.h.ModelContext[ref.Provider+"/"+ref.Model].Window
+}
+
+// windowAbove reports whether the configuration says the candidate's window is larger than than (>= 0). A window the
+// configuration does not give is 0 and is never above anything.
+func (t *turn) windowAbove(ref agent.ModelRef, than int) bool {
+	return t.window(ref) > than
+}
+
+// afterRetries is what follows a candidate whose attempts are used up (D45): the next candidate that can still be asked,
+// or the end of the step. refused is the largest window that refused the request as too big, -1 when none did (D56).
+func (t *turn) afterRetries(later []agent.ModelRef, refused int) string {
+	for _, r := range later {
+		if refused < 0 || t.windowAbove(r, refused) {
+			return "next_candidate"
+		}
+	}
+	return "stop"
+}
+
+// ownFault decides what a non-retryable error of a candidate means for the next one (D56, the table in the ADR): true when
+// the error belongs to that candidate and a later one can still be asked. A context-length refusal is the candidate's
+// own only for a later candidate the configuration says has a larger window; a content-policy refusal and every error of
+// the request itself end the step.
+func (t *turn) ownFault(me *model.Error, ref agent.ModelRef, later []agent.ModelRef, refused int) bool {
+	switch {
+	case me.Code == model.CodeContextLength:
+		return t.afterRetries(later, max(refused, t.window(ref), 0)) == "next_candidate"
+	case me.Fault == model.FaultCandidate:
+		return t.afterRetries(later, refused) == "next_candidate"
+	}
+	return false
 }
 
 // errorCode is the step's error code of a provider error.
 // logAttempt records one request of the step: how long it took, when its first output came, how it ended (D54).
-func (t *turn) logAttempt(ref agent.ModelRef, latency time.Duration, timing model.Timing, err error, blocked bool) {
+// It returns how the request ended, for the span of the call (D57).
+func (t *turn) logAttempt(ref agent.ModelRef, latency time.Duration, timing model.Timing, err error, blocked bool) string {
 	outcome := "ok"
 	var me *model.Error
 	switch {
@@ -1644,6 +1750,7 @@ func (t *turn) logAttempt(ref agent.ModelRef, latency time.Duration, timing mode
 	e := map[string]any{"attempt": t.attempts, "provider": ref.Provider, "model": ref.Model, "outcome": outcome, "latencyMs": latency.Milliseconds()}
 	addTiming(e, timing.FirstOutput, timing.FirstText, timing.AfterFirst)
 	t.attemptLog = append(t.attemptLog, e)
+	return outcome
 }
 
 func addTiming(m map[string]any, first, text, after *time.Duration) {
@@ -1692,6 +1799,13 @@ func (t *turn) usageEvent(step int, st run.Step, u model.Usage) map[string]any {
 	}
 	if len(t.attemptLog) > 1 {
 		m["attemptTimings"] = t.attemptLog
+	}
+	if len(st.Failed) > 0 { // D56: the candidates that did not answer before this one did
+		failed := make([]map[string]any, 0, len(st.Failed))
+		for _, f := range st.Failed {
+			failed = append(failed, map[string]any{"provider": f.Provider, "model": f.Model, "code": f.Code})
+		}
+		m["failedCandidates"] = failed
 	}
 	return m
 }

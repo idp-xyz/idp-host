@@ -359,7 +359,7 @@ D32 让运行"读"CMI；没有"写"，线程之外的后续运行就记不住这
 - 上限按字节算，不按 token：HOST 不知道各个模型的分词。最坏情况是最近 6 个结果都是 16 KiB 的数字表格，约 8 万 token；窗口比这小的模型仍会超出，由 ③④ 说明原因。
 - 每当一个结果滑出"最近 6 个"被缩短，它之后的内容在模型服务的前缀缓存里就失效，那一步要重新处理最近几个结果。在参考主机的模型服务上，一步在开始写回答之前的耗时从约 2.5 秒变成约 4.5 秒（两次真实运行第 8 步之后各步的耗时对回答 token 数的回归；生成速度不变，约 125 token/秒）。
 - 16 KiB、6 个、1,200 字节是 `Harness` 的默认值，没有配置项。
-- 被截断但带有工具调用的回答不在 ③ 之内，行为不变。
+- 被截断但带有工具调用的回答不在 ③ 之内，行为不变。（**D55 修订**：被截断的回答带工具调用时，一个调用也不执行，运行同样以 `MODEL_ERROR` 结束。）
 - ④ 只在 OpenAI 兼容适配器里实现，认的是 OpenAI、vLLM、llama.cpp 与参考主机上 Strata 的说法；Anthropic 与 Gemini 适配器仍报 `status_400`。说法不在其列的服务也仍报 `status_400`，`tests/live` 的用例会把它查出来。
 
 **实施**：`internal/harness`（`Harness.KeepToolResults`、`OldToolResultBytes`；`oldToolResults`、`shortenOld`，`guardedMessages` 在输入防护之前缩短；`loop` 里 ③④ 的两条失败消息）；`internal/mcpclient`（`CallResult.Text` 在字符边界截断并写明字节数）；`internal/model`（`CodeContextLength`、`ClassifyBody`）；`adapters/providers/openai`（非 200 时读至多 64 KiB 正文用于分类）；`tests/fixtures/fakemodel`（`Turn.CutOff`、`Turn.ErrorCode`）；`tests/live`（`TestLiveRequestTooLongIsToldApart`）。
@@ -486,13 +486,13 @@ D37 让成员的文件经票据进出运行：字节不经过模型。但 agent 
 **取舍与边界**
 - 缺省 3 次、1 秒起，是"撑过一次短暂故障"的量，不是"等一次长时间故障"的量：长时间故障仍然换候选或失败。要等得更久的运维调 `attempts` 与 `maxBackoffSeconds`。
 - 失败的尝试之后换候选时，路由器的时延观测按每次尝试记，一个反复抖动的候选在 `latency` 策略下会被排到后面，这是想要的。
-- **不可重试的 4xx 使回退循环停止**（主候选答 400，不试后面的候选）：分析里的旁注，不在本决策范围，没有改。它在多候选且各候选对同一请求的接受度不同（例如上下文窗口不同）时会有影响。
+- **不可重试的 4xx 使回退循环停止**（主候选答 400，不试后面的候选）：分析里的旁注，不在本决策范围，没有改（**D56 修订**：按错误类别决定）。它在多候选且各候选对同一请求的接受度不同（例如上下文窗口不同）时会有影响。
 
 **实施**：`internal/model`（`Error.RetryAfter`、`ClassifyHTTP`、`ParseRetryAfter`、`RetryPolicy`）；`adapters/providers/*`；`internal/config`（`Provider.Retry`）；`cmd/idp-host`；`internal/harness`（`callModel` 的两层循环、`Harness.Retry`）；`internal/agui`（`CustomModelRetry`）。契约不变：事件名与事件字段不属于 schema（同 D44）。
 
 **验证**：复现 `TestARunSurvivesOneRetryableErrorOfTheOnlyConfiguredModel` 通过（未改断言）。新增：`TestRequestsToOneCandidateAreBoundedAndEachWaitIsReported`、`TestTheUsageEventSaysHowManyRequestsTheStepMade`、`TestAFailedAttemptConsumesNoStepAndNoTokens`、`TestARetryAfterLongerThanTheBackoffIsWaitedFor`（秒与日期）、`TestARetryAfterBeyondTheCapIsNotWaitedFor`、`TestTheNextCandidateIsTriedAfterTheRetriesOfTheFirstAreUsedUp`、`TestANonRetryableErrorIsNotRetried`、`TestNoRetryAfterTheFirstStreamedDelta`、`TestAFailureAfterReasoningButBeforeTextIsStillRetried`、`TestTextStreamedByAFailedCandidateIsClosedWhenTheNextCandidateAnswers`、`TestTheWaitBetweenAttemptsEndsAtACancel`、`TestTheWaitBetweenAttemptsEndsAtTheDeadline`、`TestAWaitThatWouldOutliveTheDeadlineMovesToTheNextCandidate`；`internal/model` 的 `TestParseRetryAfter`、`TestClassifyHTTPCarriesRetryAfter`、`TestRetryPolicyWait`；四个适配器的 `TestARetryAfterOfTheProviderReachesTheError`；`internal/config` 的 `TestProviderRetryAndIdleSettings`。每个控制手工拿掉一次、看对应测试失败、再恢复（D46 末尾的表）。
 
-**没有做的**：没有对真实模型验证（只用测试替身）；没有熔断（连续失败的提供者仍然每个运行各试各的）；没有按错误类型区分策略（429 与 5xx 同一套）；不可重试 4xx 的回退行为（见上）。
+**没有做的**：没有对真实模型验证（只用测试替身）；没有熔断（连续失败的提供者仍然每个运行各试各的）；没有按错误类型区分策略（429 与 5xx 同一套）；不可重试 4xx 的回退行为（见上）。（**D56 修订**：候选自己的错误换下一个候选，请求自己的错误不换。）
 
 ## 28. D46：期限与取消到达进行中的调用（2026-11-19 决策与实施）
 
@@ -995,3 +995,160 @@ D37 让成员的文件经票据进出运行：字节不经过模型。但 agent 
 **测过什么**：`internal/model` 的 `Stopwatch`（先发出再输出才有时间，首个文字与首个输出同一次读数，没有输出就缺失，nil 安全）；三个适配器各有：最后一块带用量与 `timings` 的流、没有它们的流（只有工具调用：首个文字缺失）、`cached_tokens: 0` 与字段缺失的区别、两次尝试各有自己的时间（OpenAI 另有非流式回答与只有 `timings` 没有 `usage` 的流）；harness：步骤与事件取成功的尝试，三次尝试的事件各记各的，没有提供者信息时字段缺失；PostgreSQL：步骤行读回，没说的是 NULL。**去掉首个输出的打点**（把适配器里的 `Output()`、`Text()` 调用去掉）：三个适配器各 3 到 4 个测试、harness 3 个测试失败。
 
 **不知道的**：(1) 首个输出的时刻是适配器**读到**那一块的时刻，不是服务端写出的时刻；网络与代理的缓冲会让它偏晚，本机回环上可以忽略。(2) 一个服务端若把所有块攒到最后一起发（代理缓冲），首个输出就接近总时间，这与非流式不同，也无从分辨。(3) `cachedTokens` 与 llama.cpp 的 `cacheN` 在 llama.cpp 上是同一个数；留两份是因为别家只有前者。(4) Anthropic 与 Gemini 的字段没有对着真实服务验证。(5) 看不到提供者那一侧的排队时间（单槽服务上排在别的请求后面的时间算在首个输出里）。
+
+## 36. D55：被输出上限截断的回答不执行它带的工具调用（2026-11-19 决策与实施，修订 D40 的"被截断但带有工具调用的回答不在 ③ 之内"；契约不变）
+
+沿用 D40（被截断的回答不是回答，运行以 `MODEL_ERROR` 结束）、D47（一步的消息与工具调用记录一起写）、D52（Anthropic 的 `model_context_window_exceeded` 与 `max_tokens` 同样是截断）。
+
+**复现**（先写失败的测试，在 main 的代码上）。D40 ③ 的"没有工具调用"这个条件留下一个洞：回答因长度被截断、正在写一个工具调用时，三个适配器都把停止原因记为 `tool_calls`（有调用就是 `tool_calls`，截断的信息丢了），harness 于是照常分类、派发。分两种：
+- **参数被截成非法 JSON**：适配器的 `json.Valid` 检查先失败，步错误码是 `schema`，运行以 `model call failed: schema` 结束。工具没有被调用，但成员读到的不是"回答被截断"，事件里也没有原因；
+- **参数截断后恰好是合法 JSON**（例如调用写完了、后面的文字被截断，或模型写完一个对象后被截）：**调用被派发给工具**，工具结果交给下一步，运行继续。用模型替身（`finish_reason: length`，一个 `sum` 调用，参数 `{"a":1,"b":2}`），模型每步都被截断，同一个调用被执行了 10 次直到 `STEP_LIMIT`。
+
+| 测试（在 main 上） | 输出 |
+|---|---|
+| `internal/harness` `TestACutOffAnswerWithToolCallsRunsNoTool/arguments_that_parse` | `status FAILED STEP_LIMIT, err STEP_LIMIT: the run reached its limit of 10 steps`（网关收到 10 次调用） |
+| 同上 `/arguments_cut_in_a_string` | `cut-off event []`（运行以 `schema` 失败，没有原因事件） |
+| 同上 `TestACutOffAnswerFromAnyProviderRunsNoTool`（桩提供者答 `length` 加一个调用） | `FAILED, 10 gateway calls, 0 dangling, 1 records` |
+| `adapters/providers/openai` `TestACutOffAnswerWithToolCallsIsReportedAsCutOff` | `model provider error: schema` 与 `stop "tool_calls" … want "length"` |
+| `adapters/providers/anthropic` `TestACutOffAnswerWithAToolUseIsReportedAsCutOff`（`max_tokens` 与 `model_context_window_exceeded` 各两种参数） | 同上 4 条 |
+| `adapters/providers/gemini` `TestACutOffAnswerWithAFunctionCallIsReportedAsCutOff`（`MAX_TOKENS`；Gemini 的参数是对象，截断的参数是缺字段或空） | `stop "tool_calls" … want "length"` 3 条 |
+| `tests/integration` `TestACutOffAnswerWithAToolCallLeavesAValidThreadOnPostgres` | `FAILED STEP_LIMIT` |
+
+各适配器的线上写法不同，所以每个都有自己的测试：OpenAI 兼容 `finish_reason: "length"`（工具调用片段与它同一个流里），Anthropic `message_delta.stop_reason` 为 `max_tokens` 或 `model_context_window_exceeded`（`tool_use` 块的 `input_json_delta` 被截），Gemini `finishReason: "MAX_TOKENS"`（`functionCall.args` 是对象）。harness-worker 适配器原样传停止原因。
+
+| # | 决策 | 理由 |
+|---|---|---|
+| D55-1 | **适配器：停止原因是截断时，回答就是 `length`，不论它带不带工具调用**；截断的回答里调用的参数不再做 JSON 合法性检查（检查会把截断变成 `schema` 错误，把原因吞掉），调用留在返回的消息里，让 harness 能数出来。没有被截断的回答，参数不合法仍是 `schema` | 适配器是唯一看得见提供者原话（finish reason）的地方 |
+| D55-2 | **harness：停止原因是 `length` 且带工具调用时，一个调用也不分类、不记录、不派发、不流出（没有 `TOOL_CALL_*` 事件）。** 参数恰好合法的也一样：被截断的回答里没有哪个调用是写完了的证据 | 模型的输出在截断处停了，调用可能少了字段、少了一个调用，或者后面本来还有一个更正；合法的 JSON 不是模型想要的 JSON |
+| D55-3 | **存下来的会话要对提供者合法。** 存下的助手消息只留已经说出的文字，工具调用去掉：一个没人回答的 `tool_calls` 会让下一个请求被提供者拒绝（OpenAI 的"tool_call_id 没有对应的 tool 消息"，Anthropic 的没有 `tool_result` 的 `tool_use`）。**什么也没说**（没有文字）就不存助手消息：空的助手消息同样被提供者拒绝，会话停在用户消息上，下一个用户消息直接接上。流里已经出现的文字照旧以 `TEXT_MESSAGE_END` 收尾 | 运行失败了，会话还要能继续；这个失败不能毒化会话（D40 描述的重试三次都同样失败的情形） |
+| D55-4 | **运行照 D40 以 `MODEL_ERROR` 结束，消息多一句**：`…(N input tokens at step S); it was writing K tool call(s), which were not run`；事件 `idp.host/model.cutoff {step, finishReason, toolCalls, tools}`（工具名，没有参数）写在这一步的事件里，在 `model.usage` 之前。步骤行与 `model.usage` 照常（停止原因 `length`、用了的 token） | 不再重试续写：D40 的实测是窗口满了，续写没有用；这里没有对"输出上限小而窗口有余"的情形另做决定，见下 |
+
+**取舍与边界**
+- 没有做"让模型继续写"：D40 决定被截断的回答失败，理由（窗口满了续写无益）对窗口满的情形成立，对"输出上限设得太低"的情形不成立。输出上限太低时运维该调 `maxOutputTokens`，运行的失败消息说明了原因。若要为后一种情形做续写，是 D40 的新决策，不在这里。
+- 失败的运行不留下被截断的工具调用，所以这一步的调用对评估与审计不可见（只有事件里的工具名与个数）；不记参数，因为截断的参数本来就是半截内容。
+- 复现 R4 `TestAnAnswerCutOffAtTheOutputLimitDoesNotFailTheRun`（`-tags repro`，没有工具调用的截断）**不变**，仍然失败，断言没有改：D40 ③ 对这种回答的决定没有动。`go vet -tags repro ./...` 干净。
+
+**实施**：`adapters/providers/{openai,anthropic,gemini}`（`cut` 先于 `tool_calls` 判断）；`internal/harness`（`loop` 里的 `cutCalls`）；`internal/agui`（`CustomModelCutOff`）；`tests/fixtures/fakemodel`（`CutOff` 与工具调用一起答 `length`；并且像真实的 API 那样，对有未应答 `tool_calls` 的会话答 400，这样"下一个请求被接受"是可测的）。没有改动 `dispatch`、`execute`。
+
+**验证**：上表的测试在改动后通过；另有 `TestAnAnswerThatEndedWithAToolCallStillRunsIt`（没有被截断的调用照常执行）与 PostgreSQL 上的 `TestACutOffAnswerWithAToolCallLeavesAValidThreadOnPostgres`（存下的会话没有悬空调用、失败消息与事件、同一会话的下一个运行完成）、`TestACutOffAnswerWithOnlyAToolCallStoresNoMessageOnPostgres`（没有文字时会话只有用户消息，下一个运行完成）。
+
+**拿掉一个控制、看测试失败**（每个手工拿掉一次，再恢复）：
+
+| 拿掉 | 失败的测试 |
+|---|---|
+| OpenAI 适配器：`tool_calls` 先于 `cut` 判断 | `TestACutOffAnswerWithToolCallsIsReportedAsCutOff` |
+| OpenAI 适配器：截断时仍做 JSON 检查 | 同上 |
+| Anthropic 适配器：`tool_calls` 先于 `cut`；截断时仍检查 | `TestACutOffAnswerWithAToolUseIsReportedAsCutOff`（各一次） |
+| Gemini 适配器：`tool_calls` 先于 `MAX_TOKENS` | `TestACutOffAnswerWithAFunctionCallIsReportedAsCutOff` |
+| harness：不去掉调用（`resp.Message.ToolCalls = nil`） | `TestACutOffAnswerWithToolCallsRunsNoTool`（三个子测试）、`TestACutOffAnswerFromAnyProviderRunsNoTool`、PostgreSQL 的 `TestACutOffAnswerWithAToolCallLeavesAValidThreadOnPostgres` |
+| harness：不写 `model.cutoff` 事件 | `TestACutOffAnswerWithToolCallsRunsNoTool` |
+| harness：没有文字也存一条空的助手消息 | `TestACutOffAnswerWithToolCallsRunsNoTool`（无文字的两个子测试） |
+| harness：失败消息不提调用 | PostgreSQL 的 `TestACutOffAnswerWithAToolCallLeavesAValidThreadOnPostgres`（消息由 PostgreSQL 测试读，内存桩不记消息） |
+
+**没有做的**：没有对真实模型验证（llama.cpp 是否在截断的工具调用上发 `finish_reason: "length"`，按文档与 OpenAI 的行为推断，没有抓到样本）；没有为"输出上限低"的情形做续写（见上）；没有处理 Anthropic 的 `stop_reason: "refusal"` 与 Gemini 的 `SAFETY`（它们是内容策略的停止，不是截断；今天落在 `other`，没有工具调用时记为完成，D56 对"策略拒绝不换提供者"的决定与它相关，但这一条没有改变那个行为）。
+
+## 37. D56：候选自己的错误换下一个候选，请求自己的错误与内容策略的拒绝不换（2026-11-19 决策与实施，修订 D45 的"没有做的"与局限；契约不变）
+
+沿用 D45（同一候选先重试再换）、D50（流里的错误类别）、D52（`providers[].models[].contextWindow` 在 HOST 配置里）、D40（`context_length`）。
+
+**复现**（在 main 上先写的测试）：`TestTheFallbackIsAskedAfterANonRetryableErrorOnlyWhenTheErrorIsTheCandidatesOwn`，主候选 `p1` 答错，回退是答得正常的模型替身。`callModel` 的候选循环对不可重试的错误一律 `break candidates`，所以主候选答 401、403、404、402、413、`insufficient_quota`、Anthropic 的"credit balance is too low"、流里的认证与额度错误时，回退一次也没有被问：运行以 `MODEL_ERROR: model call failed: status_401` 结束，`fallback asked 0 times`，共 12 个子测试失败（上面每一种各一个）。`TestAContextLengthRefusalMovesOnOnlyToAKnownLargerWindow` 的"窗口更大"一行同样：`FAILED, fallback asked 0 times`。另一处：`429` 加 `insufficient_quota`（OpenAI 的额度用尽就是 429）被当作限流，先重试 3 次（`3 requests to the first candidate, want 1`）才失败，等待白费。
+
+**规则**（错误类别 → 换不换下一个候选；"换"指：当前候选不再试，下一个候选马上被问，D45 的重试不受影响）：
+
+| 错误 | 谁的问题 | 换下一个候选 | 理由 |
+|---|---|---|---|
+| 408、429（限流）、5xx、传输失败、流静默超时、流里的 `provider_overloaded/rate_limit/server` | 提供者的暂时故障 | **先按 D45 重试，用尽再换**（不变） | D45 |
+| 401、403 | 这个提供者的密钥或权限 | **换** | 另一个提供者有自己的密钥 |
+| 404 | 这个提供者的模型名或路径 | **换** | 模型名是按提供者写的 |
+| 402；429 或 400 或 403 的正文说额度用尽（`insufficient_quota`、`exceeded your current quota`、`billing_hard_limit_reached`、Anthropic 的 `credit balance is too low`） | 这个提供者账户的额度 | **换，并且不重试**（等待不会让额度回来） | 另一个提供者有自己的账户；D50 已规定流里的 `insufficient_quota` 不重试，HTTP 形式与它一致 |
+| 413 | 这个端点的请求体上限 | **换** | 上限是端点的，不是请求的 |
+| 流里的错误事件：`authentication`、`permission`、`PERMISSION_DENIED`、`UNAUTHENTICATED`、`invalid_api_key`、`not_found`、`NOT_FOUND`、`billing`、`insufficient_quota` | 同上各行 | **换** | 同上各行 |
+| `context_length`（D40，D50-3） | 这个候选的窗口装不下 | **只换到 HOST 配置里窗口更大的候选**：下一个候选必须在 `models[].contextWindow` 里有窗口，且大于刚拒绝的那个候选的窗口（拒绝的那个没有配窗口则不比，只要下一个有窗口）；窗口没配的、不更大的候选**跳过**，不去问。没有这样的候选，运行照 D40 以"会话装不下"结束 | 窗口相同或更小的候选会同样拒绝，白白多一次请求；HOST 只在配置里知道窗口，不去猜 |
+| 400（工具定义的 schema 错误、参数错误等其他 400）、422、其余 4xx | 请求本身 | **不换**（不变） | 哪个提供者都会拒绝；换候选只是把同一个错误多付几次请求。无法从 400 看出"这个模型不支持工具"这类候选自己的限制：宁可停下来让运维看错误码，也不把请求发给不知道会怎样的候选 |
+| 内容策略的拒绝：400 正文的 `content_policy_violation`、`content_filter`、`ResponsibleAIPolicyViolation`；流里的 `content_filter`、`content_policy` | 一个提供者对这份内容的判定 | **不换** | 见下 |
+| `decode`、`schema`（读不懂提供者的回答）、`unknown_provider`、`no_candidate` | 不变 | 不变（`decode` 与 `schema` 仍然停下） | 不在这条决策里；见"没有做的" |
+
+**内容策略的拒绝为什么不换（决定）**：一个提供者因内容策略拒绝了这份内容，这是对内容的判定，不是可用性故障。把同一份内容发给下一个候选，是在候选之间"找一个肯收的"，绕过了提供者的安全策略；也会把被一家拒绝的内容送到运维没有为这类内容评估过的另一家（D43、D44 的筛选按"可能使用外部模型"的发布件做，不按"某个提供者拒绝之后"的内容做）。回退的目的是可用性，不是申诉。因此这类拒绝使这一步终止，运行以 `MODEL_ERROR` 结束，步错误码是 `status_400` 或 `provider_error`，事件里 `fault: "policy"`。运维如果要让某类内容可以由另一家处理，应当在路由里把那一家写成主候选，而不是靠失败转移。
+
+**记录**：
+- 步骤行的 `provider`、`model` 是答了的那个候选（没有一个答则是最后问的那个）；新增 `failed_candidates`（jsonb，迁移 `0012_step_candidates.sql`，NULL 表示没有候选失败）：`[{provider, model, code}]`，按问的先后，**只有错误码，没有提供者的话**（`code` 与步骤行的 `error_code` 同一套：`status_401`、`context_length`、`provider_error`…）。步骤行的 `error_code` 仍是 D45 的规则：成功则清空。
+- `idp.host/model.usage` 新增 `failedCandidates: [{provider, model, code}]`（只在有时写）。
+- `idp.host/model.error {step, provider, model, attempt, code, outcome, fault?}`：原来只在流里的提供者错误（D50，有 `Detail`）时每次尝试一条；现在**每个失败的候选的最后一次尝试都有一条**，`outcome` 是 `retry`（D45 还会重试同一个候选，这时只有带 `Detail` 的才写）、`next_candidate`、`stop`（这一步结束，运行失败）；`fault` 是 `candidate` 或 `policy`（HOST 判定不了的不写）。没有提供者的任何文字。
+- `model.Error` 新增 `Fault`（`candidate`、`policy`、空）。判断只看状态码、提供者的 type/code/status，以及（只对额度与策略）正文里的固定标记；正文不保存、不交给任何人，与 D40、D50 一致。
+
+**取舍与边界**
+- 候选循环的结构变了：每次失败的尝试先算出 `action`（`retry`、`next_candidate`、`stop`），再写事件与记录，原来分散在三处 `break` 里的判断集中成一个 `switch`；D45 的重试次数、等待、`Retry-After`、期限与取消的行为不变（原有的 D45、D46 测试全部不改而通过）。
+- `429` 加额度正文不再重试，是对 D45 的一处改变（以前先等 3 次）；只对正文里有固定标记的 429。Gemini 的 `RESOURCE_EXHAUSTED` 额度与限流同码，仍按限流重试。
+- 403 的正文说"地区不支持"之类也算候选的问题，换；403 来自 HOST 自己要求的某种拦截（代理）也会换，白问一次下一个候选，上界是候选数。
+- 一步最多 候选数 × `attempts` 次请求的上界不变。
+- 没有给 `context_length` 的候选比较做"估计能否放进下一个窗口"：视图本来就缩到所有候选里最小的已知窗口（D52 的 `limitsFor`），能到这里说明估计偏低；不再另设一道。
+
+**实施**：`internal/model`（`Error.Fault`，`Classify`、`ClassifyBody`、`ClassifyStreamError`）；`internal/harness`（`callModel` 的候选循环、`ownFault`、`afterRetries`、`windowAbove`）；`internal/run`（`Step.Failed`、`CandidateFailure`）；`adapters/store/postgres`（`failed_candidates`）；`migrations/0012_step_candidates.sql`。契约不变（事件名与字段不属于 schema，同 D44、D45）。
+
+**验证**：`internal/harness` 的 `TestTheFallbackIsAskedAfterANonRetryableErrorOnlyWhenTheErrorIsTheCandidatesOwn`（15 行，表里每一类至少一行，记录里的候选、错误码、`outcome`、`fault`、对第一个候选的请求数）、`TestARefusedContentIsNotSentToAnotherProvider`、`TestWhenEveryCandidateFailsWithItsOwnFaultTheStepNamesThemAll`、`TestAContextLengthRefusalMovesOnOnlyToAKnownLargerWindow`（窗口：更大、相等、更小、下一个未配、拒绝的未配而下一个配了、都没配）、`TestACandidateWithoutALargerWindowIsSkippedAfterAContextLengthRefusal`；`internal/model` 的 `TestWhoseFaultAProviderErrorIs`、`TestWhoseFaultAStreamErrorIs`；PostgreSQL 的 `TestTheStepRowSaysWhichCandidateFailedAndWhichAnsweredOnPostgres`（步骤行、事件、提供者的话不在其中）。
+
+**拿掉一个控制、看测试失败**：
+
+| 拿掉 | 失败的测试 |
+|---|---|
+| 候选自己的错误不换（`ownFault` 对 `FaultCandidate` 返回 false） | 表测试 12 行 |
+| 策略拒绝也换（`Fault != ""` 就换） | 表测试的 4 个策略行 |
+| 所有不可重试的错误都换（拿掉表） | 表测试的请求错误行（400、422、策略） |
+| `Classify` 不给 401、402、403、404、413 标候选 | 表测试 7 行 |
+| 额度正文的标记表清空 | 表测试的 429 额度行与 400 credit 行 |
+| 策略标记表清空 / 流里的策略类别去掉 | `TestWhoseFaultAProviderErrorIs` / `TestWhoseFaultAStreamErrorIs` |
+| 流里的认证、额度类别不标候选 | 表测试的 4 个流里的行 |
+| 相等的窗口算"更大" | `TestAContextLengthRefusalMovesOnOnlyToAKnownLargerWindow` 与跳过的测试 |
+| 拒绝之后不跳过窗口不更大的候选 | `TestACandidateWithoutALargerWindowIsSkippedAfterAContextLengthRefusal` |
+| 步骤不记失败的候选 | 表测试 15 行（含 D45 的 503） |
+| `model.error` 不写 `outcome` | 表测试 17 个子测试 |
+| 额度 429 仍可重试 | 表测试的 429 额度行（对第一个候选 3 次请求） |
+| 存储不写 `failed_candidates` | PostgreSQL 的 `TestTheStepRowSaysWhichCandidateFailedAndWhichAnsweredOnPostgres` |
+
+**没有做的**：没有对真实提供者验证各家的错误正文（标记表按 OpenAI、Anthropic、Gemini 的文档与已知消息写，Azure 的 `content_filter` 同）；没有把 `decode` 与 `schema` 当作候选的问题（一个返回乱码的候选换下一个是合理的，但 `schema` 是模型输出的问题，两者要分开决定）；Anthropic 的 `stop_reason: "refusal"` 与 Gemini 的 `SAFETY`/`blockReason` 不是错误而是回答，今天不经过这条规则，也没有处理；没有熔断（一个密钥失效的提供者每个运行各试一次）。
+
+## 38. D57：worker 里的一个回合是请求那条链路上的 span，模型调用与工具调用是它的子 span，trace 上下文只发给该收的一方（2026-11-19 决策与实施；契约不变）
+
+沿用 M4 的追踪（OpenTelemetry SDK 加自己写的 OTLP/HTTP JSON 导出器，`internal/observability/tracing.go`，标准环境变量 `OTEL_EXPORTER_OTLP_*`；API 的每个请求由 `HTTPMiddleware` 开一个服务端 span 并接续传入的 `traceparent`）、D44（`external: false` 才是企业自己的提供者）、idp-mcp D51（trace 上下文不传给**外部**上游，由网关执行）。
+
+**复现与读到的**：追踪只覆盖 API。运行由请求创建、由 worker 服务（可能是另一个进程、过一会儿），而运行只存了 `trace_id`（合同的 `AgentRun.traceId`）：没有 traceparent，没有父 span；worker 的 `Run` 里没有任何 span，模型适配器与网关客户端的 `Propagator.Inject` 读的是 worker 的 `ctx`（没有 span），所以发给模型提供者与网关的请求没有 `traceparent`，早先审阅说的"为空"就是这样。运维在追踪里看到 API 请求就停了：不知道一个运行花了多少步、哪一次模型调用慢、哪个工具调用失败。
+- 复现：`tests/integration` 的临时测试（在 main 的行为上，没有保留；它的正式形式是 `TestARunsTurnContinuesTheTraceOfTheRequestThatCreatedItOnPostgres`）：请求带 `traceparent: 00-0af765…-b7ad6b…-01` 创建运行，worker 服务它，网关替身记录 `tools/call` 的头：`no request to the gateway carried the trace 0af7651916cd43dd8448eb211c80319c: [""]`。
+- 一个隐患：适配器与网关客户端对 `ctx` 里的 span **无条件**注入 `traceparent`。一旦 worker 有了 span，这些请求就会带着它发给**外部模型提供者**。这不是已有的行为（因为 worker 没有 span），是只要补上 span 就会出现的行为，所以要在补之前决定。
+
+| # | 决策 | 理由 |
+|---|---|---|
+| D57-1 | **运行存下创建它的请求的 traceparent**（`runs.traceparent`，迁移 `0013_run_traceparent.sql`；`trace_id` 照旧）。子运行（D22）存的是**委派它的那个回合的 span** 的 traceparent，没有则继承父运行的。运行的表示不变（`traceparent` 不在 `AgentRun`，`json:"-"`；`traceId` 还是原来的）。迁移之前创建的运行没有它，回合按 `trace_id` 加入同一条 trace（父 span 是随机的，在后端里会显示成没有父的一截） | 回合要接着请求的链路，需要的是请求的 span id，不只是 trace id。traceparent 只标识 span，没有内容与主体 |
+| D57-2 | **一个回合（一次 `Harness.Run`）是 span `idp.run.turn`**（种类 consumer），接在存下的 traceparent 之后；**每个模型请求**（D45 的重试与回退每次尝试各一个）是它的子 span `idp.model.call`（client），**每个网关工具调用**是子 span `idp.tool.call`（client，由网关客户端 `CallTool` 开，从回合的 `ctx` 里读要记的东西）。属性只有标识、数、时间与结果词：回合 `idp.run.id`、`idp.run.depth`、`idp.run.step_count`（回合开始时的）、`idp.turn.outcome`（`ok`、`failed`、`fenced`、`stopped`、`error`）、失败时 `idp.run.failure_code`；模型调用 `idp.run.id`、`idp.step`、`idp.model.attempt`、`idp.model.provider`、`idp.model.name`、`idp.model.outcome`（`ok` 或步骤行的错误码）、`idp.model.stop_reason`、提示与回答的 token 数、`cached_tokens`、D54 的 `idp.model.first_output_ms`、`first_text_ms`、`after_first_ms`（缺失的不写）；工具调用 `idp.run.id`、`idp.step`、`idp.tool.name`、`idp.tool.gateway`、`idp.tool.external`、`idp.tool.outcome`（`ok`、`tool_error`、`unauthorized`、`rpc_error`、`interrupted`、`error`）。失败的 span 的状态描述只是错误码或结果词。**没有提示、参数、结果、令牌、主体（owner）、提供者的话** | 运维要回答"这个运行慢在哪一步、哪个提供者、哪个工具"，不需要内容；内容进追踪后端等于把它交给另一个有自己保留期与访问范围的系统 |
+| D57-3 | **只在配了收集端时才做 span。** `Harness.Tracer` 为 nil 时（没有 `OTEL_EXPORTER_OTLP_ENDPOINT` 或 `…_TRACES_ENDPOINT`，`observability.Exporting()` 为假）：不开 span，请求不带 trace 头，这些路径不分配内存（测试用 `testing.AllocsPerRun` 量过：回合、模型调用、工具调用三处都是 0）。API 的 span 与日志里的 trace id 照旧，那是 M4 的 | 没有收集端就没人读 worker 的 span；代价与行为都不该变 |
+| D57-4 | **网关：带，除了外部工具。** 发给网关的 `tools/call` 带这次调用的 span 的 `traceparent`；对 HOST 知道是外部的工具（`externalTools` 的模式或网关的标记，D44、D51）**不带**，调用的 span 仍然有（`idp.tool.external: true`）。idp-mcp D51 禁止把 trace 上下文传给外部上游，由网关执行；HOST 再不递给它，是第二道，成本是一个 map 查找。回合里的 `tools/list`（发现）不带：它不属于哪个调用，API 一侧创建运行时的发现请求原来就带请求的 span | 网关是企业自己的，要追踪才能看到一个调用在网关内部与上游花的时间；外部上游不该看到我们的 trace |
+| D57-5 | **模型提供者：默认不带，企业自己的提供者才带，运维可以改。** 配置里 provider 条目新增 `tracePropagation: true｜false`；不写时等于 `external: false`（D44：没声明就是外部）。对外部提供者**默认不发 `traceparent`**，理由：它不含内容，但它标识我们的请求——trace id 与 span id 让第三方能把这个运行的各次请求关联起来（同一个运行的多步在对方日志里成为一串），并且泄露我们在用追踪、用哪种采样标记；收益是对方若也有追踪（极少）能给出它那一侧的耗时，企业内部署的模型服务才有这个价值。运维明确要发（例如合同约定的云提供者要用它排查）就写 `tracePropagation: true`；企业自己的提供者不想发写 `false`。适配器（OpenAI 兼容、Anthropic、Gemini、harness-worker）**默认不再无条件注入**：只有调用的 `ctx` 被 harness 标了允许才注入（`observability.WithPropagation`），而 harness 只对 `Harness.TraceProviders` 里为真的提供者标。网关一侧相反：默认带，由 `WithoutPropagation` 去掉。两个方向不同，因为信任不同：网关是我们的基础设施，提供者可能是第三方 | 默认安全：补 span 不能顺带改变对外部发什么；要发由运维说 |
+
+**取舍与边界**
+- 只覆盖网关工具调用：子 agent 委派、技能资源读取、A2A 远程调用在回合里是进程内或另一种客户端，没有 `idp.tool.call` span；委派出去的子运行的回合接在委派它的回合的 span 之后（D57-1），所以链路不断，只是没有"委派这一次"的 span。给它们加 span 要改 `execute` 与 `dispatch`（分派工具调用的地方，另有未合并的分支 `parallel-reads` 在改它们），这里按要求没有动它们：工具调用的 span 放在网关客户端，靠回合的 `ctx` 带上下文，所以并行分派合并之后每个并行的调用仍然各有 span（`ctx` 的值只读）。
+- `idp.step` 在工具调用的 span 里读的是回合当前的步，并行读取合并后这是同一步里的所有调用，仍然对。
+- 采样：沿用 `ParentBased(AlwaysSample)`；存下的 traceparent 的采样标志就是请求当时的。
+- 存下的 traceparent 不含 `tracestate`（那是别家厂商的数据，不存）。
+- 失败的运行也有 span，`idp.turn.outcome` 与失败码在其中。
+
+**实施**：`internal/observability/spans.go`（`Traceparent`、`ContinueTrace`、`WithPropagation`、`WithoutPropagation`、`InjectIfAllowed`、`InjectUnlessDenied`、`ToolTrace`、`StartToolCall`、`Exporting`）；`internal/harness/tracing.go`（回合与模型调用的 span）与 `harness.go` 里的几行（`Run` 开头开回合 span、`watch` 把 `ToolTrace` 放进回合的 `ctx`、`callModel` 每次尝试开模型 span、`logAttempt` 返回结果词、`delegate` 给子运行传 traceparent）；`internal/mcpclient`（`CallTool` 开工具 span；注入改为 `InjectUnlessDenied`）；`adapters/providers/*`（`InjectIfAllowed`）；`internal/run`、`adapters/store/postgres`、`internal/api`（存与读 traceparent）；`internal/config`（`tracePropagation`）；`cmd/idp-host`（有收集端才设 `Tracer`）。**碰到的分派代码**：`dispatch` 与 `execute` 一行没动；改了 `delegate` 一行（子运行的 traceparent）、`Run`、`watch`、`callModel`、`logAttempt`（和 D55、D56 的 `loop` 成功路径与候选循环）。
+
+**验证**（内存导出器）：`internal/harness` 的 `TestTheSpanTreeOfARunWithTwoStepsAndAToolCall`（两步一个工具调用：1 个回合、2 个模型、1 个工具 span，trace 与父子关系，属性，含 D54 的时间）、`TestSpansCarryNoPromptArgumentsOrResults`、`TestARunWithOnlyATraceIdJoinsThatTrace`、`TestAFailedModelCallAndTurnAreMarkedWithCodesOnly`、`TestTheTraceContextIsSentToAListedProviderOnly`（假提供者收到的头：列出的带模型调用 span 的 traceparent，不在表里、写 false、没有表都不带）、`TestTheTraceContextIsSentToTheGatewayExceptForAnExternalTool`（假网关收到的头）、`TestWithoutATracerNothingIsRecordedOrSent`（无 span、无头、`AllocsPerRun` 为 0）、`TestADelegatedRunIsGivenTheTurnsTraceContext`；`internal/observability` 的 `TestContinueTrace`、`TestInjectPolicies`、`TestStartToolCall`；三个适配器各一个 `TestTheTraceContextIsSentOnlyWhenTheCallIsMarked`；`internal/config` 的 `TestProviderTracePropagation`；PostgreSQL 的 `TestARunsTurnContinuesTheTraceOfTheRequestThatCreatedItOnPostgres`（带 `traceparent` 的请求创建运行、库里存了它、回合接在它之后、网关收到、没列出的提供者没收到、列出的收到、运行的表示没有 `traceparent`）。
+
+**拿掉一个控制、看测试失败**：
+
+| 拿掉 | 失败的测试 |
+|---|---|
+| 回合不接存下的 traceparent | span 树、`ARunWithOnlyATraceId`、提供者的头（6 个） |
+| `ContinueTrace` 不用 trace id 兜底 | `TestContinueTrace` |
+| 提供者一律带 | `TestTheTraceContextIsSentToAListedProviderOnly`（3 个） |
+| OpenAI 适配器一律注入 | 适配器的 `TestTheTraceContextIsSentOnlyWhenTheCallIsMarked` |
+| 外部工具也带（`External` 恒假） | `TestTheTraceContextIsSentToTheGatewayExceptForAnExternalTool` |
+| `InjectUnlessDenied` 不看禁止 | `TestInjectPolicies`、`TestStartToolCall` |
+| 没有 tracer 也开 span | `TestWithoutATracerNothingIsRecordedOrSent` |
+| 模型 span 加上指令文本属性 | `TestSpansCarryNoPromptArgumentsOrResults` |
+| 工具 span 的运行 id 写错 / 不接回合 | `TestTheSpanTreeOfARunWithTwoStepsAndAToolCall` |
+| `delegate` 不传 traceparent | `TestADelegatedRunIsGivenTheTurnsTraceContext` |
+| 配置里默认对外部提供者发 | `TestProviderTracePropagation` |
+| API 不存 traceparent | PostgreSQL 的 `TestARunsTurnContinuesTheTraceOfTheRequestThatCreatedItOnPostgres` |
+
+**没有做的**：没有对真实的 OTLP 收集端验证（只用了内存导出器；导出器是 M4 的，没有改）；没有给 `tools/list`（回合里的发现）与子 agent、资源读取、A2A 开 span；没有把存下的 traceparent 的父 span 画成"请求的 span"以外的东西（HOST 在请求进来时才知道那个 span）；`idp.host/*` 事件仍不在契约里。

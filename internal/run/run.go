@@ -133,6 +133,8 @@ type ChildRunInput struct {
 	// ExternalTools are the gateways' external-tool patterns by gateway name (D44): a child whose release may call one of
 	// them is not given the parent's CMI context unless the parent's was screened.
 	ExternalTools map[string][]string
+	// Traceparent is the trace context of the span of the parent's turn that delegated (D57); the child's turn continues it.
+	Traceparent string
 }
 
 // ChildOutcome is what a parent learns of a finished (or still running) child run.
@@ -213,6 +215,7 @@ type Run struct {
 	EvaluationID        string    `json:"-"`
 	CredentialExpiresAt time.Time `json:"-"`
 	TraceID             string    `json:"traceId,omitempty"`
+	Traceparent         string    `json:"-"` // the W3C traceparent of the request that created the run; the worker's turn continues it (D57)
 	DeadlineAt          time.Time `json:"deadlineAt"`
 	CreatedAt           time.Time `json:"createdAt"`
 	StartedAt           time.Time `json:"startedAt,omitzero"`
@@ -266,6 +269,16 @@ type Step struct {
 	CachedTokens        *int                 `json:"cachedTokens,omitempty"`
 	CacheCreationTokens *int                 `json:"cacheCreationTokens,omitempty"`
 	Server              *model.ServerTimings `json:"server,omitempty"`
+	// Failed are the candidates that failed before the one that answered (or all of them, when none did), in the order
+	// they were asked (D56). Codes only, never the provider's words.
+	Failed []CandidateFailure `json:"failedCandidates,omitempty"`
+}
+
+// CandidateFailure is one candidate that did not answer a step: who, and the error code of its last attempt.
+type CandidateFailure struct {
+	Provider string `json:"provider"`
+	Model    string `json:"model"`
+	Code     string `json:"code"`
 }
 
 // StepName is the AG-UI step name of step n.

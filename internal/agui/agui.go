@@ -348,6 +348,9 @@ const (
 	// CustomModelError: a request to a model failed with an error the provider reported or a chunk the host could not
 	// decode (D50): {step, provider, model, attempt, code}. It carries no text of the provider's: that is in the host log.
 	CustomModelError = "idp.host/model.error"
+	// CustomModelCutOff: the model's answer was stopped by the output limit or the context window and carried tool calls;
+	// none of them was run and none is stored (D55): {step, finishReason, toolCalls, tools}.
+	CustomModelCutOff = "idp.host/model.cutoff"
 	// content guards (ADR-0001 D27, D28)
 	CustomGuardFlagged = "idp.host/guard.flagged"
 	CustomGuardBlocked = "idp.host/guard.blocked"

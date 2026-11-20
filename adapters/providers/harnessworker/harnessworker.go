@@ -33,6 +33,7 @@ import (
 
 	"idp-host/internal/agui"
 	"idp-host/internal/model"
+	"idp-host/internal/observability"
 )
 
 // Config of one harness worker.
@@ -131,6 +132,7 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 	}
 	hr.Header.Set("Content-Type", "application/json")
 	hr.Header.Set("Accept", "text/event-stream")
+	observability.InjectIfAllowed(ctx, hr.Header) // only when the harness says this provider may receive it (D57)
 	if p.cfg.APIKey != "" {
 		hr.Header.Set("Authorization", "Bearer "+p.cfg.APIKey)
 	}

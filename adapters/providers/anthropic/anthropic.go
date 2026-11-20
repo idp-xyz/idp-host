@@ -14,8 +14,6 @@ import (
 	"strings"
 	"time"
 
-	"go.opentelemetry.io/otel/propagation"
-
 	"idp-host/internal/agui"
 	"idp-host/internal/model"
 	"idp-host/internal/observability"
@@ -248,7 +246,7 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 	if p.cfg.APIKey != "" {
 		hr.Header.Set("x-api-key", p.cfg.APIKey)
 	}
-	observability.Propagator.Inject(ctx, propagation.HeaderCarrier(hr.Header))
+	observability.InjectIfAllowed(ctx, hr.Header) // only when the harness says this provider may receive it (D57)
 	req.Watch.Sent()
 	resp, err := p.cfg.HTTP.Do(hr)
 	if err != nil {
@@ -377,6 +375,8 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 	msg := agui.Message{ID: p.cfg.NewMessageID(), Role: agui.RoleAssistant}
 	var reasoning strings.Builder
 	var content strings.Builder
+	// the window or the output limit ended the answer (D52): a tool_use it was writing is cut (D55), valid JSON or not
+	cut := stop == "max_tokens" || stop == "model_context_window_exceeded"
 	for _, idx := range order {
 		st := blocks[idx]
 		switch st.kind {
@@ -389,7 +389,7 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 			if args == "" {
 				args = "{}"
 			}
-			if st.id == "" || st.name == "" || !json.Valid([]byte(args)) {
+			if !cut && (st.id == "" || st.name == "" || !json.Valid([]byte(args))) {
 				return nil, &model.Error{Code: "schema"}
 			}
 			msg.ToolCalls = append(msg.ToolCalls, agui.ToolCall{ID: st.id, Type: "function", Function: agui.FunctionCall{Name: st.name, Arguments: args}})
@@ -398,12 +398,12 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 	msg.Content = content.String()
 	reason := model.StopOther
 	switch {
+	case cut: // the window ran out in the middle of the answer (D52)
+		reason = model.StopLength
 	case len(msg.ToolCalls) > 0:
 		reason = model.StopToolCalls
 	case stop == "end_turn" || stop == "stop_sequence":
 		reason = model.StopEnd
-	case stop == "max_tokens" || stop == "model_context_window_exceeded": // the window ran out in the middle of the answer (D52)
-		reason = model.StopLength
 	}
 	return &model.Response{Message: msg, StopReason: reason, Usage: ua.usage(), Reasoning: reasoning.String()}, nil
 }

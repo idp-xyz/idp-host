@@ -75,7 +75,8 @@ providers:
      retry: {attempts: 3,           # D45: requests in all per candidate model before the next candidate or failure, 1..10 (default 3; 1 = never retry)
              backoffSeconds: 1,     #      the wait before the first retry, doubling after that, with jitter (default 1)
              maxBackoffSeconds: 20, #      cap of a computed wait (default 20)
-             maxRetryAfterSeconds: 60}}   # a provider's Retry-After above this is not waited for (default 60, at most 600)
+             maxRetryAfterSeconds: 60},     # a provider's Retry-After above this is not waited for (default 60, at most 600)
+     tracePropagation: false}       # D57: send the W3C traceparent of the run's trace to this provider (default: yes only for external: false)
 gateways:
   - name: edge
     endpoint: https://mcp.example.com/mcp
@@ -114,6 +115,12 @@ cmi:   # optional (ADR-0001 D32): releases with context.cmi = true resolve a Con
 **模型的上下文窗口（ADR D52）。** 要让长任务不撞窗口，部署必须给用到的每个模型配 `contextWindow`（provider 条目下的 `models[]`，键是 `provider` 名加发布件里的模型名）。配了以后：HOST 每次调用前按 token 估算输入，用上一步模型服务报告的用量校正；估算超过水位（`waterMarkShare`，缺省 0.6）时把更早的工具结果与更早的工具调用参数继续缩短（最老的先缩，一次缩到水位的六分之五以下，之后的步骤里已缩短的不再变长）；超过 `hintShare`（缺省 0.8）时在每步的预算提示里告诉模型窗口已用多少、该收尾；估算说即使缩到底也装不下时，不调用模型，直接以 D40 的消息结束运行。没有 `contextWindow` 的模型一切照旧，与 D40 逐字节相同：三个数字用 16 KiB、6、1,200 字节，参数不缩短，没有提示，也不会在调用前拒绝；这样的模型在窗口满时仍然只能靠模型服务报错（三家适配器现在都认得）。三个阈值的缺省值都按窗口推出，131,072 token 时恰是 D40 的数字；设置放在 HOST 配置而不在发布件里：发布件不能给自己放宽运维定的上限。其余字段的范围见 `internal/config`，写错的值在启动时被拒。平台的 compose（`deploy/compose/e2e.sh` 生成的 `host.yaml`）与 kind（`deploy/kubernetes/kind/kustomization.yaml` 里的 `host.yaml`）目前没有 `models`，要得到这个行为，需要在 `local` 条目下加所用模型的条目与 `contextWindow`。
 
 provider 的 `retry` 与 `idleTimeoutSeconds`（ADR D45、D46）都可以不配：可重试的错误（HTTP 408、429、5xx、传输失败、流静默超时）先对同一个候选模型重试，等待从 1 秒起翻倍、封顶 20 秒、带抖动，提供者的 `Retry-After` 更长时取它（超过 `maxRetryAfterSeconds` 就不等：换下一个候选或失败）；已经流出文字之后不重试；等待随运行的期限与取消结束。设置放在 provider 条目而不在发布件里：限流策略是运维知道的事，发布件作者不应能为自己的 agent 多烧预算。运行的期限与取消也到达进行中的模型与工具调用：期限到了运行在约一秒内以 `RUN_TIMEOUT` 结束，所有者取消的运行在约一秒内（每秒向库询问一次）以 `CANCELED` 结束。
+
+**回退候选（ADR D56，修订 D45）。** 主候选的错误按类别决定换不换下一个候选，不用配置：候选自己的问题换（401、403、404、402、413、额度用尽——HTTP 的 `insufficient_quota` 与 Anthropic 的 "credit balance is too low" 不再重试、立刻换；流里的认证、权限、找不到、额度错误），请求自己的问题不换（其余 400、422、其余 4xx），提供者内容策略的拒绝（`content_policy_violation`、`content_filter`）也不换：把被一家拒绝的内容送给另一家等于绕过它的策略。`context_length` 只换到**配置里 `models[].contextWindow` 更大**的候选（没配窗口的候选不比、不问）。每一步记下失败的候选：步骤行的 `failed_candidates`（只有错误码，迁移 0012）、`model.usage` 的 `failedCandidates`、`model.error` 的 `outcome`（`retry`、`next_candidate`、`stop`）与 `fault`。
+
+**worker 里的追踪（ADR D57）。** 配了 `OTEL_EXPORTER_OTLP_ENDPOINT`（或 `…_TRACES_ENDPOINT`）时，worker 的每个回合是接在创建运行的请求之后的 span（`idp.run.turn`），每次模型请求（`idp.model.call`）与每个网关工具调用（`idp.tool.call`）是它的子 span，属性只有运行 ID、步、提供者与模型、工具名、结果与 D54 的时间，没有提示、参数、结果；没有收集端时什么都不做。运行存着创建它的请求的 `traceparent`（`runs.traceparent`，迁移 0013；运行的表示不变）。`traceparent` 发给网关（外部工具除外，idp-mcp D51）；发给模型提供者**只在** provider 条目 `tracePropagation: true` 时，不写则等于 `external: false`：外部提供者默认不发，因为它标识我们的请求。
+
+**被输出上限截断的回答（ADR D55，修订 D40）。** 回答因输出上限或窗口被截断时，它带着的工具调用一个也不执行（参数哪怕恰好是合法的 JSON），存下的会话只留已说出的文字，运行以 `MODEL_ERROR` 结束，消息与事件 `idp.host/model.cutoff` 说明原因。
 
 **worker 中断时进行中的工具调用（ADR D47，修订 D3）。** worker 停止或崩溃时，HOST 分不清"已经执行完但结果丢了"和"根本没发出去"，所以接手的 turn 对记为 `EXECUTING` 的网关工具调用只在重发无害时才重发：网关现在列出的该工具带 `readOnlyHint` 或 `idempotentHint`（`tools/list` 的 `annotations`），且没有被网关条目的 `neverResendTools`（模式语法与校验同 `externalTools`，匹配即永不重发，不看标注）点名。其余调用（没有标注、标注为假、网关已不再列出该工具、任何子智能体调用）不重发：模型收到一条工具错误，说明调用被中断、结果未知、可能已经做了也可能没有、重做之前先核实；运行的事件流记 `idp.host/tool.interrupted {toolCallId, tool, resent, reason}`（`resent: true` 的是被重发的那次重复；`reason` 为 `worker_stopped`，期限与取消打断的调用为 `deadline`、`canceled`），指标 `idp_host_tool_interruptions_total{resent, reason}` 同样计数。助手消息与它的工具调用记录在同一个事务里写入，工具调用的最终状态与它的工具消息也是；旧数据里缺的记录或工具消息，续跑时补建并照常执行。收到 SIGTERM 的 worker 不再认领运行，进行中的调用（模型调用、工具调用、远程智能体调用）做完，不开始任何新的调用，在下一个边界把运行交还（运行仍是 `RUNNING`，下一个 worker 立刻认领，不等租约过期）；超过 `IDP_HOST_STOP_GRACE`（缺省 `20s`；必须小于平台的终止宽限期：Kubernetes 清单的 `terminationGracePeriodSeconds` 为 30 秒，compose 的 host-worker 为 `stop_grace_period: 30s`）仍在进行的才被中断；`0` 表示立即中断。
 

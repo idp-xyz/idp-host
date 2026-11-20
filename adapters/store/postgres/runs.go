@@ -30,6 +30,7 @@ type CreateRunInput struct {
 	Credential     *credential.Token // delegated gateway token, sealed before storage
 	FileTickets    *run.FileTickets  // the member's file tickets (D37), sealed before storage
 	TraceID        string
+	Traceparent    string // the W3C traceparent of the request, for the worker's turn to continue (D57)
 	ReleaseID      string // the approved release to run; "" = the agent's current release
 	ExecutionRef   string // the caller's execution reference (EER), recorded on the run
 	// D32: the CMI package the run's context came from, and the events that record how it was
@@ -40,7 +41,7 @@ type CreateRunInput struct {
 
 const runCols = `tenant_id::text, id, thread_id, agent_id::text, release_id::text, release_digest, owner, status, idempotency_key, input, step_count, event_seq,
 	fencing_epoch, coalesce(lease_owner, ''), lease_until, cancel_requested, coalesce(failure_code, ''), coalesce(failure_message, ''), coalesce(execution_ref, ''),
-	credential_expires_at, coalesce(trace_id, ''), deadline_at, created_at, started_at, finished_at, coalesce(parent_run_id, ''), depth, coalesce(purpose, ''), coalesce(evaluation_id::text, ''), coalesce(context_package_id, '')`
+	credential_expires_at, coalesce(trace_id, ''), deadline_at, created_at, started_at, finished_at, coalesce(parent_run_id, ''), depth, coalesce(purpose, ''), coalesce(evaluation_id::text, ''), coalesce(context_package_id, ''), coalesce(traceparent, '')`
 
 // activeStatuses are the statuses of a run that holds its thread and a place in the tenant's concurrency.
 const activeStatuses = `('QUEUED', 'RUNNING', 'AWAITING_INPUT', 'AWAITING_SUBAGENT')`
@@ -51,7 +52,7 @@ func scanRun(row pgx.Row) (*run.Run, error) {
 	var leaseUntil, credExp, startedAt, finishedAt *time.Time
 	if err := row.Scan(&r.TenantID, &r.ID, &r.ThreadID, &r.AgentID, &r.ReleaseID, &r.ReleaseDigest, &r.Owner, &r.Status, &r.IdempotencyKey, &input, &r.StepCount, &r.EventSeq,
 		&r.FencingEpoch, &r.LeaseOwner, &leaseUntil, &r.CancelRequested, &r.FailureCode, &r.FailureMessage, &r.ExecutionRef,
-		&credExp, &r.TraceID, &r.DeadlineAt, &r.CreatedAt, &startedAt, &finishedAt, &r.ParentRunID, &r.Depth, &r.Purpose, &r.EvaluationID, &r.ContextPackageID); err != nil {
+		&credExp, &r.TraceID, &r.DeadlineAt, &r.CreatedAt, &startedAt, &finishedAt, &r.ParentRunID, &r.Depth, &r.Purpose, &r.EvaluationID, &r.ContextPackageID, &r.Traceparent); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, fail("NOT_FOUND", "run not found")
 		}
@@ -276,9 +277,12 @@ func (s *Store) CreateRun(ctx context.Context, tenant string, in CreateRunInput)
 			}
 			inputRaw, _ := json.Marshal(in.Input)
 			deadline := s.now().Add(time.Duration(doc.Definition.Limits.RunTimeoutSeconds) * time.Second)
-			var trace, execRef, ctxPkg any
+			var trace, execRef, ctxPkg, traceparent any
 			if in.TraceID != "" {
 				trace = in.TraceID
+			}
+			if in.Traceparent != "" {
+				traceparent = in.Traceparent
 			}
 			if in.ExecutionRef != "" {
 				execRef = in.ExecutionRef
@@ -287,8 +291,8 @@ func (s *Store) CreateRun(ctx context.Context, tenant string, in CreateRunInput)
 				ctxPkg = in.ContextPackageID
 			}
 			if _, err := tx.Exec(ctx, `INSERT INTO runs (tenant_id, id, thread_id, agent_id, release_id, release_digest, owner, status, idempotency_key, request_sha256, input,
-			credential, credential_expires_at, trace_id, deadline_at, execution_ref, context_package_id, file_tickets, credential_refresh) VALUES ($1, $2, $3, $4, $5, $6, $7, 'QUEUED', $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`,
-				tenant, runID, threadID, a.ID, releaseID, env.Digest, in.Owner, in.IdempotencyKey, hash, inputRaw, cred, credExp, trace, deadline, execRef, ctxPkg, tickets, credRefresh); err != nil {
+			credential, credential_expires_at, trace_id, deadline_at, execution_ref, context_package_id, file_tickets, credential_refresh, traceparent) VALUES ($1, $2, $3, $4, $5, $6, $7, 'QUEUED', $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`,
+				tenant, runID, threadID, a.ID, releaseID, env.Digest, in.Owner, in.IdempotencyKey, hash, inputRaw, cred, credExp, trace, deadline, execRef, ctxPkg, tickets, credRefresh, traceparent); err != nil {
 				if isUniqueViolation(err) {
 					if strings.Contains(constraintOf(err), "idempotency") {
 						return errRetry // the same request raced; the retry replays it
@@ -861,6 +865,15 @@ func durMs(d *time.Duration) *float64 {
 	return &f
 }
 
+// failedJSON is the failed_candidates column (D56): NULL when no candidate failed.
+func failedJSON(f []run.CandidateFailure) any {
+	if len(f) == 0 {
+		return nil
+	}
+	b, _ := json.Marshal(f)
+	return string(b)
+}
+
 // FinishStep records the model call's outcome.
 func (s *Store) FinishStep(ctx context.Context, c *run.Claim, st run.Step, events []agui.Event) error {
 	return s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
@@ -881,10 +894,11 @@ func (s *Store) FinishStep(ctx context.Context, c *run.Claim, st run.Step, event
 		// D54: nil pointers are stored as NULL ("not known"), never as 0
 		if _, err := tx.Exec(ctx, `UPDATE run_steps SET provider = $3, model = $4, prompt_tokens = $5, completion_tokens = $6, latency_ms = $7, stop_reason = $8, error_code = $9, finished_at = now(),
 			first_output_ms = $10, first_text_ms = $11, after_first_ms = $12, cached_tokens = $13, cache_creation_tokens = $14,
-			server_prompt_n = $15, server_prompt_ms = $16, server_cache_n = $17, server_predicted_n = $18, server_predicted_ms = $19
+			server_prompt_n = $15, server_prompt_ms = $16, server_cache_n = $17, server_predicted_n = $18, server_predicted_ms = $19,
+			failed_candidates = $20
 			WHERE run_id = $1 AND step = $2`, c.RunID, st.Step, st.Provider, st.Model, st.PromptTokens, st.CompletionTokens, st.Latency.Milliseconds(), stop, code,
 			durMs(st.FirstOutput), durMs(st.FirstText), durMs(st.AfterFirst), st.CachedTokens, st.CacheCreationTokens,
-			sv.PromptN, sv.PromptMs, sv.CacheN, sv.PredictedN, sv.PredictedMs); err != nil {
+			sv.PromptN, sv.PromptMs, sv.CacheN, sv.PredictedN, sv.PredictedMs, failedJSON(st.Failed)); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `UPDATE runs SET tokens_used = tokens_used + $2 WHERE id = $1`, c.RunID, int64(st.PromptTokens+st.CompletionTokens)); err != nil {
@@ -1147,9 +1161,16 @@ func (s *Store) CreateChildRun(ctx context.Context, c *run.Claim, in run.ChildRu
 			}
 			inputRaw, _ := json.Marshal(input)
 			deadline := s.now().Add(time.Duration(doc.Definition.Limits.RunTimeoutSeconds) * time.Second)
-			var trace, execRef, exp any
+			var trace, execRef, exp, traceparent any
 			if parent.TraceID != "" {
 				trace = parent.TraceID
+			}
+			// D57: the child's turn continues the trace from the span of the parent's turn that delegated, else from the parent's own
+			switch {
+			case in.Traceparent != "":
+				traceparent = in.Traceparent
+			case parent.Traceparent != "":
+				traceparent = parent.Traceparent
 			}
 			if parent.ExecutionRef != "" {
 				execRef = parent.ExecutionRef
@@ -1158,8 +1179,8 @@ func (s *Store) CreateChildRun(ctx context.Context, c *run.Claim, in run.ChildRu
 				exp = *credExp
 			}
 			if _, err := tx.Exec(ctx, `INSERT INTO runs (tenant_id, id, thread_id, agent_id, release_id, release_digest, owner, status, idempotency_key, request_sha256, input,
-			credential, credential_expires_at, trace_id, deadline_at, execution_ref, parent_run_id, depth, credential_refresh) VALUES ($1, $2, $2, $3, $4, $5, $6, 'QUEUED', $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
-				c.TenantID, childID, ag.ID, releaseID, env.Digest, parent.Owner, "sub:"+in.ToolCallID, hash, inputRaw, cred, exp, trace, deadline, execRef, parent.ID, parent.Depth+1, credRefresh); err != nil {
+			credential, credential_expires_at, trace_id, deadline_at, execution_ref, parent_run_id, depth, credential_refresh, traceparent) VALUES ($1, $2, $2, $3, $4, $5, $6, 'QUEUED', $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`,
+				c.TenantID, childID, ag.ID, releaseID, env.Digest, parent.Owner, "sub:"+in.ToolCallID, hash, inputRaw, cred, exp, trace, deadline, execRef, parent.ID, parent.Depth+1, credRefresh, traceparent); err != nil {
 				return err
 			}
 			if _, err := appendMessages(ctx, tx, c.TenantID, childID, childID, []agui.Message{msg}); err != nil {

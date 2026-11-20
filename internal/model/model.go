@@ -158,7 +158,17 @@ type Error struct {
 	// message for an error it reported inside a stream, or where an undecodable chunk was. It is provider-controlled
 	// text: it goes to the host log only, never to an event, the failure message or the step row.
 	Detail string
+	// Fault says whose problem a non-retryable error is (D56): FaultCandidate for what belongs to the one provider or
+	// model that was asked (its key, its model name, its quota, its size limit), FaultPolicy for a content refusal.
+	// Empty is the request's own problem, or one this host cannot attribute: it would fail at every candidate.
+	Fault string
 }
+
+// The values of Error.Fault.
+const (
+	FaultCandidate = "candidate" // the next candidate may answer: another key, another model name, another quota
+	FaultPolicy    = "policy"    // the provider's content policy refused this content: it is not offered to another provider
+)
 
 // Error implements error.
 func (e *Error) Error() string {
@@ -237,7 +247,13 @@ func NewHTTPClient(headerTimeout time.Duration, caFile string) (*http.Client, er
 
 // Classify turns an HTTP status into a provider error.
 func Classify(status int) *Error {
-	return &Error{Code: "status", Status: status, Retryable: status == 408 || status == 429 || status >= 500}
+	e := &Error{Code: "status", Status: status, Retryable: status == 408 || status == 429 || status >= 500}
+	switch status {
+	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden, http.StatusNotFound, http.StatusRequestEntityTooLarge:
+		// that provider's key, its payment, its permission for the model, its model name or route, its body limit (D56)
+		e.Fault = FaultCandidate
+	}
+	return e
 }
 
 // ClassifyHTTP is ClassifyBody for a response whose headers are at hand: the error also carries the Retry-After the
@@ -334,13 +350,33 @@ var contextMarkers = []string{"context_length_exceeded", "maximum context length
 // model's context window gets its own code, because the caller can do something about that one. Only the code
 // leaves this function; the body is neither kept nor shown.
 func ClassifyBody(status int, body []byte) *Error {
+	text := strings.ToLower(string(body))
 	if status == http.StatusBadRequest {
-		text := strings.ToLower(string(body))
 		for _, marker := range contextMarkers {
 			if strings.Contains(text, marker) {
 				return &Error{Code: CodeContextLength, Status: status}
 			}
 		}
 	}
-	return Classify(status)
+	e := Classify(status)
+	switch status {
+	case http.StatusBadRequest, http.StatusPaymentRequired, http.StatusForbidden, http.StatusTooManyRequests:
+		if containsAny(text, quotaMarkers) {
+			// the account has no more to spend: waiting does not help (a 429 of this kind is not the rate limit), and
+			// another candidate has its own account (D56)
+			e.Retryable, e.Fault = false, FaultCandidate
+		}
+	}
+	if status == http.StatusBadRequest && e.Fault == "" && containsAny(text, policyMarkers) {
+		e.Fault = FaultPolicy
+	}
+	return e
 }
+
+// quotaMarkers are how providers say the account is out of quota or credit: OpenAI's error code (also in the 429 body that
+// looks like a rate limit), its billing limit, and Anthropic's 400 message. Only the code and the status are read for the
+// class; the body is not kept.
+var quotaMarkers = []string{"insufficient_quota", "exceeded your current quota", "billing_hard_limit_reached", "credit balance is too low"}
+
+// policyMarkers are how providers say their content policy refused the request: the error code of OpenAI and Azure.
+var policyMarkers = []string{"content_policy_violation", "content_filter", "responsibleaipolicyviolation"}

@@ -127,6 +127,10 @@ type Provider struct {
 	// External says whether what is sent to this provider leaves the enterprise (D43). Absent means it does: a provider
 	// is the enterprise's own only when the operator says so (external: false).
 	External *bool `yaml:"external"`
+	// TracePropagation says whether requests to this provider carry the W3C traceparent of the run's trace (D57). Absent:
+	// it does when the provider is declared external: false and does not otherwise. The header names no content, but it
+	// identifies our request to whoever receives it, and a provider outside the enterprise is a third party.
+	TracePropagation *bool `yaml:"tracePropagation"`
 	// Retry says how the host retries a request this provider answered with a retryable error before any text was
 	// streamed (D45); every field is optional and the defaults need no configuration.
 	Retry Retry `yaml:"retry"`
@@ -254,6 +258,15 @@ func (p Provider) IdleTimeout() time.Duration { return seconds(p.IdleTimeoutSeco
 
 // IsExternal: unless declared otherwise, a provider is outside the enterprise.
 func (p Provider) IsExternal() bool { return p.External == nil || *p.External }
+
+// PropagatesTrace reports whether requests to the provider carry the trace context (D57): what the operator said, else
+// only for a provider that is the enterprise's own.
+func (p Provider) PropagatesTrace() bool {
+	if p.TracePropagation != nil {
+		return *p.TracePropagation
+	}
+	return !p.IsExternal()
+}
 
 // Gateway is one MCP Infrastructure gateway.
 type Gateway struct {

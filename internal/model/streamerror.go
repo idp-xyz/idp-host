@@ -86,8 +86,10 @@ func ClassifyStreamError(raw json.RawMessage) *Error {
 	switch {
 	case containsAny(strings.ToLower(msg+" "+tokens), contextMarkers):
 		e.Code = CodeContextLength
-	case containsAny(tokens, []string{"insufficient_quota", "billing", "invalid_api_key", "authentication", "permission"}):
-		e.Code = CodeProviderError
+	case containsAny(tokens, []string{"content_filter", "content_policy", "responsibleaipolicyviolation"}):
+		e.Code, e.Fault = CodeProviderError, FaultPolicy // D56: refused by the provider's policy, not offered to another
+	case containsAny(tokens, []string{"insufficient_quota", "billing", "invalid_api_key", "authentication", "permission", "not_found", "unauthenticated"}):
+		e.Code, e.Fault = CodeProviderError, FaultCandidate // D56: this provider's quota, key, access or model name
 	case num == 503 || num == 529 || containsAny(tokens, []string{"overloaded", "unavailable"}):
 		e.Code, e.Retryable = CodeProviderOverloaded, true
 	case num == 429 || containsAny(tokens, []string{"rate_limit", "rate limit", "too_many_requests", "resource_exhausted"}):
