@@ -229,6 +229,7 @@ type turn struct {
 	lastView   string                               // the items shortened at the previous step, to record only a change
 	sticky     map[string]int                       // the limit each item was cut to at an earlier step of this run (D52)
 	batch      batchState                           // where the run is in D58's batches of shortening
+	notes      []keptNote                           // D59: the budget notes of earlier steps that stay in the view
 	viewRaw    float64                              // the raw estimate of the request now being sent
 	viewFixed  float64                              // ... and corrected
 	hint       string                               // what the budget note adds about the context this step
@@ -2100,12 +2101,31 @@ func (t *turn) guardedMessages() ([]agui.Message, error) {
 	tools := t.modelTools()
 	// D52: what is not the thread, estimated; then what the model reads of the thread is decided against the water mark
 	base := requestTokens(t.def.Instructions, msgs, tools)
+	keep := t.limits.KeepNotes && t.limits.Window > 0
+	noteTokens := 0.0
+	if keep {
+		if n := len(t.notes); n > 0 && t.notes[n-1].step == t.step { // this step's note, of an earlier call of the same step
+			t.notes = t.notes[:n-1]
+		}
+		for _, k := range t.notes {
+			noteTokens += msgTokens(k.msg)
+		}
+		base += noteTokens
+	}
 	wrapTokens := 0.0
 	if in.ToolResults != guard.ModeOff {
 		wrapTokens = ctxwin.Tokens(guard.Wrap("tool_result", ""))
 	}
-	view := t.shape(base, wrapTokens)
-	for _, m := range t.messages {
+	view := t.shape(base, wrapTokens, noteTokens)
+	if view.drop {
+		t.notes = nil
+	}
+	nextNote := 0
+	for i, m := range t.messages {
+		for nextNote < len(t.notes) && t.notes[nextNote].after <= i { // D59: a note stays where it was written: after the thread as it was then
+			msgs = append(msgs, t.notes[nextNote].msg)
+			nextNote++
+		}
 		body := m.Content
 		if s, ok := view.results[m.ID]; ok {
 			body = s
@@ -2121,6 +2141,9 @@ func (t *turn) guardedMessages() ([]agui.Message, error) {
 		}
 		msgs = append(msgs, m)
 	}
+	for ; nextNote < len(t.notes); nextNote++ {
+		msgs = append(msgs, t.notes[nextNote].msg)
+	}
 	t.hint, t.viewRaw = "", requestTokens(t.def.Instructions, msgs, tools)
 	t.viewFixed = t.viewRaw * t.corr.Factor()
 	if t.limits.Window > 0 && (t.viewFixed >= float64(t.limits.Hint) || t.batch.told) { // D52: the context is filling; say so, where the budget hint is (D58: and keep saying it once the shortening is at its bottom and the estimate has reached the hint)
@@ -2129,6 +2152,9 @@ func (t *turn) guardedMessages() ([]agui.Message, error) {
 	if t.step > 0 { // D41: last, so the thread before it stays a stable prefix; not stored
 		note := agui.Message{ID: "budget", Role: agui.RoleDeveloper, Content: t.budgetNote()}
 		msgs = append(msgs, note)
+		if keep { // D59: the note stays in the view at the next steps, where it is
+			t.notes = append(t.notes, keptNote{after: len(t.messages), step: t.step, msg: note})
+		}
 		t.viewRaw += msgTokens(note)
 		t.viewFixed = t.viewRaw * t.corr.Factor()
 	}

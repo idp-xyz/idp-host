@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"idp-host/internal/agui"
 	"idp-host/internal/canonical"
 	"idp-host/internal/mcpclient"
 	"idp-host/internal/model"
@@ -26,6 +27,18 @@ const (
 
 var workspaceCreatedRE = regexp.MustCompile(`workspace ([0-9a-f]{32}) created`)
 
+// keptNote is a budget note of an earlier step that stays in the view (D59): where it was written (after how many thread
+// messages), and as it was written.
+type keptNote struct {
+	after int
+	step  int
+	msg   agui.Message
+}
+
+// keptNoteRule is the last sentence of a budget note that stays in the view (D59): the notes of earlier steps are still
+// there at the next steps, unchanged, so each one says which step it is and that only the last one is current.
+const keptNoteRule = " Note dated step %d: only the last budget note of the conversation is current; earlier ones are history."
+
 // budgetNote is what the model reads about the run's budget this step. It is not stored on the thread.
 func (t *turn) budgetNote() string {
 	max := t.def.Limits.MaxSteps
@@ -42,11 +55,18 @@ func (t *turn) budgetNote() string {
 		if remain < 0 {
 			remain = 0
 		}
-		fmt.Fprintf(&b, " The run ends at %s (%s left).", d.UTC().Format(time.RFC3339), humanRemain(remain))
+		if t.limits.KeepNotes && t.limits.Window > 0 { // D59: a note that is read again later says what was true when it was written
+			fmt.Fprintf(&b, " The run ends at %s (%s left at this step).", d.UTC().Format(time.RFC3339), humanRemain(remain))
+		} else {
+			fmt.Fprintf(&b, " The run ends at %s (%s left).", d.UTC().Format(time.RFC3339), humanRemain(remain))
+		}
 	}
 	b.WriteString(t.hint) // D52: set by guardedMessages when the context is filling; empty otherwise
 	if t.wrappingUp() {
 		b.WriteString(" Wrap-up: only file delivery is available now. Deliver each file the user should receive, with target output. Do not inspect, edit or run code.")
+	}
+	if t.limits.KeepNotes && t.limits.Window > 0 {
+		fmt.Fprintf(&b, keptNoteRule, t.step)
 	}
 	return b.String()
 }

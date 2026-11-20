@@ -155,6 +155,7 @@ type Model struct {
 		KeepToolResults int     `yaml:"keepToolResults"` // 1 to 50; default 6
 		OldResultBytes  int     `yaml:"oldResultBytes"`  // 200 bytes to 1 MiB; default 1,200 at 131,072 tokens, scaled with the window within 512 to 4,096
 		ArgumentBytes   int     `yaml:"argumentBytes"`   // 200 bytes to 1 MiB; default OldResultBytes
+		KeepBudgetNotes bool    `yaml:"keepBudgetNotes"` // D59: the budget notes of earlier steps stay in what the model reads until a batch of shortening drops them
 	} `yaml:"context"`
 }
 
@@ -162,7 +163,7 @@ type Model struct {
 func (m Model) Settings() ctxwin.Settings {
 	c := m.Context
 	return ctxwin.Settings{Window: m.ContextWindow, MarkShare: c.WaterMarkShare, HintShare: c.HintShare, ToolResultBytes: c.ToolResultBytes,
-		KeepResults: c.KeepToolResults, OldBytes: c.OldResultBytes, ArgumentBytes: c.ArgumentBytes}
+		KeepResults: c.KeepToolResults, OldBytes: c.OldResultBytes, ArgumentBytes: c.ArgumentBytes, KeepNotes: c.KeepBudgetNotes}
 }
 
 func (m Model) validate() error {

@@ -119,6 +119,7 @@ type threadView struct {
 	batch   int    // D58: how many items a batch cut at this step (0 = no batch)
 	why     string // what called the batch: "start" | "mark" | "limit"
 	bottom  bool   // D58: shortening is at its bottom; the view is frozen until the limit
+	drop    bool   // D59: the view changes at this step (a batch, or with D52's rule any cut), so the budget notes of earlier steps are dropped
 }
 
 // batchState is where a run is in D58's batches: the view changes only at a batch, and a batch is called by the first view
@@ -134,7 +135,7 @@ type batchState struct {
 // system part, the context entries, the user's messages and the assistant's text are never shortened; neither is an
 // error result, and neither are the newest tool results (the last KeepResults, and at the deepest levels the last
 // FloorKeep) and the calls that asked for them.
-func (t *turn) shape(base, wrapTokens float64) *threadView {
+func (t *turn) shape(base, wrapTokens, noteTokens float64) *threadView {
 	lim := t.limits
 	v := &threadView{results: map[string]string{}, args: map[string]string{}}
 	resource := map[string]bool{}
@@ -300,6 +301,10 @@ func (t *turn) shape(base, wrapTokens float64) *threadView {
 			for _, it := range items {
 				was[it] = it.limit
 			}
+			if noteTokens > 0 { // D59: the view changes anyway; the notes of earlier steps go with it
+				total -= noteTokens
+				v.drop = true
+			}
 			level0()
 			done := true
 			if total*t.corr.Factor() > float64(lim.Mark) {
@@ -326,6 +331,9 @@ func (t *turn) shape(base, wrapTokens float64) *threadView {
 			continue
 		}
 		if lim.Window > 0 {
+			if lim.PerStep && t.sticky[it.kind+"|"+it.id] != it.limit {
+				v.drop = true
+			}
 			t.sticky[it.kind+"|"+it.id] = it.limit
 		}
 		if it.kind == "result" {

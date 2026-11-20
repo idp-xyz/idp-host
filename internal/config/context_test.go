@@ -27,6 +27,7 @@ func TestAModelEntryGivesTheWindowAndTheThresholds(t *testing.T) {
           keepToolResults: 4
           oldResultBytes: 800
           argumentBytes: 2000
+          keepBudgetNotes: true
 `)
 	if err != nil {
 		t.Fatal(err)
@@ -36,7 +37,7 @@ func TestAModelEntryGivesTheWindowAndTheThresholds(t *testing.T) {
 		t.Errorf("%+v", q)
 	}
 	s := mc["local/small"]
-	if s.Window != 32768 || s.MarkShare != 0.5 || s.HintShare != 0.75 || s.ToolResultBytes != 8192 || s.KeepResults != 4 || s.OldBytes != 800 || s.ArgumentBytes != 2000 {
+	if s.Window != 32768 || s.MarkShare != 0.5 || s.HintShare != 0.75 || s.ToolResultBytes != 8192 || s.KeepResults != 4 || s.OldBytes != 800 || s.ArgumentBytes != 2000 || !s.KeepNotes || mc["local/qwen"].KeepNotes {
 		t.Errorf("%+v", s)
 	}
 	if _, ok := mc["local/other"]; ok {

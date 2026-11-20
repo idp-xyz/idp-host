@@ -78,6 +78,7 @@ type Settings struct {
 	KeepResults     int     // the newest tool results (and the calls that asked for them) that are kept whole
 	OldBytes        int     // an older result or argument value longer than this is shown as head and tail
 	ArgumentBytes   int     // like OldBytes, for the values of a tool call's arguments (default: OldBytes)
+	KeepNotes       bool    // D59: the budget notes of earlier steps stay in the view, dropped at a batch, so that the request keeps growing at its end
 }
 
 // Limits are Settings with every default filled in from the window.
@@ -90,6 +91,7 @@ type Limits struct {
 	KeepResults     int
 	OldBytes        int
 	ArgumentBytes   int
+	KeepNotes       bool
 }
 
 // The D40 constants, which the derivation gives for a window of 131,072 tokens.
@@ -116,7 +118,7 @@ const FloorKeep = 2
 // Resolve fills in the defaults. fixed carries what a Harness was given explicitly (it wins over a derived default, not
 // over the operator's per-model setting).
 func (s Settings) Resolve(fixed Settings) Limits {
-	l := Limits{Window: s.Window}
+	l := Limits{Window: s.Window, KeepNotes: s.Window > 0 && s.KeepNotes}
 	pick := func(model, set, derived int) int {
 		switch {
 		case model > 0:

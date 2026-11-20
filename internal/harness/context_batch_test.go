@@ -276,14 +276,17 @@ func lastBudget(msgs []fakemodel.Message) string {
 	return ""
 }
 
+// goldenMultiStepD40 are the digests of every request of a run of six steps on recordedLikeThread(pairs), made by the code of D57 with
+// no window configured.
+var goldenMultiStepD40 = map[int][]string{
+	20: {"e523779ca92c37a64803a88b3a1f1f0f2d08f1096a00e6dd5944f10d57c6ff22", "058d0ed18450c390658995f89d9bb0e4e2ead98e2d17843f7eaa2598f7294280", "d237e8251a8337eefd561c60bcb00ac33c267ec36d41e10a9f9ddc4f00e19dd1", "f40b7cb7b9c85ca6ec351553143940b0d8a8b130237f38ac4ce06657aa42c86c", "5809416fcfa1d81c427ebde73118defe0e26d3acd91bdc0761302647612b5bd4", "906c51bab083b067fcddd8e6ccc6f1d011c91b122cf81af30133e7a5403e9378"},
+	45: {"73bbdf111958a6fa1785506684192ed4b03843c5f341097a32a86da4d137847e", "c54d3b1af77d03c0c1ce5492b06b9e2759be03bbbd8242a73f866f58528bef21", "49f591a7a9e0efadbd06c320eef0f0829ec93376d86ba4daff0b534b44fea487", "dff06ec21fac4fcf64b457d105ae074e062672a3cbc779600db4f0e6753a22b8", "88ba7507feb2af6c0cf039c18682fe51f7b7bd7d4340c2af56dbe66bbe2cc93d", "ab75cda82df23a21dcc6b72cc5d9d248b163997076988e16d1dd3eb3794c20b6"},
+}
+
 // D58: with no window configured a run of several steps sends what D40 sent, byte for byte: the digests are those of the
 // code of D57 (the branch this one starts from), which wrote no record of D52 or D58 and cut at every step by D40's rule.
 func TestWithoutAContextWindowEveryRequestOfARunIsThatOfD40(t *testing.T) {
-	golden := map[int][]string{
-		20: {"e523779ca92c37a64803a88b3a1f1f0f2d08f1096a00e6dd5944f10d57c6ff22", "058d0ed18450c390658995f89d9bb0e4e2ead98e2d17843f7eaa2598f7294280", "d237e8251a8337eefd561c60bcb00ac33c267ec36d41e10a9f9ddc4f00e19dd1", "f40b7cb7b9c85ca6ec351553143940b0d8a8b130237f38ac4ce06657aa42c86c", "5809416fcfa1d81c427ebde73118defe0e26d3acd91bdc0761302647612b5bd4", "906c51bab083b067fcddd8e6ccc6f1d011c91b122cf81af30133e7a5403e9378"},
-		45: {"73bbdf111958a6fa1785506684192ed4b03843c5f341097a32a86da4d137847e", "c54d3b1af77d03c0c1ce5492b06b9e2759be03bbbd8242a73f866f58528bef21", "49f591a7a9e0efadbd06c320eef0f0829ec93376d86ba4daff0b534b44fea487", "dff06ec21fac4fcf64b457d105ae074e062672a3cbc779600db4f0e6753a22b8", "88ba7507feb2af6c0cf039c18682fe51f7b7bd7d4340c2af56dbe66bbe2cc93d", "ab75cda82df23a21dcc6b72cc5d9d248b163997076988e16d1dd3eb3794c20b6"},
-	}
-	for pairs, want := range golden {
+	for pairs, want := range goldenMultiStepD40 {
 		e := setup(t)
 		e.model.Script = seqAfter(pairs, call("sum", `{"a":1,"b":2}`), call("sum", `{"a":2,"b":2}`), call("sum", `{"a":3,"b":2}`), call("sum", `{"a":4,"b":2}`), call("sum", `{"a":5,"b":2}`), fakemodel.Turn{Text: "done"})
 		m := runWith(t, e, def(), recordedLikeThread(pairs), run.Input{})
