@@ -226,14 +226,22 @@ var additionRE = regexp.MustCompile(`(\d+)\s*\+\s*(\d+)`)
 
 // Server is the fake.
 type Server struct {
-	Script    Script
-	calls     atomic.Int64
-	mu        sync.Mutex
-	last      []Message
-	history   [][]Message // every request, including the host's budget note
-	lastTools []string
-	lastMax   int
-	models    []string
+	Script Script
+	// LlamaTimings makes the OpenAI-wire stream answer the way llama.cpp does (D54): usage with prompt_tokens_details.cached_tokens
+	// and a timings object in the last chunk. Off, nothing of it is sent, as before.
+	LlamaTimings bool
+	// AnthropicCache makes the Anthropic-wire stream report the same prompt as before, but split the way a cached request is
+	// reported (D54): input_tokens only 1/10 of it, the rest as cache_read_input_tokens.
+	AnthropicCache bool
+	// AnthropicTokensPerMessage is what the Anthropic-wire stream reports per message in the prompt; zero means 10.
+	AnthropicTokensPerMessage int
+	calls                     atomic.Int64
+	mu                        sync.Mutex
+	last                      []Message
+	history                   [][]Message // every request, including the host's budget note
+	lastTools                 []string
+	lastMax                   int
+	models                    []string
 }
 
 // LastTools returns the tool names offered in the last request.
@@ -650,7 +658,12 @@ func (s *Server) openai(w http.ResponseWriter, r *http.Request) {
 	}
 	send(chunk(map[string]any{}, finish))
 	if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
-		send(map[string]any{"id": "chatcmpl-fake", "object": "chat.completion.chunk", "model": req.Model, "choices": []any{}, "usage": usage})
+		last := map[string]any{"id": "chatcmpl-fake", "object": "chat.completion.chunk", "model": req.Model, "choices": []any{}, "usage": usage}
+		if s.LlamaTimings {
+			usage["prompt_tokens_details"] = map[string]any{"cached_tokens": 6 * len(msgs)}
+			last["timings"] = map[string]any{"cache_n": 6 * len(msgs), "prompt_n": 4 * len(msgs), "prompt_ms": 12.5, "predicted_n": 7, "predicted_ms": 70.25}
+		}
+		send(last)
 	}
 	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 	if f != nil {
@@ -731,7 +744,7 @@ func (s *Server) anthropic(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	send("message_start", map[string]any{"type": "message_start", "message": map[string]any{"id": "msg_fake", "type": "message", "role": "assistant",
-		"model": req.Model, "content": []any{}, "usage": map[string]any{"input_tokens": 10 * len(msgs), "output_tokens": 0}}})
+		"model": req.Model, "content": []any{}, "usage": s.anthropicStartUsage(len(msgs))}})
 	idx := 0
 	if turn.Reasoning != "" {
 		send("content_block_start", map[string]any{"type": "content_block_start", "index": idx, "content_block": map[string]any{"type": "thinking", "thinking": ""}})
@@ -760,6 +773,17 @@ func (s *Server) anthropic(w http.ResponseWriter, r *http.Request) {
 	}
 	send("message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stop, "stop_sequence": nil}, "usage": map[string]any{"output_tokens": 7}})
 	send("message_stop", map[string]any{"type": "message_stop"})
+}
+
+func (s *Server) anthropicStartUsage(n int) map[string]any {
+	per := s.AnthropicTokensPerMessage
+	if per == 0 {
+		per = 10
+	}
+	if s.AnthropicCache {
+		return map[string]any{"input_tokens": n * per / 10, "cache_creation_input_tokens": 0, "cache_read_input_tokens": n * per * 9 / 10, "output_tokens": 0}
+	}
+	return map[string]any{"input_tokens": n * per, "output_tokens": 0}
 }
 
 func split(s string, n int) []string {

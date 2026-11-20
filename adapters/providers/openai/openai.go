@@ -176,9 +176,21 @@ type chunk struct {
 		} `json:"message"`
 	} `json:"choices"`
 	Usage *struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
+		PromptTokens        int `json:"prompt_tokens"`
+		CompletionTokens    int `json:"completion_tokens"`
+		PromptTokensDetails *struct {
+			CachedTokens *int `json:"cached_tokens"`
+		} `json:"prompt_tokens_details"`
 	} `json:"usage"`
+	// Timings is llama.cpp's own account of the call (D54): sent in the last chunk of a stream (and of a plain answer)
+	// without any request option, in every chunk with timings_per_token. Other servers do not send it.
+	Timings *struct {
+		PromptN     *int     `json:"prompt_n"`
+		PromptMs    *float64 `json:"prompt_ms"`
+		CacheN      *int     `json:"cache_n"`
+		PredictedN  *int     `json:"predicted_n"`
+		PredictedMs *float64 `json:"predicted_ms"`
+	} `json:"timings"`
 	Error *json.RawMessage `json:"error"`
 }
 
@@ -190,12 +202,26 @@ type accumulator struct {
 	finish    string
 	usage     model.Usage
 	sawUsage  bool
+	watch     *model.Stopwatch // nil for a non-streamed answer: its first output is not known (D54)
 }
 
 func (a *accumulator) apply(c *chunk, onDelta func(model.Delta)) {
 	if c.Usage != nil {
-		a.usage = model.Usage{PromptTokens: c.Usage.PromptTokens, CompletionTokens: c.Usage.CompletionTokens}
+		// prompt_tokens is the whole prompt, cached part included: cached_tokens is a share of it (OpenAI's documentation;
+		// llama.cpp's usage_json_oaicompat), so nothing is added back (D54)
+		cached, creation, srv := a.usage.CachedTokens, a.usage.CacheCreationTokens, a.usage.Server
+		a.usage = model.Usage{PromptTokens: c.Usage.PromptTokens, CompletionTokens: c.Usage.CompletionTokens, CachedTokens: cached, CacheCreationTokens: creation, Server: srv}
+		if d := c.Usage.PromptTokensDetails; d != nil && d.CachedTokens != nil {
+			n := *d.CachedTokens
+			a.usage.CachedTokens = &n
+		}
 		a.sawUsage = true
+	}
+	if t := c.Timings; t != nil {
+		st := &model.ServerTimings{PromptN: t.PromptN, PromptMs: t.PromptMs, CacheN: t.CacheN, PredictedN: t.PredictedN, PredictedMs: t.PredictedMs}
+		if st.Any() {
+			a.usage.Server = st
+		}
 	}
 	for _, ch := range c.Choices {
 		if ch.Index != 0 {
@@ -220,6 +246,7 @@ func (a *accumulator) apply(c *chunk, onDelta func(model.Delta)) {
 		d := ch.Delta
 		if d.Content != nil && *d.Content != "" {
 			a.content.WriteString(*d.Content)
+			a.watch.Text()
 			if onDelta != nil {
 				onDelta(model.Delta{Text: *d.Content})
 			}
@@ -227,6 +254,7 @@ func (a *accumulator) apply(c *chunk, onDelta func(model.Delta)) {
 		for _, r := range []*string{d.ReasoningContent, d.Reasoning} {
 			if r != nil && *r != "" {
 				a.reasoning.WriteString(*r)
+				a.watch.Output()
 				if onDelta != nil {
 					onDelta(model.Delta{Reasoning: *r})
 				}
@@ -236,6 +264,9 @@ func (a *accumulator) apply(c *chunk, onDelta func(model.Delta)) {
 			idx := i
 			if tc.Index != nil {
 				idx = *tc.Index
+			}
+			if tc.ID != "" || tc.Function.Name != "" || tc.Function.Arguments != "" {
+				a.watch.Output() // a tool call is output: its name and arguments are written by the model
 			}
 			a.call(idx, tc)
 		}
@@ -307,6 +338,7 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 		hr.Header.Set("Authorization", "Bearer "+p.cfg.APIKey)
 	}
 	observability.Propagator.Inject(ctx, propagation.HeaderCarrier(hr.Header))
+	req.Watch.Sent()
 	resp, err := p.cfg.HTTP.Do(hr)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -336,9 +368,10 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 		if c.Error != nil {
 			return nil, model.ClassifyStreamError(*c.Error)
 		}
-		acc.apply(&c, onDelta)
+		acc.apply(&c, onDelta) // acc has no watch here: nothing was streamed, so the first output stays absent (D54)
 		return acc.response(p.cfg.NewMessageID())
 	}
+	acc.watch = req.Watch
 	sc := bufio.NewScanner(stream)
 	sc.Buffer(make([]byte, 64<<10), 4<<20)
 	var data []string
@@ -383,5 +416,6 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 	if err := sc.Err(); err != nil {
 		return nil, watch.StreamError(ctx)
 	}
+	req.Watch.Done()
 	return acc.response(p.cfg.NewMessageID())
 }

@@ -42,6 +42,9 @@ type Request struct {
 	Tools           []ToolSpec
 	Temperature     *float64
 	MaxOutputTokens int
+	// Watch, when set, is told by the adapter when the request was sent and when the answer first produced output (D54).
+	// An adapter that streams calls it; one that does not leaves the timing absent. Never nil-checked by the caller.
+	Watch *Stopwatch
 }
 
 // Delta is a streamed fragment.
@@ -51,9 +54,38 @@ type Delta struct {
 }
 
 // Usage is the token accounting of one call.
+//
+// PromptTokens is ALWAYS the whole prompt the model server holds for the request, cached part included (D54): D52's
+// correction compares it with the estimate of the whole request. A provider that reports the uncached part apart
+// (Anthropic's input_tokens) is added up by its adapter.
+//
+// The pointer fields are what the provider said about reuse and processing (D54); nil is "it did not say", never zero.
 type Usage struct {
 	PromptTokens     int `json:"promptTokens"`
 	CompletionTokens int `json:"completionTokens"`
+	// CachedTokens is the part of the prompt served from the provider's cache: OpenAI-compatible
+	// usage.prompt_tokens_details.cached_tokens, Anthropic cache_read_input_tokens, Gemini cachedContentTokenCount.
+	CachedTokens *int `json:"cachedTokens,omitempty"`
+	// CacheCreationTokens is what the provider wrote to its cache for this request (Anthropic
+	// cache_creation_input_tokens).
+	CacheCreationTokens *int `json:"cacheCreationTokens,omitempty"`
+	// Server is the model server's own account of the call (llama.cpp's timings object).
+	Server *ServerTimings `json:"server,omitempty"`
+}
+
+// ServerTimings is what a llama.cpp style server reports in its timings object: prompt_n tokens processed (not reused),
+// cache_n reused, predicted_n generated, and the milliseconds spent on the first and the last.
+type ServerTimings struct {
+	PromptN     *int     `json:"promptN,omitempty"`
+	PromptMs    *float64 `json:"promptMs,omitempty"`
+	CacheN      *int     `json:"cacheN,omitempty"`
+	PredictedN  *int     `json:"predictedN,omitempty"`
+	PredictedMs *float64 `json:"predictedMs,omitempty"`
+}
+
+// Any reports whether the server said anything.
+func (s *ServerTimings) Any() bool {
+	return s != nil && (s.PromptN != nil || s.PromptMs != nil || s.CacheN != nil || s.PredictedN != nil || s.PredictedMs != nil)
 }
 
 // Stop reasons.

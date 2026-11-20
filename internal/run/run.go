@@ -12,6 +12,7 @@ import (
 
 	"idp-host/internal/agent"
 	"idp-host/internal/agui"
+	"idp-host/internal/model"
 )
 
 // Status of a run.
@@ -258,6 +259,13 @@ type Step struct {
 	Latency          time.Duration `json:"-"`
 	StopReason       string        `json:"stopReason,omitempty"`
 	ErrorCode        string        `json:"errorCode,omitempty"`
+	// D54: what is known of the successful attempt's timing and of the provider's account of reuse; nil is "not known".
+	FirstOutput         *time.Duration       `json:"-"` // request sent to the first output of any kind
+	FirstText           *time.Duration       `json:"-"` // request sent to the first text fragment
+	AfterFirst          *time.Duration       `json:"-"` // first output to the end of the stream
+	CachedTokens        *int                 `json:"cachedTokens,omitempty"`
+	CacheCreationTokens *int                 `json:"cacheCreationTokens,omitempty"`
+	Server              *model.ServerTimings `json:"server,omitempty"`
 }
 
 // StepName is the AG-UI step name of step n.

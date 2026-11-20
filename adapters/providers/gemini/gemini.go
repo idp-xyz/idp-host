@@ -176,9 +176,10 @@ type chunk struct {
 		FinishReason string `json:"finishReason"`
 	} `json:"candidates"`
 	UsageMetadata *struct {
-		PromptTokenCount     int `json:"promptTokenCount"`
-		CandidatesTokenCount int `json:"candidatesTokenCount"`
-		ThoughtsTokenCount   int `json:"thoughtsTokenCount"`
+		PromptTokenCount        int  `json:"promptTokenCount"`
+		CachedContentTokenCount *int `json:"cachedContentTokenCount"`
+		CandidatesTokenCount    int  `json:"candidatesTokenCount"`
+		ThoughtsTokenCount      int  `json:"thoughtsTokenCount"`
 	} `json:"usageMetadata"`
 	Error *json.RawMessage `json:"error"`
 }
@@ -206,6 +207,7 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 		hr.Header.Set("x-goog-api-key", p.cfg.APIKey)
 	}
 	observability.Propagator.Inject(ctx, propagation.HeaderCarrier(hr.Header))
+	req.Watch.Sent()
 	resp, err := p.cfg.HTTP.Do(hr)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -244,7 +246,9 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 			return model.ClassifyStreamError(*c.Error) // D50: {"error":{"code":503,"message":…,"status":"UNAVAILABLE"}}
 		}
 		if c.UsageMetadata != nil {
-			usage = model.Usage{PromptTokens: c.UsageMetadata.PromptTokenCount, CompletionTokens: c.UsageMetadata.CandidatesTokenCount + c.UsageMetadata.ThoughtsTokenCount}
+			// promptTokenCount is the whole prompt, the cached content included: cachedContentTokenCount is a share of it (the
+			// usageMetadata documentation), so nothing is added back (D54)
+			usage = model.Usage{PromptTokens: c.UsageMetadata.PromptTokenCount, CompletionTokens: c.UsageMetadata.CandidatesTokenCount + c.UsageMetadata.ThoughtsTokenCount, CachedTokens: c.UsageMetadata.CachedContentTokenCount}
 		}
 		for _, cand := range c.Candidates {
 			if cand.FinishReason != "" {
@@ -261,15 +265,20 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 						return &model.Error{Code: "schema"}
 					}
 					calls++
+					req.Watch.Output()
 					msg.ToolCalls = append(msg.ToolCalls, agui.ToolCall{ID: fmt.Sprintf("%s-call-%d", msg.ID, calls), Type: "function",
 						Function: agui.FunctionCall{Name: pt.FunctionCall.Name, Arguments: args}})
 				case pt.Thought:
 					reasoning.WriteString(pt.Text)
+					if pt.Text != "" {
+						req.Watch.Output()
+					}
 					if onDelta != nil && pt.Text != "" {
 						onDelta(model.Delta{Reasoning: pt.Text})
 					}
 				case pt.Text != "":
 					text.WriteString(pt.Text)
+					req.Watch.Text()
 					if onDelta != nil {
 						onDelta(model.Delta{Text: pt.Text})
 					}
@@ -299,6 +308,7 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 	if err := sc.Err(); err != nil {
 		return nil, watch.StreamError(ctx)
 	}
+	req.Watch.Done()
 	msg.Content = text.String()
 	stop := model.StopOther
 	switch {

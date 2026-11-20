@@ -187,9 +187,10 @@ type turn struct {
 	ctx        context.Context
 	callCtx    context.Context
 	stopCalls  context.CancelCauseFunc
-	attempts   int           // model requests made in the step in progress, retries and fallbacks included (D45)
-	askedWait  time.Duration // the longest Retry-After that was refused in the step in progress (D45)
-	askedCap   time.Duration // what the provider that asked it is waited for, at most
+	attempts   int              // model requests made in the step in progress, retries and fallbacks included (D45)
+	attemptLog []map[string]any // what each of those requests took and how it ended (D54)
+	askedWait  time.Duration    // the longest Retry-After that was refused in the step in progress (D45)
+	askedCap   time.Duration    // what the provider that asked it is waited for, at most
 	claim      *run.Claim
 	rc         *run.Context
 	def        agent.Definition
@@ -1313,8 +1314,7 @@ func (t *turn) loop() error {
 		for _, call := range resp.Message.ToolCalls {
 			events = append(events, agui.ToolCallStart(call.ID, call.Function.Name, resp.Message.ID), agui.ToolCallArgs(call.ID, call.Function.Arguments), agui.ToolCallEnd(call.ID))
 		}
-		events = append(events, agui.Custom(agui.CustomUsage, map[string]any{"step": step, "provider": st.Provider, "model": st.Model,
-			"promptTokens": resp.Usage.PromptTokens, "completionTokens": resp.Usage.CompletionTokens, "latencyMs": st.Latency.Milliseconds(), "attempts": t.attempts}),
+		events = append(events, agui.Custom(agui.CustomUsage, t.usageEvent(step, st, resp.Usage)),
 			agui.StepFinished(run.StepName(step)))
 		if err := h.Store.FinishStep(t.ctx, t.claim, st, nil); err != nil {
 			return err
@@ -1494,7 +1494,7 @@ func (t *turn) callModel(step int) (*model.Response, run.Step, error) {
 		}
 	}
 	st.Provider, st.Model = refs[0].Provider, refs[0].Model
-	t.attempts, t.askedWait, t.askedCap = 0, 0, 0
+	t.attempts, t.askedWait, t.askedCap, t.attemptLog = 0, 0, 0, nil
 	var lastErr error
 candidates:
 	for i, ref := range refs {
@@ -1511,10 +1511,13 @@ candidates:
 			mctx, cancel := context.WithCancel(t.callCtx)
 			s := &streamer{t: t, msgID: msgID, last: h.Now(), cancel: cancel, out: t.output, strict: t.def.Guards.Output.Strict}
 			start := h.Now()
+			watch := model.NewStopwatch(h.Now) // D54: the adapter says when the request was sent and when the first output came
 			resp, err := p.Complete(mctx, model.Request{Model: ref.Model, Instructions: t.def.Instructions, Messages: msgs, Tools: tools,
-				Temperature: t.def.Model.Temperature, MaxOutputTokens: t.def.Model.MaxOutputTokens}, s.delta)
+				Temperature: t.def.Model.Temperature, MaxOutputTokens: t.def.Model.MaxOutputTokens, Watch: watch}, s.delta)
 			cancel()
 			st.Latency = h.Now().Sub(start)
+			timing := watch.Timing()
+			t.logAttempt(ref, st.Latency, timing, err, s.blocked != "")
 			cut := t.callCtx.Err() != nil // the deadline, a cancel or a stopped worker ended the call (D46)
 			h.Router.Observe(ref, st.Latency, err != nil && s.blocked == "" && !cut)
 			if ferr := s.finish(); ferr != nil {
@@ -1528,7 +1531,9 @@ candidates:
 				resp.Message.ID = msgID
 				st.ErrorCode = "" // an earlier attempt or candidate failed (D45); the step did not
 				st.PromptTokens, st.CompletionTokens, st.StopReason = resp.Usage.PromptTokens, resp.Usage.CompletionTokens, resp.StopReason
-				t.corr.Observe(t.viewRaw, resp.Usage.PromptTokens) // D52
+				st.FirstOutput, st.FirstText, st.AfterFirst = timing.FirstOutput, timing.FirstText, timing.AfterFirst // D54: the successful attempt's
+				st.CachedTokens, st.CacheCreationTokens, st.Server = resp.Usage.CachedTokens, resp.Usage.CacheCreationTokens, resp.Usage.Server
+				t.corr.Observe(t.viewRaw, resp.Usage.PromptTokens) // D52: PromptTokens is the whole prompt, the cached part included (D54)
 				if gerr := t.guardOutput(resp); gerr != nil {
 					st.ErrorCode = "guard_blocked"
 					if errors.Is(gerr, errInterrupted) {
@@ -1624,6 +1629,73 @@ candidates:
 }
 
 // errorCode is the step's error code of a provider error.
+// logAttempt records one request of the step: how long it took, when its first output came, how it ended (D54).
+func (t *turn) logAttempt(ref agent.ModelRef, latency time.Duration, timing model.Timing, err error, blocked bool) {
+	outcome := "ok"
+	var me *model.Error
+	switch {
+	case blocked:
+		outcome = "guard_blocked"
+	case errors.As(err, &me):
+		outcome = errorCode(me)
+	case err != nil:
+		outcome = "error"
+	}
+	e := map[string]any{"attempt": t.attempts, "provider": ref.Provider, "model": ref.Model, "outcome": outcome, "latencyMs": latency.Milliseconds()}
+	addTiming(e, timing.FirstOutput, timing.FirstText, timing.AfterFirst)
+	t.attemptLog = append(t.attemptLog, e)
+}
+
+func addTiming(m map[string]any, first, text, after *time.Duration) {
+	if first != nil {
+		m["firstOutputMs"] = first.Milliseconds()
+	}
+	if text != nil {
+		m["firstTextMs"] = text.Milliseconds()
+	}
+	if after != nil {
+		m["afterFirstMs"] = after.Milliseconds()
+	}
+}
+
+// usageEvent is the payload of idp.host/model.usage (D54): the step's tokens and latency as before, and, only where the
+// provider or the adapter knew them, the time to first output, what the provider said about reuse and processing, and (when
+// the step took more than one request) each request's own timing. An absent field is not known; it is never written as 0.
+func (t *turn) usageEvent(step int, st run.Step, u model.Usage) map[string]any {
+	m := map[string]any{"step": step, "provider": st.Provider, "model": st.Model,
+		"promptTokens": u.PromptTokens, "completionTokens": u.CompletionTokens, "latencyMs": st.Latency.Milliseconds(), "attempts": t.attempts}
+	addTiming(m, st.FirstOutput, st.FirstText, st.AfterFirst)
+	if u.CachedTokens != nil {
+		m["cachedTokens"] = *u.CachedTokens
+	}
+	if u.CacheCreationTokens != nil {
+		m["cacheCreationTokens"] = *u.CacheCreationTokens
+	}
+	if s := u.Server; s.Any() {
+		sv := map[string]any{}
+		if s.PromptN != nil {
+			sv["promptN"] = *s.PromptN
+		}
+		if s.PromptMs != nil {
+			sv["promptMs"] = *s.PromptMs
+		}
+		if s.CacheN != nil {
+			sv["cacheN"] = *s.CacheN
+		}
+		if s.PredictedN != nil {
+			sv["predictedN"] = *s.PredictedN
+		}
+		if s.PredictedMs != nil {
+			sv["predictedMs"] = *s.PredictedMs
+		}
+		m["server"] = sv
+	}
+	if len(t.attemptLog) > 1 {
+		m["attemptTimings"] = t.attemptLog
+	}
+	return m
+}
+
 func errorCode(me *model.Error) string {
 	switch {
 	case me.Code == "status":

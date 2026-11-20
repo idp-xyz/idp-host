@@ -14,6 +14,7 @@ import (
 	"idp-host/internal/canonical"
 	"idp-host/internal/cmiclient"
 	"idp-host/internal/credential"
+	"idp-host/internal/model"
 	"idp-host/internal/run"
 )
 
@@ -851,6 +852,15 @@ func (s *Store) StartStep(ctx context.Context, c *run.Claim, maxSteps int, maxTo
 	return step, cancelRequested, err
 }
 
+// durMs is a duration in milliseconds with the fraction kept, or nil (stored as NULL) when it is not known.
+func durMs(d *time.Duration) *float64 {
+	if d == nil {
+		return nil
+	}
+	f := float64(*d) / float64(time.Millisecond)
+	return &f
+}
+
 // FinishStep records the model call's outcome.
 func (s *Store) FinishStep(ctx context.Context, c *run.Claim, st run.Step, events []agui.Event) error {
 	return s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
@@ -864,8 +874,17 @@ func (s *Store) FinishStep(ctx context.Context, c *run.Claim, st run.Step, event
 		if st.ErrorCode != "" {
 			code = st.ErrorCode
 		}
-		if _, err := tx.Exec(ctx, `UPDATE run_steps SET provider = $3, model = $4, prompt_tokens = $5, completion_tokens = $6, latency_ms = $7, stop_reason = $8, error_code = $9, finished_at = now()
-			WHERE run_id = $1 AND step = $2`, c.RunID, st.Step, st.Provider, st.Model, st.PromptTokens, st.CompletionTokens, st.Latency.Milliseconds(), stop, code); err != nil {
+		var sv model.ServerTimings
+		if st.Server != nil {
+			sv = *st.Server
+		}
+		// D54: nil pointers are stored as NULL ("not known"), never as 0
+		if _, err := tx.Exec(ctx, `UPDATE run_steps SET provider = $3, model = $4, prompt_tokens = $5, completion_tokens = $6, latency_ms = $7, stop_reason = $8, error_code = $9, finished_at = now(),
+			first_output_ms = $10, first_text_ms = $11, after_first_ms = $12, cached_tokens = $13, cache_creation_tokens = $14,
+			server_prompt_n = $15, server_prompt_ms = $16, server_cache_n = $17, server_predicted_n = $18, server_predicted_ms = $19
+			WHERE run_id = $1 AND step = $2`, c.RunID, st.Step, st.Provider, st.Model, st.PromptTokens, st.CompletionTokens, st.Latency.Milliseconds(), stop, code,
+			durMs(st.FirstOutput), durMs(st.FirstText), durMs(st.AfterFirst), st.CachedTokens, st.CacheCreationTokens,
+			sv.PromptN, sv.PromptMs, sv.CacheN, sv.PredictedN, sv.PredictedMs); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `UPDATE runs SET tokens_used = tokens_used + $2 WHERE id = $1`, c.RunID, int64(st.PromptTokens+st.CompletionTokens)); err != nil {

@@ -156,9 +156,7 @@ type event struct {
 	Type    string `json:"type"`
 	Index   int    `json:"index"`
 	Message *struct {
-		Usage struct {
-			InputTokens int `json:"input_tokens"`
-		} `json:"usage"`
+		Usage wireUsage `json:"usage"`
 	} `json:"message"`
 	ContentBlock *struct {
 		Type  string          `json:"type"`
@@ -174,10 +172,51 @@ type event struct {
 		Thinking    string `json:"thinking"`
 		StopReason  string `json:"stop_reason"`
 	} `json:"delta"`
-	Usage *struct {
-		OutputTokens int `json:"output_tokens"`
-	} `json:"usage"`
+	Usage *wireUsage       `json:"usage"`
 	Error *json.RawMessage `json:"error"`
+}
+
+// wireUsage is the usage object of message_start and message_delta. input_tokens is only the part of the prompt AFTER the
+// last cache breakpoint, so what the model holds is input_tokens + cache_read_input_tokens + cache_creation_input_tokens
+// (the documentation of prompt caching); message_delta may repeat the input fields as running totals (D54).
+type wireUsage struct {
+	InputTokens              *int `json:"input_tokens"`
+	OutputTokens             *int `json:"output_tokens"`
+	CacheReadInputTokens     *int `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens *int `json:"cache_creation_input_tokens"`
+}
+
+// usageAcc keeps the three input counts apart until the stream ends.
+type usageAcc struct {
+	in, read, creation *int
+	out                int
+}
+
+func (u *usageAcc) apply(w wireUsage) {
+	if w.InputTokens != nil {
+		u.in = w.InputTokens
+	}
+	if w.CacheReadInputTokens != nil {
+		u.read = w.CacheReadInputTokens
+	}
+	if w.CacheCreationInputTokens != nil {
+		u.creation = w.CacheCreationInputTokens
+	}
+	if w.OutputTokens != nil {
+		u.out = *w.OutputTokens
+	}
+}
+
+// usage is the call's usage with PromptTokens the WHOLE prompt (D52's correction compares it with the estimate of the whole
+// request; the uncached part alone would pull the factor to its floor as soon as the prompt is cached).
+func (u *usageAcc) usage() model.Usage {
+	n := func(p *int) int {
+		if p == nil {
+			return 0
+		}
+		return *p
+	}
+	return model.Usage{PromptTokens: n(u.in) + n(u.read) + n(u.creation), CompletionTokens: u.out, CachedTokens: u.read, CacheCreationTokens: u.creation}
 }
 
 type blockState struct {
@@ -210,6 +249,7 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 		hr.Header.Set("x-api-key", p.cfg.APIKey)
 	}
 	observability.Propagator.Inject(ctx, propagation.HeaderCarrier(hr.Header))
+	req.Watch.Sent()
 	resp, err := p.cfg.HTTP.Do(hr)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -227,7 +267,7 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 	stream := watch.Wrap(resp.Body)
 	blocks := map[int]*blockState{}
 	var order []int
-	var usage model.Usage
+	var ua usageAcc
 	stop := ""
 	sc := bufio.NewScanner(stream)
 	sc.Buffer(make([]byte, 64<<10), 4<<20)
@@ -252,7 +292,7 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 			return model.ClassifyStreamError(raw)
 		case "message_start":
 			if ev.Message != nil {
-				usage.PromptTokens = ev.Message.Usage.InputTokens
+				ua.apply(ev.Message.Usage)
 			}
 		case "content_block_start":
 			if ev.ContentBlock == nil {
@@ -265,6 +305,15 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 			}
 			blocks[ev.Index] = st
 			order = append(order, ev.Index)
+			if st.kind == "tool_use" {
+				req.Watch.Output() // the model has started a tool call; its name is output
+			} else if st.text.Len() > 0 {
+				if st.kind == "text" {
+					req.Watch.Text()
+				} else {
+					req.Watch.Output()
+				}
+			}
 		case "content_block_delta":
 			st := blocks[ev.Index]
 			if st == nil || ev.Delta == nil {
@@ -273,13 +322,22 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 			switch ev.Delta.Type {
 			case "text_delta":
 				st.text.WriteString(ev.Delta.Text)
+				if ev.Delta.Text != "" {
+					req.Watch.Text()
+				}
 				if onDelta != nil && st.kind == "text" {
 					onDelta(model.Delta{Text: ev.Delta.Text})
 				}
 			case "input_json_delta":
 				st.text.WriteString(ev.Delta.PartialJSON)
+				if ev.Delta.PartialJSON != "" {
+					req.Watch.Output()
+				}
 			case "thinking_delta":
 				st.text.WriteString(ev.Delta.Thinking)
+				if ev.Delta.Thinking != "" {
+					req.Watch.Output()
+				}
 				if onDelta != nil {
 					onDelta(model.Delta{Reasoning: ev.Delta.Thinking})
 				}
@@ -289,7 +347,7 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 				stop = ev.Delta.StopReason
 			}
 			if ev.Usage != nil {
-				usage.CompletionTokens = ev.Usage.OutputTokens
+				ua.apply(*ev.Usage)
 			}
 		}
 		return nil
@@ -315,6 +373,7 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 	if err := sc.Err(); err != nil {
 		return nil, watch.StreamError(ctx)
 	}
+	req.Watch.Done()
 	msg := agui.Message{ID: p.cfg.NewMessageID(), Role: agui.RoleAssistant}
 	var reasoning strings.Builder
 	var content strings.Builder
@@ -346,5 +405,5 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 	case stop == "max_tokens" || stop == "model_context_window_exceeded": // the window ran out in the middle of the answer (D52)
 		reason = model.StopLength
 	}
-	return &model.Response{Message: msg, StopReason: reason, Usage: usage, Reasoning: reasoning.String()}, nil
+	return &model.Response{Message: msg, StopReason: reason, Usage: ua.usage(), Reasoning: reasoning.String()}, nil
 }
