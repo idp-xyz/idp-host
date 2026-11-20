@@ -148,7 +148,17 @@ type Provider struct {
 type Model struct {
 	Name          string `yaml:"name"`
 	ContextWindow int    `yaml:"contextWindow"` // tokens, the most one request and its answer may hold
-	Context       struct {
+	// MaxOutputTokens is the most the model may write in one answer (D60): sent as the output limit of every request to it,
+	// lowered to what is left of the window when the window is known. Zero means model.DefaultMaxOutputTokens (32,768), applied only where contextWindow is known.
+	// A release's own value can be lower, never higher.
+	MaxOutputTokens int `yaml:"maxOutputTokens"`
+	// RunawayRetry is the sampling of the retry after an answer that did not end (D60). All optional.
+	RunawayRetry struct {
+		KeepSampling    bool    `yaml:"keepSampling"`    // true: the retry repeats the request unchanged
+		Temperature     float64 `yaml:"temperature"`     // (0, 2]; default 0.7, used when the release sets none; the release's own is kept when above 0
+		PresencePenalty float64 `yaml:"presencePenalty"` // [0, 2]; default 0.5; sent to OpenAI-compatible providers only
+	} `yaml:"runawayRetry"`
+	Context struct {
 		WaterMarkShare  float64 `yaml:"waterMarkShare"`  // (0.2, 0.9]; default 0.6: a batch of shortening is called when the estimate passes it (D58), older content is cut and, if that is not enough, cut further
 		HintShare       float64 `yaml:"hintShare"`       // (0.3, 0.95]; default 0.8: above it, the model is told the context is filling; above the water mark
 		ToolResultBytes int     `yaml:"toolResultBytes"` // 1 KiB to 1 MiB; default an eighth of the window in bytes, 4 KiB to 64 KiB (16 KiB at 131,072)
@@ -175,6 +185,14 @@ func (m Model) validate() error {
 		return errors.New("a model needs a name")
 	case m.ContextWindow < 0 || (m.ContextWindow > 0 && (m.ContextWindow < 4096 || m.ContextWindow > 16<<20)):
 		return errors.New("contextWindow must be within [4096, 16777216] tokens")
+	case m.MaxOutputTokens != 0 && (m.MaxOutputTokens < 16 || m.MaxOutputTokens > 1<<20):
+		return errors.New("maxOutputTokens must be within [16, 1048576] tokens (0 = default 32768)")
+	case m.ContextWindow > 0 && m.MaxOutputTokens >= m.ContextWindow:
+		return errors.New("maxOutputTokens must be below contextWindow")
+	case m.RunawayRetry.Temperature < 0 || m.RunawayRetry.Temperature > 2:
+		return errors.New("runawayRetry.temperature must be within (0, 2] (0 = default 0.7)")
+	case m.RunawayRetry.PresencePenalty < 0 || m.RunawayRetry.PresencePenalty > 2:
+		return errors.New("runawayRetry.presencePenalty must be within [0, 2] (0 = default 0.5)")
 	case !shareOK(c.WaterMarkShare, 0.2, 0.9):
 		return errors.New("context.waterMarkShare must be within (0.2, 0.9]")
 	case !shareOK(c.HintShare, 0.3, 0.95):
@@ -203,6 +221,19 @@ func (f *File) ModelContext() map[string]ctxwin.Settings {
 	for _, p := range f.Providers {
 		for _, m := range p.Models {
 			out[p.Name+"/"+m.Name] = m.Settings()
+		}
+	}
+	return out
+}
+
+// ModelOutput is the output settings of every model that has an entry, by "provider/model" (D60).
+func (f *File) ModelOutput() map[string]model.OutputPolicy {
+	out := map[string]model.OutputPolicy{}
+	for _, p := range f.Providers {
+		for _, m := range p.Models {
+			r := m.RunawayRetry
+			out[p.Name+"/"+m.Name] = model.OutputPolicy{MaxOutputTokens: m.MaxOutputTokens,
+				Retry: model.RunawayRetry{Keep: r.KeepSampling, Temperature: r.Temperature, PresencePenalty: r.PresencePenalty}}
 		}
 	}
 	return out

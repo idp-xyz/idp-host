@@ -27,6 +27,14 @@ import (
 // MaxResponse bounds a buffered (non-streaming) provider response.
 const MaxResponse = 8 << 20
 
+// StreamLimit is the bound of a streamed answer in bytes: the adapter's own setting, or MaxResponse when that is zero.
+func StreamLimit(configured int) int {
+	if configured > 0 {
+		return configured
+	}
+	return MaxResponse
+}
+
 // ToolSpec is a tool offered to the model.
 type ToolSpec struct {
 	Name        string
@@ -42,6 +50,9 @@ type Request struct {
 	Tools           []ToolSpec
 	Temperature     *float64
 	MaxOutputTokens int
+	// PresencePenalty, when set, is sent where the provider documents the field (OpenAI-compatible presence_penalty); the
+	// other adapters leave it out. The host sets it only for the retry of a runaway answer (D60).
+	PresencePenalty *float64
 	// Watch, when set, is told by the adapter when the request was sent and when the answer first produced output (D54).
 	// An adapter that streams calls it; one that does not leaves the timing absent. Never nil-checked by the caller.
 	Watch *Stopwatch
@@ -144,6 +155,10 @@ func (r *Registry) Names() []string {
 // window (D40).
 const CodeContextLength = "context_length"
 
+// CodeOutputRunaway is the code of an answer that did not end before a limit of this host stopped it (D60): the output
+// limit (the provider's finish reason length, with the context window not nearly full) or the bound of the stream.
+const CodeOutputRunaway = "output_runaway"
+
 // Error is a provider failure safe to record and show: a code, never the provider's raw body.
 type Error struct {
 	Code      string // transport, status, context_length, provider_* (D50), decode, schema, canceled
@@ -177,6 +192,8 @@ func (e *Error) Error() string {
 		return fmt.Sprintf("model provider answered HTTP %d", e.Status)
 	case CodeContextLength:
 		return "the request does not fit the model's context window"
+	case CodeOutputRunaway:
+		return "the model's answer did not end: " + CodeOutputRunaway
 	case "transport":
 		if e.Idle {
 			return "model provider error: the stream stopped sending data"

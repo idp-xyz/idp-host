@@ -783,7 +783,7 @@ D37 让成员的文件经票据进出运行：字节不经过模型。但 agent 
 | D50-2 | **类别与重试。** `provider_overloaded`（`overloaded`、`unavailable`、503、529）、`provider_rate_limit`（`rate_limit`、429、`RESOURCE_EXHAUSTED`）、`provider_server`（`server_error`、`api_error`、`internal`、超时、5xx）可重试；`provider_error`（其余，包括 `insufficient_quota`、认证、`invalid_request_error`）不重试。类别只看提供者的 type、code、status，不看自由文字（自由文字只用来判断上下文窗口）。可重试的错误走 D45 的原规则，没有新规则：`streamer.streamed()` 为真（已有文字增量写进事件日志）就不重试同一候选，之前只有推理或工具调用片段的流照旧可以重试 | 一次重试比一次失败的 180 秒便宜；已写进日志的文字收不回来（D45-3） |
 | D50-3 | **上下文窗口。** type、code 或消息里出现 D40 认得的标记（`context_length_exceeded`、`exceed_context_size_error`、`exceeds the context` 等），错误码是 `context_length`，运行的失败消息是 D40 的那句。标记表增加 Anthropic 的 `prompt is too long`，对 HTTP 400 同样生效 | 不是故障而是会话的状态，重试没有用 |
 | D50-4 | **提供者的话怎么存、给谁看：只给运维，只在 HOST 日志。** `model.Error` 增 `Detail`：提供者的 type、code、status、message，每个字段至多 160 字符、合起来至多 `MaxDetail` = 300 字符，控制字符与不可打印字符换成空格、连续空格合并、非法 UTF-8 丢弃，超长以 `…` 结尾。`Detail` 只写进 HOST 日志的一行 Warn `model call failed`，带 `run`、`step`、`attempt`、`provider`、`model`、`code`、`detail`，运维凭运行 ID 即可找到；每次失败的尝试一行，大小有上界。事件 `idp.host/model.error {step, provider, model, attempt, code}` 每次失败的尝试一条，**没有任何提供者的文字**，只说"这一步有一次提供者报告的错误或读不懂的数据块"。运行的失败消息、步表、会话消息都不带它：成员看到固定的一句 `model call failed: provider_error: the model server reported an error while answering`（错误码因类别而异）。步表没有详情列，不为此改 schema | 事件流是运行所有者读的。提供者的错误文字不归我们展示：OpenAI 兼容服务器的认证错误会引出密钥的一部分（"Incorrect API key provided: sk-…abcd"），其他的会写出内部主机名或组织 ID。D40 的做法是成员读固定的句子、运维读详情，D50 沿用；放宽的只是详情现在有界、清洗过，并且存在日志里 |
-| D50-5 | **真正读不懂的数据块仍是 `decode`**，现在带一句有界的位置说明（"a stream chunk is not JSON"、"content_block_delta without its block or delta"、"the stream is longer than the limit"），绝不含原始数据；同样只写入日志（事件只有错误码） | 两种情形仍可区分，且不泄漏载荷 |
+| D50-5 | **真正读不懂的数据块仍是 `decode`**，现在带一句有界的位置说明（"a stream chunk is not JSON"、"content_block_delta without its block or delta"、"the stream is longer than the limit"）（**D60 修订**："the stream is longer than the limit" 不再是 `decode`，是 `output_runaway`），绝不含原始数据；同样只写入日志（事件只有错误码） | 两种情形仍可区分，且不泄漏载荷 |
 
 **拿掉一个控制、看测试失败**：把 `detail` 放回事件：`TestTheProvidersWordsReachOnlyTheHostLog`、`TestANonRetryableStream…` 失败；`ClassifyStreamError` 一律返回 `decode`：`TestClassifyStreamError`、`TestStreamErrorDetailIsBoundedAndClean`、三个适配器各自的 `TestAStreamErrorIsTheProvidersAndKeepsItsWords`、harness 的 `TestARetryableStreamErrorBeforeTextIsRetried`、`TestAStreamErrorAfterTextIsNotRetried`、`TestANonRetryableStreamError…`、`TestAStreamErrorThatSaysTheContextIsFullIsTheContextWindowError`。
 
@@ -1024,7 +1024,7 @@ D37 让成员的文件经票据进出运行：字节不经过模型。但 agent 
 | D55-4 | **运行照 D40 以 `MODEL_ERROR` 结束，消息多一句**：`…(N input tokens at step S); it was writing K tool call(s), which were not run`；事件 `idp.host/model.cutoff {step, finishReason, toolCalls, tools}`（工具名，没有参数）写在这一步的事件里，在 `model.usage` 之前。步骤行与 `model.usage` 照常（停止原因 `length`、用了的 token） | 不再重试续写：D40 的实测是窗口满了，续写没有用；这里没有对"输出上限小而窗口有余"的情形另做决定，见下 |
 
 **取舍与边界**
-- 没有做"让模型继续写"：D40 决定被截断的回答失败，理由（窗口满了续写无益）对窗口满的情形成立，对"输出上限设得太低"的情形不成立。输出上限太低时运维该调 `maxOutputTokens`，运行的失败消息说明了原因。若要为后一种情形做续写，是 D40 的新决策，不在这里。
+- 没有做"让模型继续写"：D40 决定被截断的回答失败，理由（窗口满了续写无益）对窗口满的情形成立，对"输出上限设得太低"的情形不成立。输出上限太低时运维该调 `maxOutputTokens`，运行的失败消息说明了原因。（**D60 修订**：输出上限现在一定发出；窗口有余时的截断是 `output_runaway`，会重试一次。）若要为后一种情形做续写，是 D40 的新决策，不在这里。
 - 失败的运行不留下被截断的工具调用，所以这一步的调用对评估与审计不可见（只有事件里的工具名与个数）；不记参数，因为截断的参数本来就是半截内容。
 - 复现 R4 `TestAnAnswerCutOffAtTheOutputLimitDoesNotFailTheRun`（`-tags repro`，没有工具调用的截断）**不变**，仍然失败，断言没有改：D40 ③ 对这种回答的决定没有动。`go vet -tags repro ./...` 干净。
 
@@ -1378,3 +1378,110 @@ D37 让成员的文件经票据进出运行：字节不经过模型。但 agent 
 - **网关（idp-mcp）**：无状态的 Streamable HTTP，每个请求独立，没有会话；缺省对平台客户端（HOST）没有限流（idp-mcp 的 `rateLimits` 只套在外部客户端与没列出的客户端上）；如果运维给 HOST 的客户端条目设了 `rateLimit`，同时在途的请求不改变每个窗口的请求总数，只是更集中。网关这边不用做什么。HOST 到网关的连接池每个主机保留 16 个空闲连接，`parallelCalls` 不超过 32，足够。
 - **idp-web**：三个工具都标 `readOnlyHint: true`，所以 `web_search` 与 `web_fetch` 现在会同时执行；`web_open_url` 按 README 的示例配置列在 `confirmTools` 里（D44，HOST 强制确认），等成员确认，不进组。要知道的：(1) **PDF 读取有两个槽**（`IDP_WEB_PDF_CONCURRENCY`，缺省 2，每个 Pod 的）：满了，调用最多等 2 秒然后 `pdf_busy`；一步里同时读 4 个 PDF，后两个多半得到 `pdf_busy`，逐个读时不会。运维要么把这个网关的 `parallelCalls` 设成不超过槽数，要么提高 `IDP_WEB_PDF_CONCURRENCY` 并把 Pod 的内存上限跟着调（每槽 192 MiB）。**本决策没有替运维改这个值**，缺省仍是 4。(2) 来源编号按调用者在库里的行锁（或内存里的锁）分配，同一个调用者的并发调用得到一致的编号，但**同一步里两个调用拿到的编号不一定按调用的顺序**（先到的先拿小号）；每个结果里的 `[n]` 与它的地址是对的，D49 记的来源也是对的，只是第二个调用的号可能小于第一个。(3) 搜索的滑动窗口限流是按调用者的窗口：并发的四个搜索与逐个的四个搜索占同样的额度，只是更集中，更容易撞上窗口。
 - **idp-sandbox**：`sandbox_read_file` 与 `sandbox_list_files` 标 `readOnlyHint: true`（`openWorldHint: false`），会与同组的别的读同时执行。读过代码：这两个读不占 `sandbox_run` 的并发槽（`MaxConcurrent`，满了回 `ErrCapacity`，那是对运行的），没有每工作区的互斥（"每个工作区一次一个"是对 `sandbox_run` 的，运行标注为非只读，永远单独执行）；Kubernetes 后端里每次读是一个小 Job（`transferOp`，大文件按 `readJobs = 3` 分块读），互相独立，所以同时执行是对的。要知道的：一步里 4 个读就是 4 个同时的 Job，运行命名空间有 ConfigMap 配额（写大文件才占，读不占）；运维看一眼 Job 的配额与调度能力，嫌多就把这个网关的 `parallelCalls` 调小，或把这两个工具放进 `sequentialTools`。`sandbox_create`、`sandbox_run`、`sandbox_import_file`、`sandbox_export_file` 标 `readOnlyHint: false`，`sandbox_write_file` 与 `sandbox_delete` 是 `readOnlyHint: false` 加 `idempotentHint: true`；都不进组，各自单独执行。
+
+## 42. D60：输出上限一定发出，不会结束的回答是 `output_runaway`，在同一候选上重试一次并改变采样（2026-11-20 决策与实施；契约不变）
+
+修订 D50（"流比上限长"原记为 `decode`）、D55（"输出上限低时运维该调 `maxOutputTokens`"与"没有对输出上限低的情形另做决定"）；沿用 D40（窗口满的截断仍失败）、D45（重试的规则）、D52（窗口与调用前的拒绝）、D54（每次尝试的计时）、D56（候选循环）。
+
+**起因**（本机模型的真实运行）：约 60 个长运行里有两次，一步在 180 到 185 秒后以步错误码 `decode` 失败，运行随之失败，没有任何原因。模型服务 Strata 0.1.27 的日志（`E:\Strata\strata-iq3_xxs.log`）里有同样的两个请求：
+
+```
+strata serve: prompt 75814 tokens = 18875 reused + 56939 read in 12121 ms (4697.6 tok/s), 35351 generated in 172860 ms (204.5 tok/s), drafts accepted 26056 of 26367, 6 checkpoints
+strata serve: prompt 20096 tokens = 2491 reused + 17605 read in 4364 ms (4034.5 tok/s), 35850 generated in 176042 ms (203.6 tok/s), drafts accepted 25793 of 26384, 3 checkpoints
+```
+
+模型在重复循环（推测解码的草稿接受率 98% 与 98%；录得的正常长步是 80%：24,107 token 的那步 14,328/17,887，Strata 日志里另一个 25,286 token 的是 15,736/19,235）。HOST 没有发输出上限：`max_tokens` 只在发布件的 `model.maxOutputTokens` 或运行选项 `idp.host/maxOutputTokens` 设了时才发，平台的 agent 两者都没设；Strata 对没有 `max_tokens` 的请求给"上下文里剩下的全部"，于是流一直写到 HOST 自己的 8 MiB 上限（`model.MaxResponse`），OpenAI 适配器把它记为 `decode`。两次的 8 MiB 对应约 35,000 个 token（约 234 字节一个 token 的 SSE 块），和日志里的 35,351、35,850 吻合。第三个同类的例子在更早的日志里：69 个 token 的提示、130,995 个 token 生成（671 秒，草稿接受 99%），写到上下文满为止。
+
+**测量**（`/home/tops/workspace/idp-telos-go/.local/long-eval/*/idp_host.dump` 七个转储，还原进一次性的 PostgreSQL，`run_steps.completion_tokens`；转储之间有重叠的运行，按 `(run_id, step)` 去重）：
+
+| 范围 | 值 |
+|---|---|
+| 运行数、步数 | 122 个运行，3,775 步，其中 3,769 步有输出 |
+| p50 / p90 | 554 / 3,108 token |
+| p99 | 8,347 token |
+| p99.9 | 20,507 token |
+| 最大 | 24,107 token（延迟 160 到 165 秒；该步的工具调用参数只有 13,739 字节，约 4,000 token，其余是推理：`completion_tokens` 含推理） |
+| 超过 8,000 / 16,000 的步 | 43 / 6 |
+| 两步的前几名 | 24,107、23,652、21,039、20,507、17,755、17,132、14,150、14,046 |
+| 失败的步 | 一个 `decode`：基线转储 `baseline-eeaafeb-20261119`，运行 `ws_0852787e…` 第 9 步，180,426 ms，0 token（失败的步不记 token）；与上面日志里的 35,850 token 那一行对得上（提示约 2 万 token，176 秒）。35,351 token 那一次不在这些转储里（它是之后的测量，提示 75,814 token） |
+
+**这个测量与委托里的前提不一致**：任务说"最长的正常输出约 14,000 token"，数据里是 24,107（p99.9 是 20,507）。把上限放在"远低于 35,000"就会截断正常的步。所以下面的缺省是 32,768：在最长的正常步（24,107，Strata 日志里还有 25,286）之上 1.3 倍，在 p99.9 之上 1.6 倍，比两次循环（35,351、35,850）低 7%。**这个数对这个模型几乎不省时间**：32,768 个 token 在 204 token/秒是 160 秒，8 MiB 的流上限是约 35,000 token、约 172 秒；它防的是之后的更坏的循环（130,995 token、671 秒）和别的模型；真正的变化是下面的分类、重试和记录。
+
+**Strata 默认怎么采样、HOST 发什么**：HOST 只发 `temperature`，而且只在发布件设了 `model.temperature` 时才发（`internal/harness` 把 `t.def.Model.Temperature` 原样交给适配器；平台的 agent 没设）。Strata 的运行配置（`strata-iq3_xxs.json`）没有 `sampling` 块，`DETAILS.md`："with no block at all a request without sampling keys decodes greedy"；`server.py` 的 `sampling_keys` 说 `temperature=0` 与缺省相同、不转发。所以**这个模型一直在贪心解码**，同样的请求给同样的循环；Qwen 自己的建议是不要贪心（会无限重复）、可以把 `presence_penalty` 调到 0–2 来减少重复。Strata 逐请求认 `temperature`、`top_p`、`top_k`、`min_p`、`presence_penalty`、`frequency_penalty`、`repetition_penalty`、`penalty_last_n`（缺省 64 个 token）、`seed`（`serve/server.py` 的 `sampling_keys`、`docs/DETAILS.md`）。OpenAI 的 Chat Completions 文档里有的是 `temperature` 与 `presence_penalty`、`frequency_penalty`；`repetition_penalty` 是 vLLM 一类的扩展，所以 HOST 只用前者。
+
+| # | 决策 | 理由 |
+|---|---|---|
+| D60-1 | **窗口已知时输出上限一定发出；窗口未知时只发明说的。** 次序：发布件的 `model.maxOutputTokens`（或运行选项）更低时用它；否则 `providers[].models[].maxOutputTokens`（HOST 配置，在 `contextWindow` 旁边）；否则缺省 `model.DefaultMaxOutputTokens` = 32,768；有该候选的 `contextWindow` 时，再不超过 `窗口 − ⌈校正后估算 × 1.05⌉ − 8`（至少 256）。每个候选各算各的（回退候选的窗口与设置不同）。**该候选的 `contextWindow` 未知、而发布件、运行与运维都没有明说上限时，不发 `max_tokens`**（请求与 D60 之前逐字节相同，D52 的黄金测试覆盖）：没有窗口就无法把缺省钳到窗口之内，而拒绝"提示 + `max_tokens` 超过上下文"的服务端（Strata 返回 400）会让以前能完成的长会话失败。明说的值（发布件的、运行的、运维的 `maxOutputTokens`）在窗口未知时照发，不钳制 | 数字见上。1.05 是 D52 对估算的边（`refuseUnfit`），8 是 Strata 自己的余量（`CTX_SLACK`：它拒绝"提示 + `max_tokens` + 8 超过上下文"的请求），256 与 D52 给回答留的最小空间一致。没有这个钳制，窗口接近满的长会话（录得的最大提示 131,033 token）会被 Strata 以 400 拒绝，而以前它们是被允许写到窗口满为止的。钳制后的行为与以前没有 `max_tokens` 时相同 |
+| D60-2 | **发布件不能超过运维给的值；运维没给时 32,768 只是缺省，不是运维的话。** 运维设了 `maxOutputTokens`：发布件的值更高时降到运维的值。没设：发布件明说的更高的值（至多 1,048,576，契约不变）照准 | D52 的规则是发布件不能给自己放宽运维定的上限；运维没说话时，发布件作者为一个要写很长文件的 agent 明说 40,000 是合理的，缺省不该替他拒绝。代价：这样的发布件对循环没有防护——是作者明说的，且仍受窗口钳制 |
+| D60-3 | **`output_runaway` 是独立的错误。** 回答因输出上限被截断（`finish_reason` 为 `length`，适配器已报告为 `StopLength`），并且窗口不接近满，就是 `output_runaway`：不接近满 = 上限不是被窗口钳小的，且 `提示 token + 上限` 没有超过 `窗口 − 窗口/16`，且服务端报告生成的 token 不少于上限的九成（报告了的话）。服务端没有报告生成数时，窗口已知并满足前两条才是。**没有发上限（窗口未知又没有明说）时，截断一律是服务端自己的，仍是 D40；窗口未知而上限是明说的，靠服务端报告的生成数与上限比，没报告则仍是 D40**。流超过 8 MiB（`model.MaxResponse`）同样是 `output_runaway`（OpenAI、Anthropic、Gemini 三个适配器；OpenAI 的非流式 JSON 正文超限也是），`Detail` 只进日志。HOST 一侧：`model.Error{Code: "output_runaway", Retryable: true}`，被截断的回答的工具调用一个也不执行（它在错误路径上，不是回答；D55 的 `model.cutoff` 事件只给窗口的情形） | 一个回答被截断有两个原因：写满了窗口（D40：重试没有用、会话要换）和写满了上限（循环：另一次采样通常不循环）。三条"不接近满"的判据各挡一种误判：被钳小的上限、估算偏低时提示加上限贴着窗口、服务端自己的上下文先满（llama.cpp 一类在窗口满时发 `length`，生成数少于我们给的上限） |
+| D60-4 | **重试在同一候选上，至多两次请求，不看 `retry.attempts`；已经流出文字就不重试。** 流出的文字用 `streamer.streamed()` 判断（有文字增量收到过，包括严格输出模式里没有放出的）：只有推理与工具调用片段不算（D45-3）。所以一个无尽的工具调用参数（循环写脚本）与只有推理的循环会重试，无尽的文字不会。重试前不等待（端点是好的；`waitMs` 是 0）。用尽后的去向是 D56 的候选循环：有下一个候选就换，没有就失败。路由器的时延观测把它记为一次失败的尝试，与别的失败一样 | 一次循环要 160 秒，三次请求（`attempts` 缺省）是 8 分钟，而且第三次与第二次一样；一次重试够用来判断"是不是总是循环" |
+| D60-5 | **重试改变采样，除非运维关掉。** 重试的请求带 `temperature` 0.7（发布件自己的温度大于 0 时保留）与 `presence_penalty` 0.5；第一次请求不变。`models[].runawayRetry: {temperature, presencePenalty, keepSampling}` 逐模型配置，`keepSampling: true` 让重试与第一次相同。`presence_penalty` 只有 OpenAI 兼容适配器发（Anthropic 的 Messages API 没有这个字段；Gemini 的 `presencePenalty` 不是所有模型支持，没有接）；对 Anthropic 与 Gemini 重试只改温度 | Strata 贪心解码，同样的请求同样的循环（上面）。这个改变只发生在重试里，不改变第一次请求，也不改变没有循环的运行，所以缺省开；0.7 是 Qwen3-Next 公布的温度，0.5 是它给的 0–2 里偏谨慎的一端：存在一个会改坏代码的风险（`penalty_last_n` 是 64 个 token，对缩进和括号一类的重复 token 有小的压制），所以不取更高。**这两个数没有对真实模型验证过** |
+| D60-6 | **记录。** 步的错误码 `output_runaway`（用尽后）；失败的步行里 `prompt_tokens`、`completion_tokens`、`stop_reason: length` 是最后一次尝试的（成功的步仍是成功的那次，行为不变：失败的尝试不占步数也不计入这一步的 token，D45）；`idp.host/model.error {step, provider, model, attempt, code: "output_runaway", outcome, limit, completionTokens?}`，每次不结束的尝试一条，`outcome` 是 `retry`、`next_candidate` 或 `stop`，只有数字没有提供者的话（D50）；`idp.host/model.retry {…, code, of, waitMs: 0, temperature, presencePenalty}`（`of` 是 2）；`model.usage.attemptTimings[]` 里每次尝试的 `completionTokens`（D54：不止不结束的尝试；用量没报告的尝试没有这个字段）。运行的失败消息：`model call failed: output_runaway: the model's answer did not end: it reached the output limit of N tokens (set by the default|operator|release) with room left in the context window (K request(s) in the step); the answer was dropped and none of its tool calls was run`，流上限的情形写 `it went on past the 8 MiB this host reads from one answer` | 运维要能分开"循环"与"窗口满"与"读不懂的数据块"，并且从事件里看到重试了什么 |
+| D60-7 | **窗口满的情形不变（D40）。** 一次请求、不重试、D40 的消息、有工具调用时 D55 的 `model.cutoff` 事件，步的错误码为空 | 重试对窗口满没有用 |
+
+**复现**（在 main 的代码上先写的测试，用模型替身：一个无尽的流，工具调用的参数一直增长，另写一个无尽的文字流；OpenAI 适配器的流上限注入为 128 KiB，不用 8 MiB；`internal/harness/runaway_test.go`）：
+
+| 测试（在 main 加上"可注入的流上限"之后、修复之前） | 输出 |
+|---|---|
+| `TestAnEndlessToolCallStreamIsARunawayAndIsRetriedOnce` | `MODEL_ERROR: model call failed: decode FAILED MODEL_ERROR, 1 requests, 24.5ms`（替身写了约 0.7 MB 就被适配器停下） |
+| `TestARunawayTwiceFailsTheRunAndSaysSo` | `FAILED MODEL_ERROR, 1 requests`（步错误码 `decode`） |
+| `TestAnEndlessTextStreamIsARunawayAndIsNotRetried` | 步 `ErrorCode:decode`，1 个请求，消息 `model call failed: decode` |
+
+今天（修复前）的行为：8 MiB 之后一步以 `decode` 结束，运行失败，成员读到 `model call failed: decode`，事件里没有原因，没有重试。同时没有发输出上限：`adapters/providers/openai` 只在 `req.MaxOutputTokens > 0` 时写 `max_tokens`，而 harness 传的是发布件的值（平台的 agent 没设，是 0）。
+
+**取舍与边界**
+
+- **缺省 32,768 对这个模型省不了多少时间**（上面）。它也**比最长的正常步只高 30%**：一个比 25,000 token 还长的正常回答会被当成循环，重试一次（采样改变后通常更短），再失败才失败；以前这样的回答会完成。这个风险是真的，运维可以在 `models[].maxOutputTokens` 调高，发布件也可以明说更高的值（D60-2）。
+- **没有 `contextWindow` 的模型没有缺省上限**：它们只在有明说的上限时才发 `max_tokens`，否则与以前相同，也就**没有循环防护**（8 MiB 的流上限仍在，现在是 `output_runaway`，会重试）。要得到防护，给本机模型配 `contextWindow`（缺省 32,768 并按窗口钳制）或 `maxOutputTokens`。平台的 compose 与 kind 目前没有 `models`。Strata 的 `--fit-max-tokens` 可以让服务端自己钳制。
+- **未知窗口时不能判断窗口满**：服务端没报告生成数、窗口又未知，截断仍按 D40 失败（不重试）；报告了生成数的（Strata、OpenAI、llama.cpp 都报告），生成数不到上限九成的是窗口，达到的是循环。
+- **失败的尝试的 token 不计入这一步**（D45）：一次循环花了 32,768 个 token，运行的 `maxTokensPerRun` 预算看不到它（D54 的 `attemptTimings[].completionTokens` 与 `model.error.completionTokens` 看得到）。要计入是预算的另一个决定。
+- **重试的采样改变发生在循环之后，不在之前**：没有循环的运行与以前逐字节相同（除了多发了 `max_tokens`）。`temperature` 与 `presence_penalty` 对重试出来的回答质量的影响没有测过。
+- **harness-worker 适配器**（`adapters/providers/harnessworker`）仍用 `io.LimitReader(…, MaxResponse)`，超限的尾巴被截掉而不是报错：它读的是另一个 HOST 的事件流，不在这条里，没有改。
+- 重试不等待：循环不是故障，端点是好的；`retry.backoffSeconds` 对它不起作用。
+
+**没有做的**
+
+- **在流里早期检测循环**（最近输出里一段长的精确重复）：没有做。(1) 没有一份循环的样本：HOST 没有留下那两次的内容，Strata 的日志只有 token 数与草稿接受率，不知道循环是精确的几个字符还是推理里的近似重复，阈值只能猜；(2) 不能保证不对正常的重复输出触发：数字表格、长的 JSON 数组、重复的行是合法的长输出，一个会误杀正常回答的检测器比一个晚 10 秒停下的上限更糟；(3) 省的时间也有限：这个模型上限只晚 10 秒，只有更坏的循环（130,995 token）才有区别，而那由上限本身封住。**下一次**要先留下样本：循环发生时在日志里记（有界的）尾部 2 KiB 是个选项，它是提供者控制的文字，要走 D50 的清洗，没有在这里做。草稿接受率（循环里 98% 以上，正常长步 80%）是个强信号，但在服务端，HOST 看不到。
+- **服务端的采样默认**：Strata 的运行配置有 `sampling` 块（`{"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": …}`），把所有请求从贪心改为采样，很可能比任何重试都更能防循环；这改变所有运行的行为，不在这条里，也不动正在进行的测量，留给运维与下一次测量决定。
+- **没有对真实模型验证**：没有向 `127.0.0.1:8080` 发任何请求。`finish_reason: "length"` 在 Strata 的 `max_tokens` 处由 Strata 的源码得出（`server.py` 的 `"length"`），没有抓到真实样本；`presence_penalty` 0.5 与温度 0.7 的重试是否能解开循环、会不会改坏代码，没有测；Strata 对 `max_tokens` 的钳制与拒绝（400）按源码；32,768 对长运行里正常的步是否过紧，只有上面的转储数据。
+
+**实施**：`internal/model`（`output.go`：`DefaultMaxOutputTokens`、`MaxRunawayAttempts`、`OutputPolicy.Limit`/`Sampling`、`RunawayError`；`CodeOutputRunaway`、`Request.PresencePenalty`、`StreamLimit`）；`adapters/providers/{openai,anthropic,gemini}`（`Config.MaxStreamBytes`，超限是 `output_runaway`；OpenAI 发 `presence_penalty` 并查非流式正文的上限）；`internal/config`（`models[].maxOutputTokens`、`runawayRetry`、`File.ModelOutput`）；`cmd/idp-host`（`Harness.ModelOutput`）；`internal/harness`（`output.go`：`outputLimit`、`cutIsRunaway`、`runawayNote`；`callModel` 的候选循环：每个候选的上限与采样、把窗口之外的 `length` 变成错误、两次的封顶、事件与计时；失败消息）；`tests/fixtures/fakemodel`（`Turn.Completion`）。契约不变：事件名与字段不属于 schema（同 D44、D45）；没有迁移（错误码是文本）。
+
+**验证**：`internal/harness`：`TestAnOutputLimitIsAlwaysSent`（缺省、运维的、发布件更低、发布件更高而运维设了、发布件更高而运维没设、运行选项、窗口的余量、窗口有余）、`TestAnAnswerCutAtTheLimitWithRoomInTheWindowIsRetriedAndTheRunCompletes`、`TestTheRetrySamplingIsTheOperatorsAndTheReleasesTemperatureIsKept`、`TestARunawayTwiceFailsTheRunWithAClearMessage`、`TestARunawayIsNotRetriedWhereTheRetryPolicyAllowsOneRequest`、`TestARunawayThatStreamedTextIsNotRetried`、`TestARunawayThatOnlyReasonedIsRetried`、`TestACutAnswerWhereTheWindowIsFullIsStillD40`（6 行）、`TestARunawayCandidateIsLeftForTheNextOne`，以及无尽流的三个（上表）；每个适配器的流超限（`TestAStreamLongerThanTheLimitIsARunawayNotADecodeError`）、`length`/`max_tokens`/`MAX_TOKENS` 带生成数（`TestALengthStopCarriesTheGeneratedTokens`、`TestAMaxTokensStopCarriesTheGeneratedTokens`）、OpenAI 的 `TestTheLimitAndThePresencePenaltyAreSent`、`TestABodyLongerThanTheLimitIsARunaway`；`internal/model`、`internal/config` 的单元；PostgreSQL 的 `TestARunawayFailsTheRunAsOutputRunawayAndTheThreadStaysUsableOnPostgres`（步行、事件、没有调用记录、同一线程的下一个运行完成）。D40、D55 的既有测试没有改动而通过。
+
+**拿掉一个控制、看测试失败**（每一行都是改代码、跑所列包的测试、记下失败的测试、再还原）：
+
+| 拿掉的控制 | 失败的测试 |
+|---|---|
+| OpenAI 适配器：流超限回到 `decode` | OpenAI `TestAStreamLongerThanTheLimitIsARunawayNotADecodeError`；harness `TestAnEndlessToolCallStreamIsARunawayAndIsRetriedOnce`、`TestARunawayTwiceFailsTheRunAndSaysSo`、`TestAnEndlessTextStreamIsARunawayAndIsNotRetried` |
+| Anthropic / Gemini 适配器：流超限回到 `decode` | 各自的 `TestAStreamLongerThanTheLimitIsARunawayNotADecodeError` |
+| OpenAI 适配器：非流式正文不查上限 | `TestABodyLongerThanTheLimitIsARunaway` |
+| OpenAI 适配器：不发 `presence_penalty` | `TestTheLimitAndThePresencePenaltyAreSent` |
+| `Limit`：缺省为 0（不发上限） / 窗口未知时仍发缺省 | `TestAnOutputLimitIsAlwaysSent`（缺省、窗口两行）、`TestTheOutputLimitIsTheOperatorsCeilingAndTheDefaultIsNot`、`TestAnAnswerCutAtTheLimit…`、D40/D55 的 `TestACutOffAnswerWithToolCallsRunsNoTool`、`TestCutOffAnswerIsNotACompletedRun`（它们现在靠"生成 7 个 token，不到上限九成"留在 D40） |
+| `Limit`：发布件可以超过运维的值 | `TestAnOutputLimitIsAlwaysSent/the_release_cannot_exceed_the_operator's`、`TestTheOutputLimitIsTheOperatorsCeilingAndTheDefaultIsNot` |
+| `Limit`：发布件不能超过缺省 | `TestAnOutputLimitIsAlwaysSent/no_operator_value:_the_release's_higher_value_stands`、同上 |
+| `outputLimit`：不按窗口钳制 | `TestAnOutputLimitIsAlwaysSent/the_window's_remainder_caps_the_default` |
+| `cutIsRunaway`：去掉"被窗口钳小的上限"一条 | `TestACutAnswerWhereTheWindowIsFullIsStillD40/the_clamp_alone_decides…`（另一行"被钳"靠"接近满"一条也过，所以这条要单独的用例：估算远高于服务端的计数） |
+| `cutIsRunaway`：去掉"输入加上限贴着窗口"一条 | `TestACutAnswerWhereTheWindowIsFullIsStillD40/the_prompt_and_the_limit_leave_less_than_a_sixteenth_of_the_window` |
+| `cutIsRunaway`：去掉"服务端生成不到上限九成"一条 | `TestACutAnswerWhereTheWindowIsFullIsStillD40` 的两行（窗口已知 / 未知、服务端提前停）、`TestACutOffAnswerWithToolCallsRunsNoTool`（3 行）、`TestCutOffAnswerIsNotACompletedRun` |
+| `cutIsRunaway`：窗口未知又没有生成数也算循环 | `TestACutAnswerWhereTheWindowIsFullIsStillD40/the_window_is_not_known_and_the_server_does_not_say…` |
+| 所有 `length` 都按 D40（不分出循环） | `TestARunawayCandidateIsLeftForTheNextOne`、`TestARunawayThatOnlyReasonedIsRetried`、`TestARunawayThatStreamedTextIsNotRetried`、`TestARunawayTwiceFailsTheRunWithAClearMessage`、`TestAnAnswerCutAtTheLimit…`、`TestTheRetrySampling…` |
+| `model.Error`：`output_runaway` 不可重试 | 11 个：harness 的循环类测试、三个适配器的流超限测试 |
+| 循环的重试不封顶为两次（用 `attempts`） | `TestARunawayTwiceFailsTheRunAndSaysSo`、`TestARunawayTwiceFailsTheRunWithAClearMessage`、`TestARunawayCandidateIsLeftForTheNextOne`（第三次请求） |
+| 流出文字之后仍重试循环 | `TestARunawayThatStreamedTextIsNotRetried`、`TestAnEndlessTextStreamIsARunawayAndIsNotRetried` |
+| 重试不改采样（`Sampling` 总返回不改） | `TestTheRetrySampling`、`TestTheRetrySamplingIsTheOperators…`、`TestAnAnswerCutAtTheLimit…` |
+| 重试不改采样（`harness` 不把值放进请求） | `TestAnAnswerCutAtTheLimit…`、`TestTheRetrySamplingIsTheOperators…`（运维的值、发布件的温度两行） |
+| 发布件的温度 0 当成"发布件设了温度"而保留 | `TestTheRetrySampling` |
+| 循环的重试像暂时故障那样等待 | `TestAnAnswerCutAtTheLimit…`（`waitMs` 不是 0） |
+| `model.error` 不带 `limit`、`completionTokens` | `TestAnAnswerCutAtTheLimit…` |
+| `model.retry` 不带采样 / `of` 用 `attempts` | `TestAnAnswerCutAtTheLimit…`（各一次） |
+| 每次尝试不记 `completionTokens`（`attemptTimings`） | `TestAnAnswerCutAtTheLimit…` |
+| 失败的消息不说 `output_runaway`、上限与来源 | `TestARunawayTwiceFailsTheRunWithAClearMessage`；PostgreSQL 的 `TestARunawayFailsTheRunAsOutputRunawayAndTheThreadStaysUsableOnPostgres` |
+| 失败的步行不留最后一次尝试的 token | `TestARunawayTwiceFailsTheRunWithAClearMessage`；PostgreSQL 的同一个测试（`error_code`、`stop_reason`、`completion_tokens`） |
+| `Error()` 对循环给通用的消息 / `RunawayError` 不清洗 `Detail` | `TestARunawayErrorSaysSoAndKeepsItsDetailOutOfTheMessage` |
+| 配置：`maxOutputTokens` 不查范围 / 可以不小于窗口 / 重试采样不查范围 | `TestTheOutputSettingsAreValidated`（各一次） |
+| 配置：`ModelOutput` 丢掉 `maxOutputTokens` / 丢掉重试设置 | `TestAModelEntryGivesTheOutputLimitAndTheRetrySampling`（各一次） |
+
+没有测试覆盖的控制：`cmd/idp-host/main.go` 里 `ModelOutput: cfg.ModelOutput()` 这一行接线（`cmd` 没有测试；配置到 `ModelOutput()` 一段有测试）。
+
+窗口未知时的两个控制（`outputLimit` 不再发缺省；`cutIsRunaway` 对没发上限的请求也判循环）：前者拿掉，`TestAnOutputLimitIsAlwaysSent/window_unknown,_nothing_explicit…` 失败；后者拿掉，`TestACutAnswerWhereTheWindowIsFullIsStillD40/the_window_is_not_known…`、`TestACutOffAnswerWithToolCallsRunsNoTool`（3 行）、`TestCutOffAnswerIsNotACompletedRun` 失败。`TestARunawayIsRecognisedWithoutAKnownWindowWhenTheLimitIsExplicit` 与 PostgreSQL 的循环测试（运维给了 `maxOutputTokens`、没有窗口）覆盖明说上限的情形。

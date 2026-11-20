@@ -37,6 +37,8 @@ type Config struct {
 	// IdleTimeout is how long a response may stay silent between two reads before the request is cancelled and the call
 	// fails as a retryable transport error (D46); zero means model.DefaultIdleTimeout.
 	IdleTimeout time.Duration
+	// MaxStreamBytes bounds the bytes of one streamed answer; zero means model.MaxResponse. Tests inject a small one.
+	MaxStreamBytes int
 	// AllowPlainHTTP permits http:// to non-loopback hosts (development only).
 	AllowPlainHTTP bool
 }
@@ -145,6 +147,9 @@ func (p *Provider) body(req model.Request, stream bool) map[string]any {
 	}
 	if req.Temperature != nil {
 		b["temperature"] = *req.Temperature
+	}
+	if req.PresencePenalty != nil {
+		b["presence_penalty"] = *req.PresencePenalty // D60: only the retry of a runaway answer sets it
 	}
 	if req.MaxOutputTokens > 0 {
 		b[p.cfg.MaxTokensField] = req.MaxOutputTokens
@@ -358,9 +363,13 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 	acc := &accumulator{}
 	mt := strings.ToLower(strings.TrimSpace(strings.Split(resp.Header.Get("Content-Type"), ";")[0]))
 	if mt == "application/json" { // a server that ignored stream: true
-		raw, err := io.ReadAll(io.LimitReader(stream, model.MaxResponse))
+		limit := model.StreamLimit(p.cfg.MaxStreamBytes)
+		raw, err := io.ReadAll(io.LimitReader(stream, int64(limit)+1))
 		if err != nil {
 			return nil, watch.StreamError(ctx)
+		}
+		if len(raw) > limit {
+			return nil, model.RunawayError("the response body is longer than the limit") // D60
 		}
 		var c chunk
 		if err := json.Unmarshal(raw, &c); err != nil {
@@ -399,8 +408,8 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 	for sc.Scan() {
 		line := strings.TrimSuffix(sc.Text(), "\r")
 		total += len(line)
-		if total > model.MaxResponse {
-			return nil, model.DecodeError("the stream is longer than the limit")
+		if total > model.StreamLimit(p.cfg.MaxStreamBytes) {
+			return nil, model.RunawayError("the stream is longer than the limit") // D60: an answer that does not end, not an unreadable chunk
 		}
 		switch {
 		case line == "":

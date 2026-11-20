@@ -165,6 +165,9 @@ type Harness struct {
 	// ModelContext is what the operator says about each model's context window and thresholds (D52), by "provider/model".
 	// A model without an entry keeps D40's behaviour exactly.
 	ModelContext map[string]ctxwin.Settings
+	// ModelOutput is what the operator says about each model's output limit and the sampling of the retry after a runaway
+	// answer (D60), by "provider/model". A model without an entry gets the defaults.
+	ModelOutput  map[string]model.OutputPolicy
 	NewMessageID func() string
 }
 
@@ -204,6 +207,7 @@ type turn struct {
 	stopCalls  context.CancelCauseFunc
 	attempts   int              // model requests made in the step in progress, retries and fallbacks included (D45)
 	attemptLog []map[string]any // what each of those requests took and how it ended (D54)
+	runaway    runawayNote      // the last attempt of the step that did not end (D60), for the failure message
 	askedWait  time.Duration    // the longest Retry-After that was refused in the step in progress (D45)
 	askedCap   time.Duration    // what the provider that asked it is waited for, at most
 	claim      *run.Claim
@@ -1388,6 +1392,9 @@ func (t *turn) loop() error {
 				// D50: the provider's words are not shown to the member; the host log holds them
 				message += ": the model server reported an error while answering"
 			}
+			if st.ErrorCode == model.CodeOutputRunaway {
+				message = t.runaway.message()
+			}
 			if st.ErrorCode == model.CodeContextLength {
 				// D40: the thread itself is what does not fit, so the same request would be refused again
 				message = "the conversation no longer fits the model's context window; start a new conversation, or ask for less at a time"
@@ -1651,6 +1658,8 @@ func (t *turn) callModel(step int) (*model.Response, run.Step, error) {
 		}
 		st.Provider, st.Model = ref.Provider, ref.Model
 		policy := h.retryPolicy(ref.Provider)
+		lim := t.outputLimit(ref) // D60: an output limit is always sent
+		temperature, presence := t.def.Model.Temperature, (*float64)(nil)
 		for attempt := 1; ; attempt++ {
 			t.attempts++
 			msgID := h.NewMessageID()
@@ -1660,11 +1669,17 @@ func (t *turn) callModel(step int) (*model.Response, run.Step, error) {
 			start := h.Now()
 			watch := model.NewStopwatch(h.Now) // D54: the adapter says when the request was sent and when the first output came
 			resp, err := p.Complete(mctx, model.Request{Model: ref.Model, Instructions: t.def.Instructions, Messages: msgs, Tools: tools,
-				Temperature: t.def.Model.Temperature, MaxOutputTokens: t.def.Model.MaxOutputTokens, Watch: watch}, s.delta)
+				Temperature: temperature, PresencePenalty: presence, MaxOutputTokens: lim.tokens, Watch: watch}, s.delta)
 			cancel()
 			st.Latency = h.Now().Sub(start)
 			timing := watch.Timing()
-			endSpan(t.logAttempt(ref, st.Latency, timing, err, s.blocked != ""), resp, timing)
+			var runaway *model.Response // D60: an answer the output limit stopped while the window had room
+			if err == nil && resp.StopReason == model.StopLength && t.cutIsRunaway(lim, resp.Usage) {
+				runaway = resp
+				err = model.RunawayError(fmt.Sprintf("the answer reached the output limit of %d tokens (%s) after %d tokens, with %d in the prompt and a window of %d",
+					lim.tokens, lim.source, resp.Usage.CompletionTokens, resp.Usage.PromptTokens, lim.window))
+			}
+			endSpan(t.logAttempt(ref, st.Latency, timing, err, s.blocked != "", resp), resp, timing)
 			cut := t.callCtx.Err() != nil // the deadline, a cancel or a stopped worker ended the call (D46)
 			h.Router.Observe(ref, st.Latency, err != nil && s.blocked == "" && !cut)
 			if ferr := s.finish(); ferr != nil {
@@ -1727,6 +1742,14 @@ func (t *turn) callModel(step int) (*model.Response, run.Step, error) {
 			if me.Code == "canceled" {
 				return nil, st, err
 			}
+			if me.Code == model.CodeOutputRunaway {
+				// D60: what the failure message says, and the tokens the attempt spent, which the step row keeps if the step fails here
+				t.runaway = runawayNote{limit: lim, bytes: runaway == nil, attempts: t.attempts}
+				if runaway != nil {
+					st.PromptTokens, st.CompletionTokens, st.StopReason = runaway.Usage.PromptTokens, runaway.Usage.CompletionTokens, runaway.StopReason
+					t.runaway.tokens = runaway.Usage.CompletionTokens
+				}
+			}
 			if me.Detail != "" {
 				// D50: what the provider said is for the operator and goes to the host log only; the event says that there is
 				// something to look for, never what it is (the run's owner reads the event stream)
@@ -1740,11 +1763,13 @@ func (t *turn) callModel(step int) (*model.Response, run.Step, error) {
 				if t.ownFault(me, ref, refs[i+1:], refused) {
 					action = "next_candidate" // the error is this candidate's own, not the request's (D56)
 				}
-			case !me.Retryable || s.streamed() || attempt >= policy.Attempts:
+			case !me.Retryable || s.streamed() || attempt >= policy.Attempts || (me.Code == model.CodeOutputRunaway && attempt >= model.MaxRunawayAttempts):
 				action = t.afterRetries(refs[i+1:], refused)
 			default:
 				var ok bool
-				if wait, ok = policy.Wait(attempt, me.RetryAfter); !ok {
+				if me.Code == model.CodeOutputRunaway {
+					ok = true // the endpoint is well: the retry is not delayed
+				} else if wait, ok = policy.Wait(attempt, me.RetryAfter); !ok {
 					t.askedWait, t.askedCap = me.RetryAfter, policy.WithDefaults().MaxRetryAfter
 					h.Log.Warn("model provider asked to wait longer than this host does", "provider", ref.Provider, "retryAfter", me.RetryAfter)
 					action = t.afterRetries(refs[i+1:], refused)
@@ -1756,6 +1781,12 @@ func (t *turn) callModel(step int) (*model.Response, run.Step, error) {
 				ev := map[string]any{"step": step, "provider": ref.Provider, "model": ref.Model, "attempt": attempt, "code": st.ErrorCode, "outcome": action}
 				if me.Fault != "" {
 					ev["fault"] = me.Fault
+				}
+				if me.Code == model.CodeOutputRunaway {
+					ev["limit"] = lim.tokens // D60: numbers only
+					if runaway != nil {
+						ev["completionTokens"] = runaway.Usage.CompletionTokens
+					}
 				}
 				if aerr := h.Store.AppendEvents(t.ctx, t.claim, []agui.Event{agui.Custom(agui.CustomModelError, ev)}); aerr != nil {
 					return nil, st, aerr
@@ -1772,8 +1803,17 @@ func (t *turn) callModel(step int) (*model.Response, run.Step, error) {
 				}
 				break
 			}
-			if err := h.Store.AppendEvents(t.ctx, t.claim, []agui.Event{agui.Custom(agui.CustomModelRetry, map[string]any{"step": step, "provider": ref.Provider, "model": ref.Model,
-				"attempt": attempt, "of": policy.Attempts, "code": st.ErrorCode, "waitMs": wait.Milliseconds(), "retryAfterMs": me.RetryAfter.Milliseconds()})}); err != nil {
+			retryEvent := map[string]any{"step": step, "provider": ref.Provider, "model": ref.Model,
+				"attempt": attempt, "of": policy.Attempts, "code": st.ErrorCode, "waitMs": wait.Milliseconds(), "retryAfterMs": me.RetryAfter.Milliseconds()}
+			if me.Code == model.CodeOutputRunaway {
+				retryEvent["of"] = min(policy.Attempts, model.MaxRunawayAttempts)
+				// D60: the same request would give the same loop from a server that decodes greedily
+				if temp, pres, ok := h.ModelOutput[ref.Provider+"/"+ref.Model].Sampling(t.def.Model.Temperature); ok {
+					temperature, presence = &temp, &pres
+					retryEvent["temperature"], retryEvent["presencePenalty"] = temp, pres
+				}
+			}
+			if err := h.Store.AppendEvents(t.ctx, t.claim, []agui.Event{agui.Custom(agui.CustomModelRetry, retryEvent)}); err != nil {
 				return nil, st, err
 			}
 			if !t.sleep(wait) {
@@ -1835,7 +1875,7 @@ func (t *turn) ownFault(me *model.Error, ref agent.ModelRef, later []agent.Model
 // errorCode is the step's error code of a provider error.
 // logAttempt records one request of the step: how long it took, when its first output came, how it ended (D54).
 // It returns how the request ended, for the span of the call (D57).
-func (t *turn) logAttempt(ref agent.ModelRef, latency time.Duration, timing model.Timing, err error, blocked bool) string {
+func (t *turn) logAttempt(ref agent.ModelRef, latency time.Duration, timing model.Timing, err error, blocked bool, resp *model.Response) string {
 	outcome := "ok"
 	var me *model.Error
 	switch {
@@ -1848,6 +1888,9 @@ func (t *turn) logAttempt(ref agent.ModelRef, latency time.Duration, timing mode
 	}
 	e := map[string]any{"attempt": t.attempts, "provider": ref.Provider, "model": ref.Model, "outcome": outcome, "latencyMs": latency.Milliseconds()}
 	addTiming(e, timing.FirstOutput, timing.FirstText, timing.AfterFirst)
+	if resp != nil && resp.Usage.CompletionTokens > 0 {
+		e["completionTokens"] = resp.Usage.CompletionTokens // D60: what the attempt generated, also when it was a runaway
+	}
 	t.attemptLog = append(t.attemptLog, e)
 	return outcome
 }

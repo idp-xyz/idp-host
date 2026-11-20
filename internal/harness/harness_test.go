@@ -37,6 +37,7 @@ type memStore struct {
 	steps       []run.Step
 	status      string
 	failCode    string
+	failMessage string
 	cred        string
 	fenced      bool
 	fenceAt     int // fence after this many event appends (0 = never)
@@ -232,13 +233,13 @@ func (m *memStore) UpdateToolCall(_ context.Context, _ *run.Claim, id, state, re
 	return m.appendEvents(events)
 }
 
-func (m *memStore) Finish(_ context.Context, _ *run.Claim, status, code, _ string, events []agui.Event) error {
+func (m *memStore) Finish(_ context.Context, _ *run.Claim, status, code, message string, events []agui.Event) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if err := m.check(); err != nil {
 		return err
 	}
-	m.status, m.failCode = status, code
+	m.status, m.failCode, m.failMessage = status, code, message
 	m.rc.Run.Status = status
 	return m.appendEvents(events)
 }

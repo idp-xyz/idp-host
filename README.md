@@ -63,6 +63,11 @@ providers:
     models:                          # D52: what the host knows about the models this provider serves (key: the release's model name)
       - name: qwen3.8-flash-next-iq3_xxs
         contextWindow: 131072        # tokens. REQUIRED for D52 to apply to this model (see below); without it nothing changes
+        maxOutputTokens: 32768       # D60: the most one answer may write, sent with every request (default 32768; 16..1048576, below contextWindow); a release can lower it, never raise it
+        runawayRetry:                # D60: what the one retry of an answer that did not end changes in the request; all optional
+          temperature: 0.7           #   (0, 2]; default 0.7; used when the release sets none, a release's own temperature above 0 is kept
+          presencePenalty: 0.5       #   [0, 2]; default 0.5; sent to OpenAI-compatible providers only (the other adapters have no such field)
+          # keepSampling: true       #   the retry repeats the request unchanged (a server that decodes greedily then loops again)
         context:                     # all optional; the defaults below are derived from the window
           waterMarkShare: 0.6        #   (0.2, 0.9]  above this share of the window older content is shortened further, oldest first
           hintShare: 0.8             #   (0.3, 0.95] above this share the budget hint tells the model the context is filling
@@ -126,6 +131,8 @@ provider 的 `retry` 与 `idleTimeoutSeconds`（ADR D45、D46）都可以不配�
 **回退候选（ADR D56，修订 D45）。** 主候选的错误按类别决定换不换下一个候选，不用配置：候选自己的问题换（401、403、404、402、413、额度用尽——HTTP 的 `insufficient_quota` 与 Anthropic 的 "credit balance is too low" 不再重试、立刻换；流里的认证、权限、找不到、额度错误），请求自己的问题不换（其余 400、422、其余 4xx），提供者内容策略的拒绝（`content_policy_violation`、`content_filter`）也不换：把被一家拒绝的内容送给另一家等于绕过它的策略。`context_length` 只换到**配置里 `models[].contextWindow` 更大**的候选（没配窗口的候选不比、不问）。每一步记下失败的候选：步骤行的 `failed_candidates`（只有错误码，迁移 0012）、`model.usage` 的 `failedCandidates`、`model.error` 的 `outcome`（`retry`、`next_candidate`、`stop`）与 `fault`。
 
 **worker 里的追踪（ADR D57）。** 配了 `OTEL_EXPORTER_OTLP_ENDPOINT`（或 `…_TRACES_ENDPOINT`）时，worker 的每个回合是接在创建运行的请求之后的 span（`idp.run.turn`），每次模型请求（`idp.model.call`）与每个网关工具调用（`idp.tool.call`）是它的子 span，属性只有运行 ID、步、提供者与模型、工具名、结果与 D54 的时间，没有提示、参数、结果；没有收集端时什么都不做。运行存着创建它的请求的 `traceparent`（`runs.traceparent`，迁移 0013；运行的表示不变）。`traceparent` 发给网关（外部工具除外，idp-mcp D51）；发给模型提供者**只在** provider 条目 `tracePropagation: true` 时，不写则等于 `external: false`：外部提供者默认不发，因为它标识我们的请求。
+
+**输出上限与不会结束的回答（ADR D60）。** 每个模型请求都带输出上限（`max_tokens`）：发布件的 `model.maxOutputTokens`（或运行选项 `idp.host/maxOutputTokens`）更低时用它；否则用 provider 条目下 `models[].maxOutputTokens`；都没有就用缺省 32,768，**但只在该模型配了 `contextWindow` 时**；有 `contextWindow` 时再不超过窗口减去这次请求（校正后的估算乘 1.05）之后剩下的。窗口未知又没有明说上限时不发 `max_tokens`，与以前逐字节相同。运维给了值，发布件只能调低、不能调高；没给值时 32,768 只是 HOST 的缺省，发布件明说更高的值照准。32,768 是按本机模型的录得运行定的：122 个长运行里 3,769 个有输出的步，99.9 分位 20,507、最长 24,107 token（多数是推理），两次重复循环写了 35,351 与 35,850 token；**这个数不是预算，只防循环**，对这个模型也只比 8 MiB 的流上限早停约 10 秒，真正的变化是下面两条。回答被上限截断、而窗口并不接近满（上限不是被窗口缩小的；输入加上限离窗口不到 1/16 则算接近满；服务端实际生成的不到上限的九成则是它自己的上下文满了）时，错误码是 `output_runaway`，不是 D40 的"窗口满"；流超过 8 MiB 也是 `output_runaway`，不再是 `decode`。它在同一候选上重试一次（不论 `retry.attempts`，至多两次请求；已经流出文字就不重试），重试改变采样：温度 0.7（发布件自己的温度大于 0 时保留）与 `presence_penalty` 0.5——Strata 没有 `sampling` 配置时是贪心解码，同样的请求会再循环一次；`runawayRetry.keepSampling: true` 关掉这个改变。两次都不结束，运行以 `MODEL_ERROR` 结束，消息写明 `output_runaway`、上限与来源、请求数；被截断的回答带的工具调用一个也不执行（D55）。事件 `idp.host/model.error {…, code: "output_runaway", outcome, limit, completionTokens}`、`idp.host/model.retry {…, temperature, presencePenalty}`，`model.usage.attemptTimings[]` 里每次尝试的 `completionTokens`。**要得到循环防护，给用到的模型配 `contextWindow`（缺省 32,768，按窗口钳制）或 `maxOutputTokens`（明说的值，窗口未知时照发）**；两者都没有的模型行为与 D60 之前相同（不发 `max_tokens`，只有 8 MiB 的流上限，超限现在是 `output_runaway` 并重试）。平台的 compose 与 kind 目前没有 `models`。
 
 **被输出上限截断的回答（ADR D55，修订 D40）。** 回答因输出上限或窗口被截断时，它带着的工具调用一个也不执行（参数哪怕恰好是合法的 JSON），存下的会话只留已说出的文字，运行以 `MODEL_ERROR` 结束，消息与事件 `idp.host/model.cutoff` 说明原因。
 

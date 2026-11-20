@@ -31,6 +31,8 @@ type Config struct {
 	// IdleTimeout is how long a response may stay silent between two reads before the request is cancelled and the call
 	// fails as a retryable transport error (D46); zero means model.DefaultIdleTimeout.
 	IdleTimeout time.Duration
+	// MaxStreamBytes bounds the bytes of one streamed answer; zero means model.MaxResponse. Tests inject a small one.
+	MaxStreamBytes int
 }
 
 // Provider implements model.Provider.
@@ -288,8 +290,8 @@ func (p *Provider) Complete(ctx context.Context, req model.Request, onDelta func
 	for sc.Scan() {
 		line := strings.TrimSuffix(sc.Text(), "\r")
 		total += len(line)
-		if total > model.MaxResponse {
-			return nil, model.DecodeError("the stream is longer than the limit")
+		if total > model.StreamLimit(p.cfg.MaxStreamBytes) {
+			return nil, model.RunawayError("the stream is longer than the limit") // D60: an answer that does not end, not an unreadable chunk
 		}
 		switch {
 		case line == "":

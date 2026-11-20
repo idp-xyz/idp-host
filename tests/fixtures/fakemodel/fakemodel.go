@@ -27,6 +27,9 @@ type Turn struct {
 	// CutOff answers on the OpenAI wire with finish_reason "length": the model ran out of context or output. With ToolCalls
 	// it is a cut-off answer whose calls (their Args may be cut JSON) were being written.
 	CutOff bool
+	// Completion is the completion_tokens the server says it generated; zero is the double's usual 7. A runaway answer (D60)
+	// says as many as the output limit it was given.
+	Completion int
 }
 
 // Call is a requested tool call.
@@ -646,7 +649,11 @@ func (s *Server) openai(w http.ResponseWriter, r *http.Request) {
 	if len(toolCalls) > 0 && !turn.CutOff { // a cut-off answer keeps "length" whatever it carries (D55)
 		finish = "tool_calls"
 	}
-	usage := map[string]any{"prompt_tokens": 10 * len(msgs), "completion_tokens": 7, "total_tokens": 10*len(msgs) + 7}
+	completion := 7
+	if turn.Completion > 0 {
+		completion = turn.Completion
+	}
+	usage := map[string]any{"prompt_tokens": 10 * len(msgs), "completion_tokens": completion, "total_tokens": 10*len(msgs) + completion}
 	if !req.Stream {
 		msg := map[string]any{"role": "assistant", "content": turn.Text}
 		if turn.Reasoning != "" {

@@ -429,7 +429,7 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 	wctx, cancelWorkers := context.WithCancel(ctx)
 	defer cancelWorkers()
 	if workers > 0 {
-		h := &harness.Harness{Store: store, Providers: registry, Gateways: gateways, Classifiers: classifiers, A2A: a2aClient, CMI: cmiClient, CMIKey: cmiKey, CMIToken: cmiToken, Remember: remember, Retry: retry, ModelContext: cfg.ModelContext(), Metrics: worker.NewMetrics(metrics), Log: log}
+		h := &harness.Harness{Store: store, Providers: registry, Gateways: gateways, Classifiers: classifiers, A2A: a2aClient, CMI: cmiClient, CMIKey: cmiKey, CMIToken: cmiToken, Remember: remember, Retry: retry, ModelContext: cfg.ModelContext(), ModelOutput: cfg.ModelOutput(), Metrics: worker.NewMetrics(metrics), Log: log}
 		if observability.Exporting() { // D57: the worker's spans are made when a collector is configured, and only then
 			h.Tracer, h.TraceProviders = tp.Tracer("idp-host/worker"), traceProviders
 		}
