@@ -35,6 +35,9 @@ type replayThread struct {
 			StartedAt time.Time `json:"startedAt"`
 			Prompt    int       `json:"prompt"`
 			Error     *string   `json:"error"`
+			// the model server's own count of the step (D54), where the dump has it: tokens it processed and tokens it reused
+			ServerPromptN *int `json:"serverPromptN"`
+			ServerCacheN  *int `json:"serverCacheN"`
 		} `json:"steps"`
 	} `json:"runs"`
 	Messages []struct {

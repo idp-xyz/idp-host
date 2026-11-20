@@ -511,7 +511,7 @@ func TestContextEntriesAndTheFilesNoteAreNeverShortened(t *testing.T) {
 // still give their citations, and the citations the answer uses are checked against them.
 func TestSourcesAreCollectedFromTheWholeResultNotTheShortenedView(t *testing.T) {
 	e := setup(t)
-	withWindow(e, ctxwin.Settings{Window: 131072})
+	withWindow(e, ctxwin.Settings{Window: 10000}) // D58: nothing is cut before the mark; the nine results of 6 KB cross it
 	n := 0
 	e.mcp.Tools = append(e.mcp.Tools, fakemcp_tool("web_search", `{"type":"object"}`, true, func(string, map[string]any) (string, any, bool) {
 		n++
@@ -671,7 +671,8 @@ func TestOneOddUsageReportCannotSwitchTheMechanismOff(t *testing.T) {
 	// raw one times the floor
 	last := evs[len(evs)-1]
 	raw, est := num(last["rawEstimateTokens"]), num(last["estimateTokens"])
-	if want := int(float64(raw)*ctxwin.MinFactor + 0.5); est != want || num(last["shortened"]) == 0 {
+	// (both numbers are rounded from a float, and the budget note carries the time left, so the estimate may be one off)
+	if want := int(float64(raw)*ctxwin.MinFactor + 0.5); est < want-1 || est > want+1 || num(last["shortened"]) == 0 {
 		t.Errorf("the mechanism was switched off or mis-scaled: raw %d, estimate %d, shortened %v", raw, est, last["shortened"])
 	}
 }

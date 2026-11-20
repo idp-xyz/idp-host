@@ -217,3 +217,19 @@ func keys(s string) string {
 	}
 	return strings.Join(out, ",")
 }
+
+// D58: the limit at which a view that cannot be shortened further is cut once more is ten points of the window above the
+// mark, and never above the hint.
+func TestTheLimitIsTenPointsAboveTheMarkAndNotAboveTheHint(t *testing.T) {
+	l := Settings{Window: 131072}.Resolve(Settings{})
+	if want := l.Mark + 13107; l.Limit != want {
+		t.Errorf("limit %d, want %d (mark %d)", l.Limit, want, l.Mark)
+	}
+	l = Settings{Window: 100000, MarkShare: 0.5, HintShare: 0.55}.Resolve(Settings{})
+	if l.Limit != l.Hint {
+		t.Errorf("limit %d with the hint at %d: it must not be above the hint", l.Limit, l.Hint)
+	}
+	if l := (Settings{}).Resolve(Settings{}); l.Limit != 0 {
+		t.Errorf("limit %d with no window", l.Limit)
+	}
+}

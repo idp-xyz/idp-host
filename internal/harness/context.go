@@ -115,7 +115,19 @@ type threadView struct {
 	results map[string]string // tool message id -> the text shown (before the input guard's wrapper)
 	args    map[string]string // tool call id -> the arguments shown
 	items   []shown
-	level   int // the deepest progressive level used (0 = none)
+	level   int    // the deepest progressive level used (0 = none)
+	batch   int    // D58: how many items a batch cut at this step (0 = no batch)
+	why     string // what called the batch: "start" | "mark" | "limit"
+	bottom  bool   // D58: shortening is at its bottom; the view is frozen until the limit
+}
+
+// batchState is where a run is in D58's batches: the view changes only at a batch, and a batch is called by the first view
+// of the run, by the estimate passing the water mark, or, once shortening has nothing left to cut, by the estimate
+// reaching the limit.
+type batchState struct {
+	started bool // the first view of the run was made (it is a batch: the run's start)
+	bottom  bool // the last batch could not bring the estimate down to the low water: nothing is cut again until the limit
+	told    bool // at the bottom the estimate reached the limit: the model is told from then on
 }
 
 // shape decides what the model reads of the thread. base is the estimate of everything else in the request. The
@@ -196,36 +208,25 @@ func (t *turn) shape(base, wrapTokens float64) *threadView {
 	}
 	// level 0: D40's rule. A result older than the newest KeepResults, over OldBytes, is shown as head and tail; with a
 	// window the arguments of the calls that asked for those results are too (at ArgumentBytes).
-	for _, it := range items {
-		if it.rank < lim.KeepResults || (it.kind == "result" && (it.resource || len(it.full) <= lim.OldBytes)) {
-			continue
-		}
-		if it.kind == "result" {
-			apply(it, lim.OldBytes, true)
-		} else {
-			apply(it, lim.ArgumentBytes, false)
-		}
-	}
-	if lim.Window > 0 {
-		// what an earlier step of this run cut stays cut: an item is never shown longer than it was, so that the part of the
-		// request before the newest cut does not change from one step to the next (the prefix a model server may have cached)
+	level0 := func() {
 		for _, it := range items {
-			if l := t.sticky[it.kind+"|"+it.id]; l > 0 && (it.limit == 0 || l < it.limit) {
-				apply(it, l, false)
+			if it.limit != 0 || it.rank < lim.KeepResults || (it.kind == "result" && (it.resource || len(it.full) <= lim.OldBytes)) {
+				continue
+			}
+			if it.kind == "result" {
+				apply(it, lim.OldBytes, true)
+			} else {
+				apply(it, lim.ArgumentBytes, false)
 			}
 		}
-		// the water mark: when the estimate is above it, older content is cut further, oldest first, down to the low water
-		// (a sixth below the mark), so that the next steps do not have to cut again; or until nothing is left to cut
-		stop := float64(lim.Mark)
-		trigger := total*t.corr.Factor() > stop
-		if trigger {
-			stop = stop * lowWater
-		}
-		over := func() bool { return trigger && total*t.corr.Factor() > stop }
-	levels:
+	}
+	// the progressive levels, oldest first, until the estimate is at or under stop; false when everything that may be cut
+	// is cut and the estimate is still above it
+	deeper := func(stop float64) bool {
+		over := func() bool { return total*t.corr.Factor() > stop }
 		for li, lv := range shortLevels {
 			if !over() {
-				break
+				return true
 			}
 			limit := lv.limit(lim.OldBytes)
 			for _, it := range items {
@@ -242,13 +243,80 @@ func (t *turn) shape(base, wrapTokens float64) *threadView {
 				before := it.limit
 				apply(it, l, false)
 				if it.limit != before {
-					v.level = li + 1
+					v.level = max(v.level, li+1)
 				}
 				if !over() {
-					break levels
+					return true
 				}
 			}
 		}
+		return !over()
+	}
+	// what an earlier step of this run cut stays cut: an item is never shown longer than it was, so that the part of the
+	// request before the newest cut does not change from one step to the next (the prefix a model server may have cached)
+	stick := func() {
+		for _, it := range items {
+			if l := t.sticky[it.kind+"|"+it.id]; l > 0 && (it.limit == 0 || l < it.limit) {
+				apply(it, l, false)
+			}
+		}
+	}
+	low := float64(lim.Mark) * lowWater
+	switch {
+	case lim.Window == 0:
+		level0()
+	case lim.PerStep:
+		// D52 as it was before D58: level 0 at every step, and the water mark calls for more
+		level0()
+		stick()
+		over := total*t.corr.Factor() > float64(lim.Mark)
+		stop := float64(lim.Mark)
+		if over {
+			stop = low
+		}
+		if over {
+			deeper(stop)
+		}
+	default:
+		// D58: nothing changes between batches. What is cut stays cut; an item that leaves the newest KeepResults is shown
+		// whole until a batch; a batch is called by the run's first view (to take up where the stored thread left the last
+		// run: shown as level 0 at least), by the estimate passing the water mark, and, once shortening is at its bottom, by
+		// the estimate reaching the limit.
+		stick()
+		before := total * t.corr.Factor()
+		call := ""
+		switch {
+		case !t.batch.started:
+			call = "start"
+		case t.batch.bottom && before >= float64(lim.Limit):
+			call = "limit"
+			t.batch.told = true
+		case !t.batch.bottom && before > float64(lim.Mark):
+			call = "mark"
+		}
+		t.batch.started = true
+		if call != "" {
+			was := make(map[*shortItem]int, len(items))
+			for _, it := range items {
+				was[it] = it.limit
+			}
+			level0()
+			done := true
+			if total*t.corr.Factor() > float64(lim.Mark) {
+				done = deeper(low)
+			}
+			t.batch.bottom = !done
+			for _, it := range items {
+				if it.limit != was[it] { // cut, or cut further
+					v.batch++
+				}
+			}
+			v.why = call
+			if v.batch == 0 { // a call that cut nothing is not a batch
+				v.why = ""
+			}
+		}
+		v.bottom = t.batch.bottom
 	}
 	if lim.Window > 0 && t.sticky == nil {
 		t.sticky = map[string]int{}
@@ -304,6 +372,13 @@ func (t *turn) viewEvent(step int, v *threadView, raw, corrected float64, hint b
 	}
 	val := map[string]any{"step": step, "windowTokens": lim.Window, "markTokens": lim.Mark, "estimateTokens": int(corrected + 0.5), "rawEstimateTokens": int(raw + 0.5),
 		"factor": float64(int(t.corr.Factor()*1000+0.5)) / 1000, "level": v.level, "shortened": len(items), "hint": hint}
+	if !lim.PerStep { // D58: whether the view changed at this step, and how much of it; the evaluation lines this up with the server's reused and processed tokens
+		val["batch"] = v.batch
+		if v.why != "" {
+			val["batchWhy"] = v.why
+		}
+		val["bottom"] = v.bottom
+	}
 	joined := strings.Join(key, ",")
 	if joined == t.lastView {
 		val["itemsAsBefore"] = true

@@ -149,7 +149,7 @@ type Model struct {
 	Name          string `yaml:"name"`
 	ContextWindow int    `yaml:"contextWindow"` // tokens, the most one request and its answer may hold
 	Context       struct {
-		WaterMarkShare  float64 `yaml:"waterMarkShare"`  // (0.2, 0.9]; default 0.6: above it, older content is shortened further
+		WaterMarkShare  float64 `yaml:"waterMarkShare"`  // (0.2, 0.9]; default 0.6: a batch of shortening is called when the estimate passes it (D58), older content is cut and, if that is not enough, cut further
 		HintShare       float64 `yaml:"hintShare"`       // (0.3, 0.95]; default 0.8: above it, the model is told the context is filling; above the water mark
 		ToolResultBytes int     `yaml:"toolResultBytes"` // 1 KiB to 1 MiB; default an eighth of the window in bytes, 4 KiB to 64 KiB (16 KiB at 131,072)
 		KeepToolResults int     `yaml:"keepToolResults"` // 1 to 50; default 6

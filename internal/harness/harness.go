@@ -228,6 +228,7 @@ type turn struct {
 	corr       ctxwin.Correction                    // the estimate's correction by the provider's usage reports (D52)
 	lastView   string                               // the items shortened at the previous step, to record only a change
 	sticky     map[string]int                       // the limit each item was cut to at an earlier step of this run (D52)
+	batch      batchState                           // where the run is in D58's batches of shortening
 	viewRaw    float64                              // the raw estimate of the request now being sent
 	viewFixed  float64                              // ... and corrected
 	hint       string                               // what the budget note adds about the context this step
@@ -2122,7 +2123,7 @@ func (t *turn) guardedMessages() ([]agui.Message, error) {
 	}
 	t.hint, t.viewRaw = "", requestTokens(t.def.Instructions, msgs, tools)
 	t.viewFixed = t.viewRaw * t.corr.Factor()
-	if t.limits.Window > 0 && t.viewFixed >= float64(t.limits.Hint) { // D52: the context is filling; say so, where the budget hint is
+	if t.limits.Window > 0 && (t.viewFixed >= float64(t.limits.Hint) || t.batch.told) { // D52: the context is filling; say so, where the budget hint is (D58: and keep saying it once the shortening is at its bottom and the estimate has reached the hint)
 		t.hint = contextHint(int(t.viewFixed), t.limits.Window)
 	}
 	if t.step > 0 { // D41: last, so the thread before it stays a stable prefix; not stored

@@ -83,7 +83,9 @@ type Settings struct {
 // Limits are Settings with every default filled in from the window.
 type Limits struct {
 	Window          int
-	Mark, Hint      int // in tokens
+	Mark, Hint      int  // in tokens
+	Limit           int  // D58: where a view that cannot be shortened further is cut once more: ten points of the window above the mark, not above the hint
+	PerStep         bool // D52's rule as it was before D58: level 0 at every step. No setting turns it on; the replay compares with it
 	ToolResultBytes int
 	KeepResults     int
 	OldBytes        int
@@ -102,6 +104,11 @@ const (
 	DefaultMarkShare = 0.60
 	DefaultHintShare = 0.80
 )
+
+// LimitAboveMark is how far above the water mark, as a share of the window, the estimate may go once shortening has nothing
+// left to cut (D58). It is the criterion of the evaluation (the largest share may rise ten points above the mark), not a
+// measurement.
+const LimitAboveMark = 0.10
 
 // FloorKeep is how many of the newest tool results (and their calls) the progressive shortening never touches.
 const FloorKeep = 2
@@ -140,6 +147,7 @@ func (s Settings) Resolve(fixed Settings) Limits {
 	if s.Window > 0 {
 		l.Mark = int(float64(s.Window) * pickf(s.MarkShare, DefaultMarkShare))
 		l.Hint = int(float64(s.Window) * pickf(s.HintShare, DefaultHintShare))
+		l.Limit = min(l.Hint, l.Mark+int(float64(s.Window)*LimitAboveMark))
 	}
 	return l
 }
