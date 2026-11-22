@@ -1492,3 +1492,42 @@ strata serve: prompt 20096 tokens = 2491 reused + 17605 read in 4364 ms (4034.5 
 没有测试覆盖的控制：`cmd/idp-host/main.go` 里 `ModelOutput: cfg.ModelOutput()` 这一行接线（`cmd` 没有测试；配置到 `ModelOutput()` 一段有测试）。
 
 窗口未知时的两个控制（`outputLimit` 不再发缺省；`cutIsRunaway` 对没发上限的请求也判循环）：前者拿掉，`TestAnOutputLimitIsAlwaysSent/window_unknown,_nothing_explicit…` 失败；后者拿掉，`TestACutAnswerWhereTheWindowIsFullIsStillD40/the_window_is_not_known…`、`TestACutOffAnswerWithToolCallsRunsNoTool`（3 行）、`TestCutOffAnswerIsNotACompletedRun` 失败。`TestARunawayIsRecognisedWithoutAKnownWindowWhenTheLimitIsExplicit` 与 PostgreSQL 的循环测试（运维给了 `maxOutputTokens`、没有窗口）覆盖明说上限的情形。
+
+## 43. D61：第三方服务没有授权时，工具结果里的标记变成一条事件——只从网关标为外部的工具读，只带连接 id，不暂停（2026-11-22 决策与实施，依据 idp-mcp-bridge-oauth-plan 第 2、3 节与选择点 3；契约不变）
+
+沿用 D27（工具结果是不可信内容）、D44、D51（网关的 `io.idp.telos/external` 标记可信，因为只有网关会设）、D47（一次回答一个事务）、D49（`structuredContent` 只由 HOST 读、不给模型；与来源一起在回答的事务里写）。
+
+**背景**：平台的桥（idp-mcp-bridge）把第三方 MCP 服务接成网关的工具。成员没有授权某个服务时，桥对这次调用返回工具错误（`isError` 为真），`structuredContent` 里带 `{"io.idp.telos/authorizationRequired": {"connection": "<id>"}}`。HOST 要让跟着运行的客户端（Workspace）在对话旁显示"连接 <服务>"。
+
+| # | 决策 | 理由 |
+|---|---|---|
+| D61-1 | **标记只从网关标为外部的工具的结果里读**：该工具在本回合的 `tools/list` 里带 `_meta["io.idp.telos/external"] === true`（`turn.gatewayExt`）。别的工具的结果里同样的键不看。运维的 `externalTools` 模式点名、而网关没有标的工具也不算：模式是运维对"内容送出企业"的声明（D44），不是"这个工具是桥"的声明 | 桥的工具都是外部的，且标记只有网关会设（D51）；任何别的工具的结果（内部的、运维点名的上游）里出现这个键，都不是桥说的，不能让它在成员的对话旁摆出"去授权"的按钮 |
+| D61-2 | **只读 `connection`，且只接受短的 id**：字符串，`^[A-Za-z0-9_-]{1,64}$`；其他类型、空串、过长、带 `/`、空格、`:` 的（也就是地址）一律不读，调用照常回答，没有事件。标记对象里的其他字段（`url` 等）不读，所以它们不可能进事件 | 一个 id 就够 Workspace 查出是哪个连接；有界的字符集挡住了把地址或脚本塞进 id 的办法 |
+| D61-3 | **没有地址**：事件与模型输入里都没有来自结果的地址。Workspace 用自己的 OAuth 路径、按 id 自己构造链接（计划选择点 1：回调在 Workspace） | 来自第三方或被攻破的桥的地址是一个现成的钓鱼入口；"去授权"的链接只能由 Workspace 生成，对着已登录的成员核对 |
+| D61-4 | **一次这样的调用一条事件**，`idp.host/authorization.required {toolCallId, tool, connection}`，写在这次调用的回答的同一个事务里（`AnswerToolCall` 的事件列表里，在 `TOOL_CALL_RESULT` 之前）。D47 的续跑规则因此成立：回答没写成，事件也没写成，接手的 worker 重发（只读或幂等的调用）或按 D47-2 回答"被中断"时不写这条；回答写成了，调用不会再执行，事件不会重复 | 与 D49 记来源同一个办法；客户端看到的事件与线程里的回答不会不一致 |
+| D61-5 | **模型读到的是工具自己的错误文字**，照原来那样包成不可信内容（D27）；不加任何东西，id 也不加。运行继续：模型可以告诉成员、换办法或放弃，不暂停（计划选择点 3 的 (a)：成员授权后重新提问；(b) "暂停、授权后接着跑"要改 HOST 的暂停与恢复，放到下一期） | 模型不需要知道连接 id，也不该被工具结果里的话支使去做什么；暂停要动 `AWAITING_INPUT` 的语义与恢复，不在这一条里 |
+| D61-6 | **计数**：事件本身是运行记录（事件流里一条，随运行保存）；另有 Prometheus 指标 `idp_host_authorization_required_total`（无标签；在回答写成之后加一，经可选接口 `AuthorizationRequired()`，同 D47-13，没有实现它的 `Metrics` 不受影响）。没有往 D49 的来源表（`run_sources`）里加字段：这里没有要存的数据，加字段会改它的写入条件 | 运维要看"多少次调用因为没授权而失败"，指标够；要看哪个运行、哪个连接，翻事件 |
+
+**契约**：不变。`idp.host/*` 的 CUSTOM 事件名没有列在 `api/contracts/schema.json`、`api/openapi.yaml` 里（与 `tool.interrupted`、`file.delivered` 一样只在 ADR 与 `internal/agui` 的常量里写），事件值的形状在这里。Workspace 要读它时，以这一条为准。
+
+**取舍与边界**
+
+- 标记出现在一次不是 `isError` 的结果里时不读：桥只在错误里发它；成功的结果里的同名键没有意义。
+- 工具的文字为空而 `structuredContent` 不空时，`mcpclient.CallResult.Text` 会把 `structuredContent` 当作文字交给模型（原来的行为，不是这一条改的）；桥应当带文字。这时模型会读到 id，它是有界的短串，不是地址。
+- 同一个运行里对同一个连接的多次调用各有一条事件（一次调用一条）；去重是 Workspace 的显示问题。
+- 没有对真实的桥验证（桥还没有）；用网关替身（`tests/fixtures/fakemcp`）。`fakemcp` 的 `HandleAs` 现在在错误结果上也带 `structuredContent`（以前丢掉）；没有别的测试依赖旧行为。
+
+**实施**：`internal/run/authorization.go`（`AuthorizationRequiredKey`、`ParseAuthorizationRequired`）；`internal/agui`（`CustomAuthorizationRequired`）；`internal/harness`（`turn.gatewayExt`、`callOutcome.authConn`、`invoke` 读标记、`settleOutcome` 写事件并计数、`authorizationMetrics`）；`internal/worker/metrics.go`。没有改存储：事件走 `AnswerToolCall` 已有的事件列表。
+
+**验证**：`internal/harness/authorization_test.go`：`TestAnExternalToolThatSaysTheMemberHasNotAuthorizedIsAnnouncedOnceWithItsConnection`（一条、形状、与回答同一次写入且在 `TOOL_CALL_RESULT` 之前、模型请求里只有工具的文字、运行完成）、`TestTheMarkerOfAToolThatTheGatewayDoesNotMarkExternalIsIgnored`（非外部工具、运维模式点名的工具各一次）、`TestAConnectionIdThatIsNotAShortPatternIsIgnored`（地址、斜杠、空格、空、过长、数字、对象、没有 `connection`；最长的合法 id 被接受）、`TestAnAddressInTheMarkerOrTheTextIsNeverInAnEvent`、`TestAResumedRunWritesTheAuthorizationEventOnceAndReplayDoesNotRepeatIt`（worker 死在回答上，续跑写一次；再续跑不重复）。PostgreSQL：`TestAnAuthorizationRequiredMarkerIsRecordedOnceWithTheAnswerOnPostgres`（外部工具一条、非外部工具没有，经 API 的事件流读，运行完成，模型输入没有 id）。
+
+**拿掉一个控制、看测试失败**（每个手工拿掉一次，再恢复）：
+
+| 拿掉 | 失败的测试 |
+|---|---|
+| 只从网关标为外部的工具读（`invoke` 里 `t.gatewayExt[tc.Tool]` 条件去掉） | `TestTheMarkerOfAToolThatTheGatewayDoesNotMarkExternalIsIgnored` |
+| id 校验（`ParseAuthorizationRequired` 不查字符集与长度） | `TestAConnectionIdThatIsNotAShortPatternIsIgnored`（地址、斜杠、空格、过长等各行） |
+| 不带地址（事件里加上标记里的 `url`） | `TestAnExternalToolThatSaysTheMemberHasNotAuthorizedIsAnnouncedOnceWithItsConnection`（事件形状）、`TestAnAddressInTheMarkerOrTheTextIsNeverInAnEvent` |
+| 事件与回答分两次写（`settleOutcome` 先单独 `AppendEvents`） | `TestAnExternalToolThatSaysTheMemberHasNotAuthorizedIsAnnouncedOnceWithItsConnection`、`TestAResumedRunWritesTheAuthorizationEventOnceAndReplayDoesNotRepeatIt` |
+
+**没有做的**：暂停与恢复（计划选择点 3 的 (b)）；Workspace 一侧的显示与链接；对真实的桥与第三方服务的验证。

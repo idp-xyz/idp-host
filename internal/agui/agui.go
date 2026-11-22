@@ -371,6 +371,10 @@ const (
 	// items are [kind (result|arguments), id (tool message | tool call), bytes, limit, shown].
 	CustomContextView = "idp.host/context.view"
 
+	// CustomAuthorizationRequired: a tool of an external service the member has not authorized answered with the marker that says
+	// so (D61): {toolCallId, tool, connection}. connection is an id; no address is ever carried. Written with the call's answer.
+	CustomAuthorizationRequired = "idp.host/authorization.required"
+
 	// CustomRunSources is written once when a run that has sources, or that was dropping entries, completes: the full list
 	// of the run's web sources with the counts of what was not recorded (D49).
 	CustomRunSources = "idp.host/run.sources"

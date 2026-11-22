@@ -113,6 +113,12 @@ type interruptionMetrics interface {
 	ToolInterrupted(resent bool, reason string)
 }
 
+// authorizationMetrics is implemented by a Metrics that counts the calls that answered "the member has not authorized this
+// service" (D61).
+type authorizationMetrics interface {
+	AuthorizationRequired()
+}
+
 // Harness runs claims.
 type Harness struct {
 	Store     Store
@@ -220,6 +226,7 @@ type turn struct {
 	visible    map[string]bool
 	stop       <-chan struct{}                      // closed when the worker was told to stop (D47); nil when there is no worker
 	external   map[string]bool                      // gateway tool -> it sends content outside the enterprise, by the operator's patterns or the gateway's marker, as listed now (D44, D51)
+	gatewayExt map[string]bool                      // the tools the gateway itself marks external, whatever the operator's patterns say (D61)
 	marked     map[string]bool                      // the part of external that is only the gateway's marker (D51): no pattern of the operator names it
 	repeatable map[string]bool                      // gateway tool -> its annotations as listed now say that calling it again does no harm (D47)
 	readOnly   map[string]bool                      // gateway tool -> the gateway lists it with readOnlyHint true: it may run beside other calls (D53)
@@ -287,7 +294,7 @@ func (h *Harness) Run(ctx context.Context, c *run.Claim) (err error) {
 		// D35: a run claimed after its deadline does nothing more, not even a call its owner confirmed
 		return h.fail(ctx, c, run.FailTimeout, timeoutMessage)
 	}
-	t := &turn{h: h, ctx: ctx, claim: c, rc: rc, def: rc.Release.Effective(), messages: rc.Messages, stop: run.StopChan(ctx), frontend: map[string]bool{}, visible: map[string]bool{}, external: map[string]bool{}, marked: map[string]bool{}, repeatable: map[string]bool{}, readOnly: map[string]bool{},
+	t := &turn{h: h, ctx: ctx, claim: c, rc: rc, def: rc.Release.Effective(), messages: rc.Messages, stop: run.StopChan(ctx), frontend: map[string]bool{}, visible: map[string]bool{}, external: map[string]bool{}, marked: map[string]bool{}, gatewayExt: map[string]bool{}, repeatable: map[string]bool{}, readOnly: map[string]bool{},
 		subagents: map[string]agent.EmbeddedSubagent{}, resources: rc.Release.OnDemandResources()}
 	if rc.Run.Input.ToolExecution == run.ToolExecutionCaller {
 		// ADR-0001 D19: the caller executes every tool. No gateway tools are offered (the release's
@@ -614,6 +621,7 @@ func (t *turn) prepareTools() error {
 			if byPattern := agent.MatchesTool(gw.ExternalTools, tool.Name); byPattern || tool.External {
 				t.external[tool.Name] = true
 				t.marked[tool.Name] = tool.External && !byPattern
+				t.gatewayExt[tool.Name] = tool.External
 			}
 			if tool.SafeToRepeat() {
 				t.repeatable[tool.Name] = true
@@ -1090,6 +1098,7 @@ func (t *turn) answerSourced(tc run.ToolCall, state, result, errText string, src
 type callOutcome struct {
 	state, result, errText string
 	src                    *run.SourceBatch // D49
+	authConn               string           // D61: the connection the member has not authorized, when the result says so
 	deliver                *agui.Event      // the file.delivered event of a delivering call
 	res                    *mcpclient.CallResult
 	ok                     bool  // the call went through and the tool did not report an error
@@ -1149,7 +1158,19 @@ func (t *turn) settleOutcome(tc run.ToolCall, o callOutcome) (bool, error) {
 			return false, err
 		}
 	}
-	return o.ok, t.answerSourced(tc, o.state, o.result, o.errText, o.src)
+	var events []agui.Event
+	if o.authConn != "" {
+		events = append(events, agui.Custom(agui.CustomAuthorizationRequired, map[string]any{"toolCallId": tc.ID, "tool": tc.Tool, "connection": o.authConn}))
+	}
+	if err := t.answerSourced(tc, o.state, o.result, o.errText, o.src, events...); err != nil {
+		return o.ok, err
+	}
+	if o.authConn != "" {
+		if m, ok := t.h.Metrics.(authorizationMetrics); ok {
+			m.AuthorizationRequired()
+		}
+	}
+	return o.ok, nil
 }
 
 // invoke sends a gateway call with the run's credential, once more with a renewed one when the gateway refuses it
@@ -1212,7 +1233,15 @@ func (t *turn) invoke(ctx context.Context, tc run.ToolCall, args json.RawMessage
 		h.Metrics.ToolCall(t.gateway.Name, outcome, h.Now().Sub(start))
 	}
 	if res.IsError {
-		return callOutcome{state: run.CallFailed, result: text, errText: "the tool reported an error", res: res}
+		o := callOutcome{state: run.CallFailed, result: text, errText: "the tool reported an error", res: res}
+		// D61: a tool the gateway marked external (the bridge's tools) says in the structured part that the member has not
+		// authorized its service. For any other tool the key means nothing. The model reads the tool's own text, as before.
+		if t.gatewayExt[tc.Tool] {
+			if conn, ok := run.ParseAuthorizationRequired(res.StructuredContent); ok {
+				o.authConn = conn
+			}
+		}
+		return o
 	}
 	o := callOutcome{state: run.CallDone, result: text, res: res, ok: true}
 	if delivers {

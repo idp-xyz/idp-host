@@ -251,7 +251,7 @@ func (s *Server) Handler() http.Handler {
 					if t.HandleAs != nil {
 						text, structured, isErr := t.HandleAs(bearer, args)
 						res := map[string]any{"content": []map[string]any{{"type": "text", "text": text}}, "isError": isErr, "_meta": info}
-						if structured != nil && !isErr {
+						if structured != nil {
 							res["structuredContent"] = structured
 						}
 						s.write(w, req.ID, res, nil, 200)

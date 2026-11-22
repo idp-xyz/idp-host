@@ -21,6 +21,7 @@ type Metrics struct {
 	Claims      *observability.CounterVec
 	memory      *observability.CounterVec
 	interrupted *observability.CounterVec // D47
+	authNeeded  *observability.CounterVec // D61
 }
 
 // NewMetrics registers the worker's instruments.
@@ -34,6 +35,7 @@ func NewMetrics(m *observability.Metrics) *Metrics {
 		runs:        m.Counter("idp_host_runs_finished_total", "Run turns by resulting status.", "status"),
 		guards:      m.Counter("idp_host_guard_events_total", "Content guard decisions by kind (input, output) and outcome.", "kind", "outcome"),
 		Claims:      m.Counter("idp_host_claims_total", "Claims by result (served, fenced).", "result"),
+		authNeeded:  m.Counter("idp_host_authorization_required_total", "Tool calls that answered that the member has not authorized the third-party service (D61)."),
 		interrupted: m.Counter("idp_host_tool_interruptions_total", "Tool calls found cut short (D47) by whether they were sent again (resent) and why (worker_stopped, deadline, canceled).", "resent", "reason"),
 		memory:      m.Counter("idp_host_memory_writes_total", "Memory records written to the CMI after completed runs, by outcome (written, replayed, rejected, failed, auth_failed, no_credential).", "outcome"),
 	}
@@ -70,3 +72,6 @@ func (m *Metrics) ToolInterrupted(resent bool, reason string) {
 
 // MemoryWrite counts one remember attempt by outcome (ADR-0001 D33).
 func (m *Metrics) MemoryWrite(outcome string) { m.memory.Inc(outcome) }
+
+// AuthorizationRequired implements the harness's authorizationMetrics (D61).
+func (m *Metrics) AuthorizationRequired() { m.authNeeded.Inc() }
