@@ -293,8 +293,47 @@ func (c *Client) ListTools(ctx context.Context, endpoint, bearer string) ([]Tool
 type ContentBlock struct {
 	Type     string `json:"type"`
 	Text     string `json:"text,omitempty"`
-	MimeType string `json:"mimeType,omitempty"`
-	URI      string `json:"uri,omitempty"`
+	MimeType string `json:"mimeType,omitempty"` // image, audio
+	URI      string `json:"uri,omitempty"`      // resource_link
+	Name     string `json:"name,omitempty"`     // resource_link
+	// Resource is the embedded resource of a "resource" block (D62): its uri, type and text sit inside this object.
+	Resource *EmbeddedResource `json:"resource,omitempty"`
+}
+
+// EmbeddedResource is what a "resource" block carries: text, or a base64 blob. The blob is not kept: only how many bytes it
+// holds, because it is never shown to a model (D62).
+type EmbeddedResource struct {
+	URI       string
+	MimeType  string
+	Text      string
+	IsBlob    bool
+	BlobBytes int
+}
+
+// UnmarshalJSON reads uri, mimeType, text and blob; the blob's base64 is measured and dropped.
+func (e *EmbeddedResource) UnmarshalJSON(b []byte) error {
+	var raw struct {
+		URI      string  `json:"uri"`
+		MimeType string  `json:"mimeType"`
+		Text     *string `json:"text"`
+		Blob     *string `json:"blob"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	*e = EmbeddedResource{URI: raw.URI, MimeType: raw.MimeType}
+	switch {
+	case raw.Text != nil:
+		e.Text = *raw.Text
+	case raw.Blob != nil:
+		e.IsBlob = true
+		n := len(*raw.Blob)
+		e.BlobBytes = n / 4 * 3
+		for i := n - 1; i >= 0 && i >= n-2 && (*raw.Blob)[i] == '='; i-- {
+			e.BlobBytes--
+		}
+	}
+	return nil
 }
 
 // CallResult is a tools/call result.
@@ -304,32 +343,69 @@ type CallResult struct {
 	IsError           bool            `json:"isError,omitempty"`
 }
 
-// Text renders the result for the model: text blocks concatenated, non-text blocks named, and the
-// structured content when there is no text. Bounded to limit bytes.
+// capped is a string builder that keeps at most max bytes (plus what finishing a rune needs) and counts all it was given, so
+// that a large resource text is cut as it is rendered and not copied whole (D62).
+type capped struct {
+	sb    strings.Builder
+	max   int // 0: keep everything
+	total int
+}
+
+func (c *capped) WriteString(s string) {
+	c.total += len(s)
+	if c.max <= 0 {
+		c.sb.WriteString(s)
+		return
+	}
+	if room := c.max + utf8.UTFMax - c.sb.Len(); room > 0 {
+		if room > len(s) {
+			room = len(s)
+		}
+		c.sb.WriteString(s[:room])
+	}
+}
+
+// Text renders the result for the model: text blocks concatenated, non-text blocks named, and the structured content when
+// there is no text. An embedded text resource is its header line "[resource <uri> <mimeType>]" and its text; a blob is only
+// named with its size (D62). Bounded to limit bytes (D40) as a whole.
 func (r *CallResult) Text(limit int) string {
-	var sb strings.Builder
+	c := &capped{max: limit}
 	for _, b := range r.Content {
 		switch b.Type {
 		case "text":
-			sb.WriteString(b.Text)
+			c.WriteString(b.Text)
 		case "image", "audio":
-			fmt.Fprintf(&sb, "[%s %s]", b.Type, b.MimeType)
-		case "resource_link", "resource":
-			fmt.Fprintf(&sb, "[%s %s]", b.Type, b.URI)
+			c.WriteString(fmt.Sprintf("[%s %s]", b.Type, b.MimeType))
+		case "resource_link":
+			if b.Name != "" {
+				c.WriteString(fmt.Sprintf("[resource_link %s %s]", b.URI, b.Name))
+			} else {
+				c.WriteString(fmt.Sprintf("[resource_link %s]", b.URI))
+			}
+		case "resource":
+			switch e := b.Resource; {
+			case e == nil:
+				c.WriteString("[resource]")
+			case e.IsBlob:
+				c.WriteString(fmt.Sprintf("[resource %s %s, %d bytes, binary content not shown]", e.URI, e.MimeType, e.BlobBytes))
+			default:
+				c.WriteString(fmt.Sprintf("[resource %s %s]\n", e.URI, e.MimeType))
+				c.WriteString(e.Text)
+			}
 		default:
-			fmt.Fprintf(&sb, "[%s]", b.Type)
+			c.WriteString(fmt.Sprintf("[%s]", b.Type))
 		}
 	}
-	if sb.Len() == 0 && len(r.StructuredContent) > 0 {
-		sb.Write(r.StructuredContent)
+	if c.total == 0 && len(r.StructuredContent) > 0 {
+		c.WriteString(string(r.StructuredContent))
 	}
-	s := sb.String()
-	if limit > 0 && len(s) > limit {
+	s := c.sb.String()
+	if limit > 0 && c.total > limit {
 		cut := limit
 		for cut > 0 && !utf8.RuneStart(s[cut]) {
 			cut--
 		}
-		s = s[:cut] + fmt.Sprintf("\n[truncated: %d of %d bytes shown; narrow the output (head, grep, a summary) to see the part you need]", cut, len(s))
+		s = s[:cut] + fmt.Sprintf("\n[truncated: %d of %d bytes shown; narrow the output (head, grep, a summary) to see the part you need]", cut, c.total)
 	}
 	return s
 }

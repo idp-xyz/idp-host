@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"idp-host/tests/fixtures/fakemcp"
 )
@@ -140,5 +142,46 @@ func TestListToolsReadsTheExternalMarkerAndNothingElseOfMeta(t *testing.T) {
 		if got := externalMarker(json.RawMessage(raw)); got != want {
 			t.Errorf("%q: %v", raw, got)
 		}
+	}
+}
+
+// D62: an embedded resource is read from its nested object; a blob is only measured; the limit cuts across it.
+func TestResultTextOfEmbeddedResources(t *testing.T) {
+	var r CallResult
+	body := `{"content":[{"type":"text","text":"downloaded (SHA abc)"},
+	  {"type":"resource","resource":{"uri":"repo://a/b/README.md","mimeType":"text/markdown","text":"# Title\nbody"}},
+	  {"type":"resource","resource":{"uri":"repo://a/b/x.bin","mimeType":"application/octet-stream","blob":"AAECAwQ="}},
+	  {"type":"resource_link","uri":"repo://a/c","name":"c"},{"type":"resource_link","uri":"repo://a/d"}]}`
+	if err := json.Unmarshal([]byte(body), &r); err != nil {
+		t.Fatal(err)
+	}
+	want := "downloaded (SHA abc)[resource repo://a/b/README.md text/markdown]\n# Title\nbody" +
+		"[resource repo://a/b/x.bin application/octet-stream, 5 bytes, binary content not shown]" +
+		"[resource_link repo://a/c c][resource_link repo://a/d]"
+	if got := r.Text(0); got != want {
+		t.Fatalf("%q", got)
+	}
+	if strings.Contains(r.Text(0), "AAECAwQ") {
+		t.Error("the blob's base64 is shown")
+	}
+	// the limit counts the header and the text as one, cuts at a rune boundary and says how much there was
+	r = CallResult{Content: []ContentBlock{{Type: "resource", Resource: &EmbeddedResource{URI: "u://1", MimeType: "text/plain", Text: strings.Repeat("é", 50)}}}}
+	total := len("[resource u://1 text/plain]\n") + 100
+	got := r.Text(40)
+	if !strings.HasPrefix(got, "[resource u://1 text/plain]\n") || !strings.Contains(got, fmt.Sprintf(" of %d bytes", total)) || !utf8.ValidString(got) {
+		t.Fatalf("%q", got)
+	}
+	if body := got[:strings.Index(got, "\n[truncated")]; len(body) > 40 {
+		t.Errorf("%d bytes shown, limit 40", len(body))
+	}
+	// a resource without its object, and a blob without padding
+	r = CallResult{Content: []ContentBlock{{Type: "resource"}}}
+	if r.Text(0) != "[resource]" {
+		t.Error(r.Text(0))
+	}
+	var e EmbeddedResource
+	_ = json.Unmarshal([]byte(`{"uri":"u","blob":"AAEC"}`), &e)
+	if !e.IsBlob || e.BlobBytes != 3 {
+		t.Errorf("%+v", e)
 	}
 }

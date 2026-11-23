@@ -23,6 +23,9 @@ type Tool struct {
 	// that a test can send a marker that is not the boolean true.
 	Meta   map[string]any
 	Handle func(args map[string]any) (text string, isError bool)
+	// Content, when set, gives the result's content blocks as they are, after the text Handle returns (a "resource" block
+	// as GitHub's server sends a file, for one).
+	Content func(args map[string]any) []map[string]any
 	// Structured, when set, gives the result's structuredContent.
 	Structured func(args map[string]any) any
 	// HandleAs, when set, answers instead of Handle and Structured with the caller's bearer too, for a tool whose answer
@@ -262,6 +265,9 @@ func (s *Server) Handler() http.Handler {
 						text, isErr = fixed, false
 					}
 					res := map[string]any{"content": []map[string]any{{"type": "text", "text": text}}, "isError": isErr, "_meta": info}
+					if t.Content != nil {
+						res["content"] = append(res["content"].([]map[string]any), t.Content(args)...)
+					}
 					if t.Structured != nil && !isErr {
 						res["structuredContent"] = t.Structured(args)
 					}

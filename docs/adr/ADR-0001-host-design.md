@@ -1531,3 +1531,35 @@ strata serve: prompt 20096 tokens = 2491 reused + 17605 read in 4364 ms (4034.5 
 | 事件与回答分两次写（`settleOutcome` 先单独 `AppendEvents`） | `TestAnExternalToolThatSaysTheMemberHasNotAuthorizedIsAnnouncedOnceWithItsConnection`、`TestAResumedRunWritesTheAuthorizationEventOnceAndReplayDoesNotRepeatIt` |
 
 **没有做的**：暂停与恢复（计划选择点 3 的 (b)）；Workspace 一侧的显示与链接；对真实的桥与第三方服务的验证。
+
+## 44. D62：工具结果里内嵌的资源（`resource` 块）按文字交给模型，二进制只写名字与大小（2026-11-23 决策与实施，修订 D40 对"非文字块"的写法；契约不变）
+
+沿用 D27（工具结果是不可信内容，进模型前包成 `<untrusted>`）、D40（一个工具结果最多给模型 `ToolResultBytes` 字节，在字符边界截断并带说明）、D49（来源只读 `structuredContent`）。
+
+**起因**（对真实 GitHub 托管 MCP 服务的验证）：`get_file_contents` 把文件放在内嵌资源块里，紧挨着一个短的文字块：`{"type":"resource","resource":{"uri":"repo://…","mimeType":"text/markdown","text":"…"}}`，二进制文件是 `"blob":"<base64>"`。`mcpclient.CallResult.Text` 从块的顶层读 `uri`，而 `uri` 在嵌套的对象里，所以模型读到"successfully downloaded text file (SHA …)[resource ]"，文件本身从未到过它。
+
+| # | 决策 | 理由 |
+|---|---|---|
+| D62-1 | **读 `resource` 块里嵌套的对象**（`uri`、`mimeType`、`text`、`blob`）：`ContentBlock.Resource`（`EmbeddedResource`，自己的 `UnmarshalJSON`）。`resource_link` 的 `uri` 在顶层，照旧，另读 `name` | 规范里 `resource` 与 `resource_link` 的形状不同 |
+| D62-2 | **文字资源**交给模型的是一行头 `[resource <uri> <mimeType>]`、换行、再是它的文字；头与文字和其他文字块一样计入 D40 的上限：整个结果合在一起，在字符边界截断，说明里的"共多少字节"是整个结果的 | 模型要知道这段文字是哪个文件、什么类型；上限是对一个工具结果的，不因块的种类而变 |
+| D62-3 | **二进制资源**：`[resource <uri> <mimeType>, <n> bytes, binary content not shown]`，`n` 是 base64 解码后的字节数；**base64 不进模型，也不留在内存里**（解码对象时量一下就丢掉） | 模型读不了 base64，它只会占窗口；也不应在 HOST 里多留一份 |
+| D62-4 | **`resource_link`**：`[resource_link <uri> <name>]`，没有 `name` 就没有最后一段；没有嵌套对象的 `resource` 块是 `[resource]` | 原来写成 `[resource_link <uri>]`，保留并加上 `name` |
+| D62-5 | **有界**：`Text(limit)` 用一个只保留 `limit` 字节（加完成一个字符所需）的写入器边渲染边数总长，所以一个远大于上限的资源文字不会在渲染里再复制一份。JSON 解码本身仍把收到的整个正文读进内存（传输层已有的上限管它，没有改）。`structuredContent` 在没有任何内容块文字时才充当文字的规则不变（判断改为"渲染出的总长为 0"，与原来的"拼出的串为空"相同） | 上限是给模型的，不是给内存的；不改传输 |
+| D62-6 | **包装不需要改，且资源不绕过它**：包成 `<untrusted source="tool_result">` 在 `guardedMessages` 里对每一条已存的工具消息做，而存下的就是 `Text` 的结果；资源文字在这条消息里，所以同样被包、被扫描（D27）。测试断言包装在，并且资源里的"IGNORE ALL PREVIOUS INSTRUCTIONS"在包装之内 | 一条路径，没有例外 |
+
+**还有谁读 `ContentBlock`**：只有 `CallResult.Text`。它的调用方：`invoke`（给模型的文字，受上面影响）、`budget.go` 里 `listedFiles`（对 `Text(1<<20)` 的每一行找"数字 路径"，仅在 `structuredContent` 没有 `files` 时；资源文字可能多出几行，只有恰为"整数 空白 一个词"的行才算，这是兜底路径、原来对任何文字块也一样）与 `exitCode`（`Text(80)` 以"exit code %d"开头，资源块排在文字块之后，不影响）。来源（D49）、文件交付（D37 的 `deliveredFile`）、子智能体读的是 `structuredContent`，不读内容块，不受影响。
+
+**契约**：不变（工具结果的渲染是 HOST 给模型的内容，不在 API 契约里）。
+
+**测试**：`internal/mcpclient` `TestResultTextOfEmbeddedResources`（嵌套读取、头、二进制只量大小、`resource_link` 有无 `name`、在 UTF-8 边界上的 D40 截断与总字节数、缺对象的块、无填充的 base64）；`internal/harness/resource_test.go`：`TestAnEmbeddedTextResourceIsWhatTheModelReadsAndIsWrappedAsUntrusted`、`TestAnEmbeddedBinaryResourceIsNamedAndItsBase64IsNeverShown`、`TestTheD40LimitCutsAcrossAnEmbeddedResource`（网关替身 `fakemcp.Tool.Content` 现在能返回任意内容块）。
+
+**拿掉一个控制、看测试失败**（手工拿掉一次，再恢复）：
+
+| 拿掉 | 失败的测试 |
+|---|---|
+| 不读嵌套对象（回到只有顶层 URI） | `TestResultTextOfEmbeddedResources`；三个 harness 测试 |
+| 二进制当文字（base64 进模型） | `TestResultTextOfEmbeddedResources`、`TestAnEmbeddedBinaryResourceIsNamedAndItsBase64IsNeverShown` |
+| 资源文字不计入上限 | `TestResultTextOfEmbeddedResources`、`TestTheD40LimitCutsAcrossAnEmbeddedResource` |
+| 没有头 | `TestResultTextOfEmbeddedResources`、`TestAnEmbeddedTextResourceIsWhatTheModelReadsAndIsWrappedAsUntrusted` |
+
+**没有做的**：包装本身没有单独拿掉来试（它不是这一条的代码，由既有的包装测试覆盖；新测试只断言资源在包装里）；没有在真实的 GitHub 上重新验证；图片与音频块仍只写类型（`[image image/png]`），没有改。
