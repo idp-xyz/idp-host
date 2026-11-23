@@ -136,3 +136,39 @@ func TestWebCiteFlowAddsAnInventedCitationAndNothingElse(t *testing.T) {
 		t.Fatalf("%q %q", plain, cite)
 	}
 }
+
+func TestCallFlowCallsTheNamedToolWithTheGivenArguments(t *testing.T) {
+	tools := []string{"github__get_me", "github__get_file_contents", "web__web_search"}
+	user := Message{Role: "user", Content: `call: get_file_contents {"owner":"idp-xyz","repo":"idp-mcp-bridge","path":"README.md"}`}
+	t1 := DefaultScript([]Message{user}, tools)
+	if len(t1.ToolCalls) != 1 || t1.ToolCalls[0].Name != "github__get_file_contents" || t1.ToolCalls[0].Args != `{"owner":"idp-xyz","repo":"idp-mcp-bridge","path":"README.md"}` {
+		t.Fatalf("first turn: %+v", t1)
+	}
+	// no arguments: {}; a full name matches as well as the suffix
+	if got := DefaultScript([]Message{{Role: "user", Content: "call: get_me"}}, tools); len(got.ToolCalls) != 1 || got.ToolCalls[0].Name != "github__get_me" || got.ToolCalls[0].Args != `{}` {
+		t.Fatalf("%+v", got)
+	}
+	if got := DefaultScript([]Message{{Role: "user", Content: "call: github__get_me {}"}}, tools); len(got.ToolCalls) != 1 || got.ToolCalls[0].Name != "github__get_me" {
+		t.Fatalf("%+v", got)
+	}
+	// the result is reported as it came, an error as it is
+	conv := []Message{user, {Role: "assistant", ToolCalls: t1.ToolCalls}, {Role: "tool", Content: `# idp-mcp-bridge`}}
+	if got := DefaultScript(conv, tools); got.Text != "Result: # idp-mcp-bridge" || len(got.ToolCalls) != 0 {
+		t.Fatalf("%+v", got)
+	}
+	conv[2].Content = "error: the member has not connected"
+	if got := DefaultScript(conv, tools); got.Text != "error: the member has not connected" {
+		t.Fatalf("%+v", got)
+	}
+	// a tool that is not offered, and arguments that are not an object, are said and not called
+	if got := DefaultScript([]Message{{Role: "user", Content: "call: delete_repo {}"}}, tools); len(got.ToolCalls) != 0 || !strings.Contains(got.Text, "not offered") {
+		t.Fatalf("%+v", got)
+	}
+	if got := DefaultScript([]Message{{Role: "user", Content: "call: get_me [1]"}}, tools); len(got.ToolCalls) != 0 || !strings.Contains(got.Text, "not a JSON object") {
+		t.Fatalf("%+v", got)
+	}
+	// "call" in prose is not the flow
+	if got := DefaultScript([]Message{{Role: "user", Content: "please call get_me"}}, tools); len(got.ToolCalls) != 0 {
+		t.Fatalf("%+v", got)
+	}
+}

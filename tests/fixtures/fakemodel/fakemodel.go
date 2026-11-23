@@ -219,6 +219,46 @@ func webFlow(messages []Message, has func(string) bool, toolName func(string) st
 	return Turn{Text: "Result: " + last.Content}, true
 }
 
+// the call flow: "call: <tool> <JSON arguments>" calls the offered tool whose name is <tool> or ends in "__<tool>" with exactly those
+// arguments (none: {}), then reports the tool's result text as "Result: <text>", an error as it is. For acceptances against a real third
+// party (platform R1), where the arguments are the point: the model double does not invent them.
+var callRE = regexp.MustCompile(`(?s)^call:\s*([A-Za-z0-9_.-]+)\s*(.*?)\s*$`)
+
+func callFlow(messages []Message, has func(string) bool, toolName func(string) string) (Turn, bool) {
+	var m []string
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" {
+			m = callRE.FindStringSubmatch(messages[i].Content)
+			break
+		}
+	}
+	if m == nil {
+		return Turn{}, false
+	}
+	last := messages[len(messages)-1]
+	switch last.Role {
+	case "user":
+		if !has(m[1]) {
+			return Turn{Text: "The tool " + m[1] + " is not offered."}, true
+		}
+		args := m[2]
+		if args == "" {
+			args = "{}"
+		}
+		var v map[string]any
+		if json.Unmarshal([]byte(args), &v) != nil {
+			return Turn{Text: "The arguments are not a JSON object: " + args}, true
+		}
+		return Turn{Reasoning: "the call the user asked for", ToolCalls: []Call{{Name: toolName(m[1]), Args: args}}}, true
+	case "tool":
+		if strings.HasPrefix(last.Content, "error") {
+			return Turn{Text: last.Content}, true
+		}
+		return Turn{Text: "Result: " + last.Content}, true
+	}
+	return Turn{}, false
+}
+
 func firstRunes(s string, n int) string {
 	if r := []rune(s); len(r) > n {
 		return string(r[:n])
@@ -319,6 +359,9 @@ func DefaultScript(messages []Message, tools []string) Turn {
 		return t
 	}
 	if t, ok := webFlow(messages, has, toolName); ok {
+		return t
+	}
+	if t, ok := callFlow(messages, has, toolName); ok {
 		return t
 	}
 	switch last.Role {
