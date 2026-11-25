@@ -929,8 +929,14 @@ func TestHostEndToEnd(t *testing.T) {
 			"tools": []any{tool}, "context": []any{}, "forwardedProps": props}
 		types, _, _ = e.sse("POST", "/ag-ui/agents/assistant", "carol", in)
 		msgs := e.must(200, "GET", "/v1/threads/eer-turn-2/messages", "carol", nil)["messages"].([]any)
-		if types[len(types)-1] != agui.EventRunFinished || !strings.Contains(msgs[len(msgs)-1].(map[string]any)["content"].(string), "SZX") {
+		// the answer is the model's (D47-14): the last message is the assistant's, not the caller's own tool message, and the
+		// run has one step and no tool call of its own
+		lastMsg := msgs[len(msgs)-1].(map[string]any)
+		if types[len(types)-1] != agui.EventRunFinished || lastMsg["role"] != "assistant" || !strings.HasPrefix(lastMsg["content"].(string), "Answer: ") || !strings.Contains(lastMsg["content"].(string), "SZX") {
 			t.Fatalf("%v %v", types, msgs)
+		}
+		if second := e.must(200, "GET", "/v1/runs/eer-run-2", "carol", nil); second["stepCount"] != 1.0 || second["status"] != run.StatusCompleted {
+			t.Fatalf("%v", second)
 		}
 		// replaying the same run id returns the same recorded run (an EER activity retry)
 		before := e.model.Calls()

@@ -386,7 +386,10 @@ func (t *turn) repairLastTurn() (string, error) {
 	for _, call := range msg.ToolCalls {
 		tc, ok := records[call.ID]
 		switch {
-		case !ok:
+		case !ok && !answered[call.ID]:
+			// D47-14: a call that already has its tool message is not a half-written step. In caller mode the thread is
+			// the caller's own history (it ran the tool and answered it in this request): HOST never recorded that call in
+			// this run and must not create it again or run it.
 			missing = append(missing, call)
 		case !answered[call.ID] && finalState(tc.State) && !tc.FinishedAt.IsZero():
 			content := tc.Result

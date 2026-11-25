@@ -592,3 +592,33 @@ func TestInterruptedToolCallsAreCountedByResentAndReason(t *testing.T) {
 func (c *crashStore) answerKilled(id string) bool {
 	return c.dieOnToolAnswer != "" && c.memStore.calls[id] != nil && c.memStore.calls[id].Tool == c.dieOnToolAnswer
 }
+
+// D47-14: in caller mode the thread is the caller's history. It ends with an assistant message whose tool call the
+// caller ran and answered with a tool message, and HOST has no record of that call in this run. That is not a half-written
+// step: the call is not created or run, the model is asked, and the run ends with its answer. (It was repaired as if its
+// worker had died between the message and the records, so the run ended at once without a model call.)
+func TestACallerThatAnswersItsOwnToolCallGetsAnswerFromTheModel(t *testing.T) {
+	e := setup(t)
+	thread := append(user("please sum"),
+		agui.Message{ID: "a1", Role: agui.RoleAssistant, ToolCalls: []agui.ToolCall{{ID: "call_x", Type: "function", Function: agui.FunctionCall{Name: "eer_lookup", Arguments: `{"id":"p-1"}`}}}},
+		agui.Message{ID: "t1", Role: agui.RoleTool, ToolCallID: "call_x", Content: `{"status":"completed","result":{"sum":42}}`})
+	m := newMem(def(), thread, run.Input{ToolExecution: run.ToolExecutionCaller,
+		Tools: []agui.Tool{{Name: "eer_lookup", Description: "look up", Parameters: []byte(`{"type":"object"}`)}}})
+	m.cred = ""
+	e.h.Store = m
+	if err := e.h.Run(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	if e.model.Calls() != 1 {
+		t.Errorf("the model was asked %d times; want once", e.model.Calls())
+	}
+	if len(m.calls) != 0 || len(e.mcp.Calls()) != 0 {
+		t.Errorf("the caller's answered call was created or run: rows %+v, gateway calls %v", m.calls, e.mcp.Calls())
+	}
+	if m.status != run.StatusCompleted || !strings.HasPrefix(m.last().Content, "Result: ") {
+		t.Errorf("run status %s (%s), last %+v", m.status, m.failCode, m.last())
+	}
+	if n := countEvents(m, agui.EventToolCallStart); n != 0 {
+		t.Errorf("%d TOOL_CALL_START events; want none", n)
+	}
+}
