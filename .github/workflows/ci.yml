@@ -20,6 +20,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: Third-party images are named by the mirror (platform releases/mirror-images.yaml), not by their source
+        run: |
+          if git grep -nE '(public\.ecr\.aws|quay\.io|docker\.io)/|ghcr\.io/(aquasecurity|cloudnative-pg|huggingface)/' -- . ':!*.md' ':!*.sum' | grep -v 'mirror:upstream'; then
+            echo "an image is named by its source: use ghcr.io/idp-xyz/mirror:<tag> (python3 tools/mirror_images.py plan, in the platform repository)" >&2; exit 1
+          fi
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -36,7 +41,7 @@ jobs:
           bash deploy/fixtures/build-fakemodel.sh idp-host-fakemodel:ci
       - name: Image vulnerabilities (trivy, HIGH and CRITICAL with a fix fail the build)
         run: |
-          bash deploy/pull-image.sh ghcr.io/aquasecurity/trivy:0.76.2
-          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock ghcr.io/aquasecurity/trivy:0.76.2 image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 idp-host:ci
+          bash deploy/pull-image.sh ghcr.io/idp-xyz/mirror:ghcr.io__aquasecurity__trivy__0.76.2
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock ghcr.io/idp-xyz/mirror:ghcr.io__aquasecurity__trivy__0.76.2 image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 idp-host:ci
       - name: Reference harness worker is executable
         run: python3 -I deploy/harness-worker/worker.py --help > /dev/null

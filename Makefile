@@ -1,5 +1,5 @@
 # idp-host build and test entry points.
-PG_IMAGE ?= public.ecr.aws/docker/library/postgres:17-alpine
+PG_IMAGE ?= ghcr.io/idp-xyz/mirror:public.ecr.aws__docker__library__postgres__17-alpine
 PG_NAME  ?= idp-host-test-pg
 
 .PHONY: build test vet test-integration pg-up pg-down

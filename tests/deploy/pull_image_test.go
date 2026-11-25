@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	pullImage = "public.ecr.aws/docker/library/postgres:17-alpine"
+	pullImage = "ghcr.io/idp-xyz/mirror:public.ecr.aws__docker__library__postgres__17-alpine"
 	pullLimit = "Error response from daemon: error from registry: Data limit exceeded"
 )
 

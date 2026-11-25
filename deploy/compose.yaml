@@ -22,7 +22,7 @@ volumes:
 
 services:
   postgres:
-    image: ${IDP_PG_IMAGE:-public.ecr.aws/docker/library/postgres:17-alpine}
+    image: ${IDP_PG_IMAGE:-ghcr.io/idp-xyz/mirror:public.ecr.aws__docker__library__postgres__17-alpine}
     networks: [data]
     environment:
       POSTGRES_PASSWORD: ${IDP_PG_OWNER_PASSWORD:?run deploy/e2e.sh}
@@ -95,7 +95,7 @@ services:
   # (deploy/keycloak/realm.py generates the realm). Issuer = the URL clients use
   # (http://127.0.0.1:7080/realms/idp); containers reach it as keycloak:7080 (backchannel). TEST DOUBLE.
   keycloak:
-    image: ${IDP_KEYCLOAK_IMAGE:-quay.io/keycloak/keycloak:26.8.1}
+    image: ${IDP_KEYCLOAK_IMAGE:-ghcr.io/idp-xyz/mirror:quay.io__keycloak__keycloak__26.8.1}
     profiles: [oidc]
     command: [start-dev, --import-realm, --features, 'token-exchange-standard,token-exchange-delegation,parameterized-scopes']
     networks: [edge, upstream]
