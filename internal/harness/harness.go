@@ -268,6 +268,7 @@ type turn struct {
 	cmiLoaded  bool                                 // cmiCred was asked of the store
 	cmiFailed  bool                                 // the member's CMI credential could not be renewed: no more calls this turn (D68)
 	kTools     []string                             // the knowledge tools this turn offers (setupKnowledge)
+	outSchema  map[string]json.RawMessage           // the outputSchema each outward tool listed, pinned for the turn (D71)
 }
 
 // Formats a gateway tool's input schema gives a property that takes a member's file (D37): the model writes
@@ -644,6 +645,12 @@ func (t *turn) prepareTools() error {
 				t.external[tool.Name] = true
 				t.marked[tool.Name] = tool.External && !byPattern
 				t.gatewayExt[tool.Name] = tool.External
+				if len(tool.OutputSchema) > 0 {
+					if t.outSchema == nil {
+						t.outSchema = map[string]json.RawMessage{}
+					}
+					t.outSchema[tool.Name] = tool.OutputSchema
+				}
 			}
 			if tool.SafeToRepeat() {
 				t.repeatable[tool.Name] = true
@@ -1183,19 +1190,34 @@ func (t *turn) answerCited(tc run.ToolCall, build func(first int, tree *run.Tree
 // and the result is recorded as having no numbers; otherwise the text is made by run.RenderWeb with the HOST's numbers.
 func (t *turn) answerWeb(tc run.ToolCall, o callOutcome, events []agui.Event) error {
 	wc := *o.web
-	if wc.Declared == 0 {
-		ev := agui.Custom(agui.CustomCitationsUnnumbered, map[string]any{"toolCallId": tc.ID, "tool": tc.Tool, "reason": "no_structured_citations"})
-		return t.answerSourced(tc, o.state, o.result, o.errText, &run.SourceBatch{Unnumbered: 1}, append(append([]agui.Event(nil), events...), ev)...)
-	}
 	limit := t.limits.ToolResultBytes
+	// the text is written from the structure when it is valid against the schema the tool listed; idp-web's own text is then not read
+	st, reason := run.ParseStructured(o.schema, o.structured)
+	if st == nil && wc.Declared == 0 {
+		ev := agui.Custom(agui.CustomCitationsUnnumbered, map[string]any{"toolCallId": tc.ID, "tool": tc.Tool, "reason": "no_structured_citations", "structure": reason})
+		return t.answerSourced(tc, o.state, o.result, o.errText, &run.SourceBatch{Unnumbered: 1}, append(events, ev)...)
+	}
 	return t.answerCited(tc, func(first int, tree *run.TreeNumbers) run.Answer {
-		r := run.RenderWeb(o.result, wc, first, tree.KnownWeb, limit)
+		var r run.WebRendered
+		if st != nil {
+			r = st.Render(tc.Tool, first, tree.KnownWeb, limit)
+		} else {
+			r = run.RenderWeb(o.result, wc, first, tree.KnownWeb, limit)
+			r.Render = run.RenderText
+		}
 		nums := make([]map[string]any, 0, len(r.Sources))
 		for _, s := range r.Sources {
 			nums = append(nums, map[string]any{"n": s.N, "webN": s.WebN})
 		}
-		ev := agui.Custom(agui.CustomCitationsNumbered, map[string]any{"toolCallId": tc.ID, "tool": tc.Tool, "mode": r.Mode, "numbers": nums, "taken": r.Used, "notShown": r.NotShown, "invalid": wc.Invalid})
+		info := map[string]any{"toolCallId": tc.ID, "tool": tc.Tool, "render": r.Render, "mode": r.Mode, "numbers": nums, "taken": r.Used, "notShown": r.NotShown, "invalid": wc.Invalid}
+		if st == nil {
+			info["structure"] = reason // why the text was rewritten instead
+		}
+		ev := agui.Custom(agui.CustomCitationsNumbered, info)
 		src := &run.SourceBatch{Items: r.Sources, Invalid: wc.Invalid, Excess: wc.Excess + r.NotShown}
+		if st != nil {
+			src.Invalid = 0
+		}
 		return t.buildAnswer(tc, o.state, r.Text, o.errText, src, r.Used, append(append([]agui.Event(nil), events...), ev)...)
 	})
 }
@@ -1204,6 +1226,8 @@ func (t *turn) answerWeb(tc run.ToolCall, o callOutcome, events []agui.Event) er
 // group's committer write it the same way.
 type callOutcome struct {
 	state, result, errText string
+	structured             json.RawMessage // the result's structuredContent, and the outputSchema the tool listed for it (D71)
+	schema                 json.RawMessage
 	web                    *run.WebCitations // D71: the structured citations of a result of an outward tool, which the HOST numbers
 	authConn               string            // D61: the connection the member has not authorized, when the result says so
 	deliver                *agui.Event       // the file.delivered event of a delivering call
@@ -1375,6 +1399,7 @@ func (t *turn) invoke(ctx context.Context, tc run.ToolCall, args json.RawMessage
 	if t.external[tc.Tool] {
 		wc := run.ParseWebCitations(res.StructuredContent)
 		o.web = &wc
+		o.structured, o.schema = res.StructuredContent, t.outSchema[tc.Tool]
 	}
 	return o
 }

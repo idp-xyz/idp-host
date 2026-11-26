@@ -354,7 +354,7 @@ func TestRunSourcesOnPostgres(t *testing.T) {
 		for _, s := range inParent {
 			if s["cited"] == true {
 				cited++
-				if s["n"] != want {
+				if s["webN"] != want { // D70: n is the HOST's, webN idp-web's (the number the researcher's gateway gave the page)
 					t.Errorf("%v", s)
 				}
 			}

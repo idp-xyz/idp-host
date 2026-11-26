@@ -185,3 +185,26 @@ func TestResultTextOfEmbeddedResources(t *testing.T) {
 		t.Errorf("%+v", e)
 	}
 }
+
+// D71: a full-size read of idp-web is a part of a page of 12 KiB that is in the result twice (the text content and the structured
+// text). Even where every byte is a control character, which JSON writes as six, the result is under 200 KiB, far under what the
+// HOST reads (MaxResponse, 8 MiB) and under the gateway's cap on an external answer (1 MiB by default, idp-mcp
+// DefaultExternalMaxResult): nothing rejects it, and the limit of the model's text is D40's, applied to what the HOST renders.
+func TestAFullSizeReadOfIdpWebIsAccepted(t *testing.T) {
+	page := strings.Repeat("\x01", 12<<10)
+	fake := fakemcp.New()
+	fake.Tools = []fakemcp.Tool{{Name: "web_fetch", InputSchema: `{"type":"object"}`, Handle: func(map[string]any) (string, bool) { return "", false },
+		HandleAs: func(string, map[string]any) (string, any, bool) {
+			return "[1] t\n\n" + page, map[string]any{"citations": []any{map[string]any{"n": 1, "text": page}}}, false
+		}}}
+	srv := httptest.NewServer(fake.Handler())
+	defer srv.Close()
+	c := &Client{HTTP: NewHTTPClient(5*time.Second, nil), Info: ClientInfo{Name: "idp-host", Version: "test"}}
+	res, err := c.CallTool(context.Background(), srv.URL+"/mcp", "", "web_fetch", nil)
+	if err != nil || res.IsError || len(res.StructuredContent) < 12<<10 || len(res.Text(0)) < 12<<10 {
+		t.Fatalf("%v %d", err, len(res.StructuredContent))
+	}
+	if 2*(12<<10)*6 >= MaxResponse || 2*(12<<10)*6 >= 1<<20 {
+		t.Error("the worst case of a full-size read is over a cap")
+	}
+}

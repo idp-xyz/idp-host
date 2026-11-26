@@ -212,6 +212,10 @@ type Tool struct {
 	Title       string          `json:"title,omitempty"`
 	Description string          `json:"description,omitempty"`
 	InputSchema json.RawMessage `json:"inputSchema"`
+	// OutputSchema is the JSON Schema the tool declares for the structuredContent of its results (MCP 2025-06-18 and later), as the
+	// gateway listed it. The HOST pins it for the turn and renders a web tool's result from the structure only when the structure is
+	// valid against it (D71). Nothing else reads it.
+	OutputSchema json.RawMessage `json:"outputSchema,omitempty"`
 	// Annotations are the gateway's hints about the tool as it lists it now (MCP tool annotations). The HOST reads
 	// readOnlyHint and idempotentHint to decide whether a call interrupted mid-way may be sent again (D47); a tool that
 	// lists none is treated as neither.

@@ -1845,3 +1845,31 @@ KB8 之后发现的问题（D69-5 的"调查"）：知识条目的 `[n]` 由 HOS
 **没有证明的（如实写下）：**(1) 续期期间不持行锁、先锁持有者再锁自己：测试里有"续期进行时两行都 `NOWAIT` 拿得到、子运行的心跳不被挡住"，但没有拿掉它们再看失败（要在事务里调续期函数才能拿掉）；与 D69-13 一样，只靠代码与事务都很短。(2) `RunCredential` 给令牌打上 `Shared`、harness 在有 `RenewRunCredential` 的存储上走单飞续期：harness 的测试用自己的替身，PostgreSQL 的测试直接调存储，两者之间的连线只被 `TestHostEndToEnd` 的"session-bound-delegation"（根运行自己的续期经租约与比较并交换）覆盖，子运行的 harness 路径没有端到端测试。(3) 结束时清 `credential_ref`：没有测试。(4) 一个运行读到"别的子 agent 才读到的号"（D74 的弱点）：只写在上面，没有测试去证明它通过。(5) 并发取号只在存储层压过（36 个并发的 `AnswerCited`，三个子运行的认领），harness 里并行的工具调用用的是内存替身。(6) 锁的持有时间（一个事务）没有测量。
 
 **平台验收还要查：**PATH M5（网页来源与引用核对）：`sources[].n` 是 HOST 的号、带 `kind: web` 与 `webN`，回答里的 `[n]` 与来源表对得上；没有网页工具的助手回答里的 `[3]` 仍不产生来源与核对。PATH M2–M4 的结果文字里没有 idp-web 的号。PATH P3：`context.resolved`、`context.package` 的 `firstIndex` 仍接续。**建议新增一步**（M5 之后或 P3 之后）：同时开了知识工具与网页工具的发布件，一次运行里先查知识、再搜网页、再查知识：模型读到的 `[n]` 连续且没有 idp-web 的号，`run.sources` 一张表、两种 `kind`、`unverifiedCitations` 只含编造的号；再加一个委派到两个子 agent 的运行，检查两个子 agent 的号不重、父运行引用子 agent 回答里的号不被报为无法核对，子运行 `credential_ref` 指向根运行、`credential` 为空。**Workspace 要改的：**认 `kind` 与知识来源（没有 `url`），否则它今天把知识来源整条丢掉。**idp-web 要改的（后续，不是这次的前提）：**结构化引用里给出 `excerpt`、`ref`、`published` 与页面文字，HOST 才能完全由结构化部分写结果。
+
+**D71 修订（2026-11-26，idp-web 的 D34 之后，决策人委托维护方决定）：从结构写文字，文字改写只做退路。** idp-web（本地分支 `cite` f1d1681）现在给 `web_search`、`web_fetch`、`web_open_url` 声明 MCP `outputSchema`，结构化结果带齐文字所说的一切：搜索条目 `{n, title, url, ref, published?, excerpt?}`（列表总在，没有结果是 `[]`）；读取条目 `{n, title, url, finalUrl?, fetchedAt, rendered?, sha256, text, start, end, total, nextOffset?, truncated, notice?(no_text | offset_past_end), pdf?{pages, pagesRead, cut}, ref?}`（`web_open_url` 没有 `ref`；读取没有 `published`），文字内容不变，网关原样转发、不按 `outputSchema` 校验。因此：
+
+1. **有效的结构就是写文字的依据。** HOST 在每个回合的 `tools/list` 里读到工具的 `outputSchema`（`mcpclient.Tool.OutputSchema`，回合内钉住，`turn.outSchema`），对外工具的成功结果的 `structuredContent` 按它校验（`run.ParseStructured`，JSON Schema 2020-12，编译结果按模式文本缓存）；有效，且每个条目 HOST 都能记（地址是 http/https，编号为正、不重复；见 D49），就由 `StructuredWeb.Render` 写出模型读到的文字：搜索每个来源一块 `[N] 标题 / address / ref / published / excerpt`，读取一个头行 `[N] 标题 [重定向到…] (PDF 页数与只读了前几页; rendered; bytes 起–止 of 总长; the rest: <工具名> with offset X)`，接着 `address`、`ref`，空行，然后正文；`notice` 写成"没有文字"或"这个偏移已超出页面文字"；没有结果写 `no results`。**idp-web 的文字完全不读**，所以它的 `[n]` 和别的任何东西都到不了模型；号用 HOST 的（D70），idp-web 的 `n` 只进来源表的 `webN`。同一个地址先搜后读、或分段读，沿用同一个 HOST 号。
+2. **不可信字段都清洗并中和（D72）。** 标题、摘录、日期、`ref`、重定向地址压成一行（摘录里的空行、假的"来源块"于是没有地方存身）；页面正文保留换行；所有字段去掉控制字符、双向与零宽等格式字符（含 U+2028/2029）、无效 UTF-8；方括号里的数写成 `⟦n⟧`。
+3. **D40 管的是 HOST 写给模型的文字，不是原始结果。** 一块写出来会超过上限就不显示、不编号（记入 `droppedOverLimit`），单独一块已超过的被截短并说明；原始结果不受这个限制。**各处的上限（一次满尺寸读取：页面一段 12 KiB，在结构化的 `text` 里一份、文字内容里再一份，JSON 把控制字符写成六个字节时最坏约 150 KiB）**：HOST 读响应的上限 `mcpclient.MaxResponse` 是 8 MiB；idp-mcp 网关对外部目标一个答案的上限 `DefaultExternalMaxResult` 是 1 MiB，对上游 JSON 的上限 `MaxUpstreamJSON` 是 16 MiB；模型读到的上限 D40 是 16 KiB（`ToolResultBytes`）。没有哪一个会拒绝满尺寸的读取；写给模型的一个满尺寸读取约 12.5 KiB，在 16 KiB 之内、不截。没有要改的上限。
+4. **没有有效结构的结果走原来的路（文字改写）**：旧版 idp-web、别的类似网页的工具、结构与声明不符（缺必需字段、类型不对、多出未声明的字段——下一版 idp-web 加字段而 HOST 没跟上时也是这样）、工具没有列 `outputSchema`、结果没有 `structuredContent`。事件 `idp.host/citations.numbered` 多两个字段：`render`（`structured` | `text`）与，走文字时，`structure`（原因：`no_output_schema`、`no_structure`、`schema_violation`、`unusable_entry`、`schema_unreadable`，只写原因、不写内容）；没有结构化引用而原样放行的结果，事件 `idp.host/citations.unnumbered` 也带 `structure`。声明的结构有效但没有条目（空搜索）不算"没有编号"：回答 `no results`，不取号。`published` 不写进读取的文字（读取条目没有它），来源表也不存它。
+
+**拿掉一个控制、看测试失败（D71 修订的每一行；方法同上）**
+
+| 控制 | 拿掉的东西 | 失败的测试 |
+|---|---|---|
+| 有效的结构用来写文字 | 恒走文字改写 | `TestAWebResultWithAValidStructureIsRenderedFromItAndIdpWebsTextIsNeverRead` |
+| 结构按列出的模式校验 | 不校验 | `TestAnInvalidStructureIsNotUsed` |
+| 模式从 `tools/list` 钉住 | 不记 `outputSchema` | `TestAWebResultWithAValidStructure…`、`TestAnInvalidStructureFallsBackToTheTextAndIsRecorded` |
+| HOST 不能记的条目不用结构 | 不查地址与编号 | `TestAnInvalidStructureIsNotUsed`（非 http 地址、编号重复） |
+| 页面字段中和方括号里的数 | 不中和 | `TestHostileExcerptAndTextAreNeutralisedAndCleaned` |
+| 去掉控制与格式字符 | 不去 | 同上 |
+| 摘录、标题压成一行 | 不压 | 同上（一个来源的行数不对） |
+| D40 管 HOST 写出的文字 | 不限 | `TestAMaximumSizeReadIsLimitedAsWhatTheModelIsGivenNotAsTheRawResult` |
+| 怎么接着读（`nextOffset`） | 不写 | `TestAReadPartsHeadSaysWhereItLiesAndHowToContinue` |
+| `notice` | 不写 | `TestTheNoticesAndAPdfCut` |
+| PDF 只读了前几页 | 不写 | 同上 |
+| 空搜索回答 `no results` | 不写 | `TestAnEmptySearchIsRenderedAndTakesNoNumber` |
+| 退路与原因记在事件里 | 不记 `structure` | `TestAnInvalidStructureFallsBackToTheTextAndIsRecorded`、`TestAToolThatListsNoSchemaGoesTheTextWayAndIsRecordedAsSuch` |
+| 先搜后读保持 HOST 号 | 不查树里已有的号 | `TestAReadOfASearchedAddressKeepsItsHostNumber` |
+
+满尺寸读取通过 HOST 的传输：`TestAFullSizeReadOfIdpWebIsAccepted`（`mcpclient`）；端到端：`TestAMaximumSizeReadGoesThroughD40AsTheTextTheModelIsGiven`（原始结果约两倍大，模型读到的整段不截）。这些上限是常数，没有"拿掉"一说。

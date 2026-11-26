@@ -87,6 +87,8 @@ type WebRendered struct {
 	// as a knowledge passage that is not shown is not.
 	NotShown int
 	Mode     string
+	// Render says which way the text was made: RenderStructured (from the declared structure) or RenderText (idp-web's text rewritten).
+	Render string
 }
 
 // RenderWeb makes the text the model reads of a web result (D71) from idp-web's text and the citations the result declared.

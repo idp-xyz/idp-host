@@ -17,6 +17,8 @@ type Tool struct {
 	Name        string
 	Description string
 	InputSchema string
+	// OutputSchema, when set, is listed as the tool's outputSchema (the JSON Schema of its structuredContent).
+	OutputSchema string
 	// Annotations, when set, are listed as the tool's annotations (readOnlyHint, idempotentHint ...).
 	Annotations map[string]any
 	// Meta, when set, is listed as the tool object's _meta (the gateway marks an external tool there). Any value goes, so
@@ -193,6 +195,9 @@ func (s *Server) Handler() http.Handler {
 			s.mu.Unlock()
 			for _, t := range s.Tools {
 				entry := map[string]any{"name": t.Name, "description": t.Description, "inputSchema": json.RawMessage(t.InputSchema)}
+				if t.OutputSchema != "" {
+					entry["outputSchema"] = json.RawMessage(t.OutputSchema)
+				}
 				if t.Annotations != nil {
 					entry["annotations"] = t.Annotations
 				}
