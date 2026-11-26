@@ -1,5 +1,5 @@
 {
-  "description": "idp.telos.cmi 1.4.0 的示例：每一个都是 idp-cmi 实际产出的文档（ContextPackage 经 cmi.Seal 密封，其余是 API 返回的记录）。",
+  "description": "idp.telos.cmi 1.7.0 的示例：每一个都是 idp-cmi 实际产出的文档（ContextPackage 经 cmi.Seal 密封，其余是 API 返回的记录）。",
   "generatedBy": "go test ./internal/cmi -run TestContract -update",
   "examples": [
     {
@@ -21,6 +21,13 @@
             "excerpt": "Pickup slots. Morning slots run from 07:00 to 11:00.",
             "id": "5b6c7d8e-0000-4000-8000-000000000020",
             "kind": "knowledge",
+            "locator": {
+              "headings": [
+                "Pickup",
+                "Morning slots"
+              ],
+              "page": 3
+            },
             "match": "both",
             "observedAt": "2026-11-02T09:00:00Z",
             "ref": "handbook://pickup#0",
@@ -92,6 +99,76 @@
             "source": "orders",
             "tokens": 13,
             "trust": "authoritative"
+          },
+          {
+            "excerpt": "| row | A | B |\n| --- | --- | --- |\n| 12 | morning | 4.50 |",
+            "id": "5b6c7d8e-0000-4000-8000-000000000021",
+            "kind": "knowledge",
+            "locator": {
+              "range": "A12:B12",
+              "sheet": "Rates 2026"
+            },
+            "match": "lexical",
+            "observedAt": "2026-11-03T09:00:00Z",
+            "ref": "kb://handbook/rates.xlsx#4",
+            "score": 0.91,
+            "sensitivity": "internal",
+            "source": "handbook",
+            "title": "Pickup rates",
+            "tokens": 22,
+            "trust": "authoritative"
+          },
+          {
+            "excerpt": "Pickup slots are booked in the portal.",
+            "id": "5b6c7d8e-0000-4000-8000-000000000022",
+            "kind": "knowledge",
+            "locator": {
+              "headings": [
+                "Booking"
+              ],
+              "slide": 7
+            },
+            "match": "semantic",
+            "observedAt": "2026-11-03T09:00:00Z",
+            "ref": "kb://handbook/onboarding.pptx#2",
+            "score": 0.62,
+            "sensitivity": "internal",
+            "source": "handbook",
+            "title": "Onboarding deck",
+            "tokens": 9,
+            "trust": "authoritative"
+          },
+          {
+            "excerpt": "Pickup › Surcharges\nThe surcharge for a late pickup is 5 euro; the evening surcharge is 7 euro.",
+            "hitCount": 2,
+            "hits": [
+              {
+                "length": 4,
+                "offset": 57
+              },
+              {
+                "length": 4,
+                "offset": 90
+              }
+            ],
+            "id": "5b6c7d8e-0000-4000-8000-000000000020",
+            "kind": "knowledge",
+            "locator": {
+              "headings": [
+                "Pickup",
+                "Surcharges"
+              ],
+              "page": 4
+            },
+            "match": "exact",
+            "observedAt": "2026-11-02T09:00:00Z",
+            "ref": "handbook://pickup#1",
+            "score": 1,
+            "sensitivity": "internal",
+            "source": "handbook",
+            "title": "Pickup handbook",
+            "tokens": 25,
+            "trust": "authoritative"
           }
         ],
         "omitted": {
@@ -117,7 +194,7 @@
     {
       "definition": "Envelope",
       "value": {
-        "digest": "sha256:e5a17483b4e6b9d8b8bd6b95e9514a5c8a4510fb11bc65c3f6a03a9513037002",
+        "digest": "sha256:99a8bdc58ee3427e213f8391e51d324d710138ba68c81077b6b894cb2d9d442f",
         "document": {
           "asOf": {
             "recorded": "2026-11-04T09:00:00Z",
@@ -135,6 +212,13 @@
               "excerpt": "Pickup slots. Morning slots run from 07:00 to 11:00.",
               "id": "5b6c7d8e-0000-4000-8000-000000000020",
               "kind": "knowledge",
+              "locator": {
+                "headings": [
+                  "Pickup",
+                  "Morning slots"
+                ],
+                "page": 3
+              },
               "match": "both",
               "observedAt": "2026-11-02T09:00:00Z",
               "ref": "handbook://pickup#0",
@@ -205,6 +289,76 @@
               "sensitivity": "internal",
               "source": "orders",
               "tokens": 13,
+              "trust": "authoritative"
+            },
+            {
+              "excerpt": "| row | A | B |\n| --- | --- | --- |\n| 12 | morning | 4.50 |",
+              "id": "5b6c7d8e-0000-4000-8000-000000000021",
+              "kind": "knowledge",
+              "locator": {
+                "range": "A12:B12",
+                "sheet": "Rates 2026"
+              },
+              "match": "lexical",
+              "observedAt": "2026-11-03T09:00:00Z",
+              "ref": "kb://handbook/rates.xlsx#4",
+              "score": 0.91,
+              "sensitivity": "internal",
+              "source": "handbook",
+              "title": "Pickup rates",
+              "tokens": 22,
+              "trust": "authoritative"
+            },
+            {
+              "excerpt": "Pickup slots are booked in the portal.",
+              "id": "5b6c7d8e-0000-4000-8000-000000000022",
+              "kind": "knowledge",
+              "locator": {
+                "headings": [
+                  "Booking"
+                ],
+                "slide": 7
+              },
+              "match": "semantic",
+              "observedAt": "2026-11-03T09:00:00Z",
+              "ref": "kb://handbook/onboarding.pptx#2",
+              "score": 0.62,
+              "sensitivity": "internal",
+              "source": "handbook",
+              "title": "Onboarding deck",
+              "tokens": 9,
+              "trust": "authoritative"
+            },
+            {
+              "excerpt": "Pickup › Surcharges\nThe surcharge for a late pickup is 5 euro; the evening surcharge is 7 euro.",
+              "hitCount": 2,
+              "hits": [
+                {
+                  "length": 4,
+                  "offset": 57
+                },
+                {
+                  "length": 4,
+                  "offset": 90
+                }
+              ],
+              "id": "5b6c7d8e-0000-4000-8000-000000000020",
+              "kind": "knowledge",
+              "locator": {
+                "headings": [
+                  "Pickup",
+                  "Surcharges"
+                ],
+                "page": 4
+              },
+              "match": "exact",
+              "observedAt": "2026-11-02T09:00:00Z",
+              "ref": "handbook://pickup#1",
+              "score": 1,
+              "sensitivity": "internal",
+              "source": "handbook",
+              "title": "Pickup handbook",
+              "tokens": 25,
               "trust": "authoritative"
             }
           ],
@@ -430,6 +584,7 @@
         "contentSha256": "sha256:ca2636bae99d12371279ee8b00bea64837b9f09ef3d76438f091adb2366e6ee6",
         "createdAt": "2026-11-02T09:00:00Z",
         "createdBy": "alice",
+        "docType": "policy",
         "documentId": "5b6c7d8e-0000-4000-8000-000000000020",
         "entities": [
           {
@@ -437,13 +592,85 @@
             "type": "service"
           }
         ],
+        "knowledgeBase": "handbook",
+        "original": {
+          "byteSize": 48213,
+          "mediaType": "application/pdf",
+          "sha256": "sha256:2d2964f1354540398f88886bfcfbecc04c3f03ce2c2024e9585c7b3fcfd23e2b"
+        },
+        "owner": "alice",
+        "reviewDue": "2027-05-03T09:00:00Z",
         "revision": 1,
         "sensitivity": "internal",
         "source": "handbook",
         "status": "active",
         "title": "Pickup handbook",
         "uri": "handbook://pickup",
+        "validFrom": "2026-11-02T09:00:00Z",
         "version": 2
+      }
+    },
+    {
+      "definition": "KnowledgeDocument",
+      "value": {
+        "acl": {},
+        "byteSize": 11,
+        "chunkCount": 1,
+        "contentSha256": "sha256:4097889236a2af26c293033feb964c4cf118c0224e0d063fec0a89e9d0569ef2",
+        "createdAt": "2026-11-04T08:00:00Z",
+        "createdBy": "alice",
+        "documentId": "c9d8e7f6-0000-4000-8000-000000000081",
+        "ingest": {
+          "attempts": 1,
+          "error": "sandbox_busy",
+          "nextAttemptAt": "2026-11-04T09:00:30Z",
+          "state": "queued",
+          "updatedAt": "2026-11-04T08:59:00Z"
+        },
+        "knowledgeBase": "handbook",
+        "original": {
+          "byteSize": 30211,
+          "mediaType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          "sha256": "sha256:b5e442d8a25324b5a3dac7c7be9b65f5949e409ddfe8fc2c2eee6c3a8dd3f445"
+        },
+        "revision": 2,
+        "sensitivity": "internal",
+        "source": "handbook",
+        "status": "pending",
+        "title": "Pickup rates",
+        "uri": "kb://handbook/rates.xlsx",
+        "version": 1
+      }
+    },
+    {
+      "definition": "KnowledgeDocument",
+      "value": {
+        "acl": {},
+        "byteSize": 9,
+        "chunkCount": 3,
+        "contentSha256": "sha256:7c375be828a16923f65095998609312a73318a1c01d89d3699e69e53a0883fac",
+        "createdAt": "2026-11-04T07:00:00Z",
+        "createdBy": "alice",
+        "documentId": "d0e9f8a7-0000-4000-8000-000000000082",
+        "ingest": {
+          "attempts": 1,
+          "notice": "Truncated: sheet Rates, rows kept 10000 of 120000",
+          "state": "truncated",
+          "updatedAt": "2026-11-04T09:00:00Z"
+        },
+        "knowledgeBase": "handbook",
+        "original": {
+          "byteSize": 5900000,
+          "mediaType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          "sha256": "sha256:4cfa64eed73535cefaf263310d0f91f02bd3ee8f492bed7ed7d777fa7b73625c"
+        },
+        "revision": 3,
+        "sensitivity": "internal",
+        "source": "handbook",
+        "status": "active",
+        "title": "Pickup rates 2026",
+        "uri": "kb://handbook/rates-2026.xlsx",
+        "version": 1
       }
     },
     {
@@ -473,6 +700,27 @@
         "uri": "handbook://pricing-internal",
         "validUntil": "2026-12-04T09:00:00Z",
         "version": 1
+      }
+    },
+    {
+      "definition": "KnowledgeBase",
+      "value": {
+        "createdAt": "2026-11-04T09:00:00Z",
+        "createdBy": "alice",
+        "defaultSensitivity": "internal",
+        "displayName": "Company handbook",
+        "knowledgeBaseId": "d4e5f6a7-0000-4000-8000-000000000090",
+        "managers": {},
+        "name": "handbook",
+        "ocr": false,
+        "quotaBytes": 0,
+        "quotaDocuments": 0,
+        "scope": {
+          "kind": "tenant"
+        },
+        "sensitivityCeiling": "restricted",
+        "source": "handbook",
+        "status": "active"
       }
     },
     {

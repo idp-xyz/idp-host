@@ -87,9 +87,10 @@ type Item struct {
 	ValidUntil  time.Time `json:"validUntil"`
 	Sensitivity string    `json:"sensitivity"`
 	Tokens      int       `json:"tokens"`
-	Match       string    `json:"match,omitempty"`   // lexical | semantic | both | exact (find)
-	Locator     *Locator  `json:"locator,omitempty"` // where a knowledge chunk sits in its document
-	Hits        []Hit     `json:"hits,omitempty"`    // find: where the text is in the chunk
+	Match       string    `json:"match,omitempty"`    // lexical | semantic | both | exact (find)
+	Locator     *Locator  `json:"locator,omitempty"`  // where a knowledge chunk sits in its document
+	Hits        []Hit     `json:"hits,omitempty"`     // find: where the text is in the chunk, only those inside the excerpt
+	HitCount    int       `json:"hitCount,omitempty"` // find: how many hits the chunk holds in all
 }
 
 // Package is the resolved package.

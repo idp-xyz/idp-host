@@ -147,6 +147,12 @@ func (s *Server) handle(f answerer) http.HandlerFunc {
 		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		s.record(r, body)
+		// the request is checked against idp.telos.cmi 1.7.0 (openapi ResolveRequest, ReadRequest, FindRequest): a key it does not have is
+		// a 422, as is a locator key or a find text it does not allow
+		if !validRequest(r.URL.Path, body) {
+			problem(w, http.StatusUnprocessableEntity, "INVALID")
+			return
+		}
 		if s.Hold != nil {
 			s.Hold(r.URL.Path)
 		}
@@ -194,6 +200,34 @@ func (s *Server) handle(f answerer) http.HandlerFunc {
 	}
 }
 
+var allowedKeys = map[string][]string{
+	"/v1/context/resolve": {"query", "purpose", "scope", "scopes", "asOf", "budget", "sources", "kinds", "maxAgeDays", "sensitivityCeiling", "entities", "knowledgeBases", "docTypes"},
+	"/v1/context/read":    {"documentId", "locator", "around", "budget", "purpose", "asOf", "scope", "sources", "sensitivityCeiling"},
+	"/v1/context/find":    {"documentId", "text", "maxHits", "budget", "purpose", "asOf", "scope", "sources", "sensitivityCeiling"},
+}
+
+func validRequest(path string, body map[string]any) bool {
+	for k := range body {
+		if !has(allowedKeys[path], k) {
+			return false
+		}
+	}
+	if l, ok := body["locator"].(map[string]any); ok {
+		for k := range l {
+			if !has([]string{"headings", "page", "slide", "sheet", "range", "table"}, k) {
+				return false
+			}
+		}
+	}
+	if t, ok := body["text"].(string); ok && len([]rune(t)) > 1000 {
+		return false
+	}
+	if sc, ok := body["scope"].(map[string]any); ok && sc["kind"] != "subject" && path != "/v1/context/resolve" {
+		return false
+	}
+	return true
+}
+
 var rank = map[string]int{"public": 0, "internal": 1, "confidential": 2, "restricted": 3}
 
 // inSources says whether a document of this source is within the request's sources (read and find: outside them it is a 404, as
@@ -224,6 +258,13 @@ func (s *Server) visible(d Doc, sub string) bool {
 		}
 	}
 	return false
+}
+
+// namesOther says whether a read or find names another member's personal base (scope subject): the fake has no caller that may name
+// members, so it is the 404 of an invisible document.
+func namesOther(body map[string]any, sub string) bool {
+	sc, ok := body["scope"].(map[string]any)
+	return ok && sc["id"] != nil && sc["id"] != sub
 }
 
 func (s *Server) doc(id, sub string) (Doc, bool) {
@@ -373,7 +414,7 @@ func hit(l, want Locator) bool {
 func (s *Server) read(sub string, body map[string]any) ([]map[string]any, map[string]int, string, int) {
 	id, _ := body["documentId"].(string)
 	d, ok := s.doc(id, sub)
-	if !ok || !inSources(body, d.Source) {
+	if !ok || !inSources(body, d.Source) || namesOther(body, sub) {
 		return nil, nil, "", http.StatusNotFound
 	}
 	around := 1
@@ -435,7 +476,7 @@ func norm(s string) string {
 func (s *Server) find(sub string, body map[string]any) ([]map[string]any, map[string]int, string, int) {
 	id, _ := body["documentId"].(string)
 	d, ok := s.doc(id, sub)
-	if !ok || !inSources(body, d.Source) {
+	if !ok || !inSources(body, d.Source) || namesOther(body, sub) {
 		return nil, nil, "", http.StatusNotFound
 	}
 	text, _ := body["text"].(string)
@@ -453,6 +494,7 @@ func (s *Server) find(sub string, body map[string]any) ([]map[string]any, map[st
 		at = len([]rune(n[:at])) // 1.7.0: offsets and lengths are code points of the block's text
 		it := item(d, i, b, "exact")
 		it["hits"] = []map[string]int{{"offset": at, "length": len([]rune(want))}}
+		it["hitCount"] = 1
 		items = append(items, it)
 	}
 	return items, nil, "find", 0

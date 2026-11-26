@@ -26,7 +26,7 @@ func (noLoader) Load(string) (any, error) { return nil, os.ErrNotExist }
 // memoryRecordSchema compiles the pinned idp.telos.cmi MemoryRecord.
 func memoryRecordSchema(t *testing.T) *jsonschema.Schema {
 	t.Helper()
-	b, err := os.ReadFile("../../tests/contracts/idp.telos.cmi/1.4.0/schema.json")
+	b, err := os.ReadFile("../../tests/contracts/idp.telos.cmi/1.7.0/schema.json")
 	if err != nil {
 		t.Fatal(err)
 	}

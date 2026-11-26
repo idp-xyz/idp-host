@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:idp:telos:cmi:1.4.0",
-  "title": "idp.telos.cmi 1.4.0",
-  "description": "idp-cmi（Context, Memory & Knowledge Infrastructure）对外发布的契约：ContextPackage（解析上下文得到的不可变、内容寻址的包，ADR-0001 D5）、ContextItem、MemoryRecord（记忆记录，D3）、Source（来源，D2）、KnowledgeDocument（知识文档的元数据，D4）、Envelope（包加摘要）、Entity（显式的业务对象引用，D13）。1.1.0 相对 1.0.0 只做新增：MemoryRecord 与 KnowledgeDocument 的 entities 与 flags（D12 写入时扫描的标记）、ContextItem 的 entities / match（D11 混合检索的命中方式）/ flags。生产者是 idp-cmi，权威副本在 idp-cmi/api/contracts/，由 go test ./internal/cmi -run TestContract 保证与实现一致；idp-contracts 中的副本只能与之逐字节相同。JSON Schema 只描述形状与可本地判定的规则；摘要是否匹配由 cmi.Open 判定，可见性与时效由 CMI 的查询判定。 1.2.0 相对 1.1.0 只做新增（M5）：MemoryRecord 的 version 与 KnowledgeDocument 的 revision（D19 预期版本）；MemoryRecord 的 status 增 candidate / disputed 与 disputedBy（D21）；Scope kind 增 organization / team / project、MemoryRecord 增 sharedFrom、ContextItem 增 scope（D22）；新定义 Verification 与 ItemStatus（D24 消费时复验）。 1.3.0 相对 1.2.0 只做新增：ContextPackage 的 asOf 与定义 AsOf（D25）、ContextPackage 的 projectionLag（D26）。 1.4.0 相对 1.3.0 只做新增：ContextPackage 的 omitted 与定义 Omitted（D28）。",
+  "$id": "urn:idp:telos:cmi:1.7.0",
+  "title": "idp.telos.cmi 1.7.0",
+  "description": "idp-cmi（Context, Memory & Knowledge Infrastructure）对外发布的契约：ContextPackage（解析上下文得到的不可变、内容寻址的包，ADR-0001 D5）、ContextItem、MemoryRecord（记忆记录，D3）、Source（来源，D2）、KnowledgeDocument（知识文档的元数据，D4）、Envelope（包加摘要）、Entity（显式的业务对象引用，D13）。1.1.0 相对 1.0.0 只做新增：MemoryRecord 与 KnowledgeDocument 的 entities 与 flags（D12 写入时扫描的标记）、ContextItem 的 entities / match（D11 混合检索的命中方式）/ flags。生产者是 idp-cmi，权威副本在 idp-cmi/api/contracts/，由 go test ./internal/cmi -run TestContract 保证与实现一致；idp-contracts 中的副本只能与之逐字节相同。JSON Schema 只描述形状与可本地判定的规则；摘要是否匹配由 cmi.Open 判定，可见性与时效由 CMI 的查询判定。 1.2.0 相对 1.1.0 只做新增（M5）：MemoryRecord 的 version 与 KnowledgeDocument 的 revision（D19 预期版本）；MemoryRecord 的 status 增 candidate / disputed 与 disputedBy（D21）；Scope kind 增 organization / team / project、MemoryRecord 增 sharedFrom、ContextItem 增 scope（D22）；新定义 Verification 与 ItemStatus（D24 消费时复验）。 1.3.0 相对 1.2.0 只做新增：ContextPackage 的 asOf 与定义 AsOf（D25）、ContextPackage 的 projectionLag（D26）。 1.4.0 相对 1.3.0 只做新增：ContextPackage 的 omitted 与定义 Omitted（D28）。 1.5.0 相对 1.4.0 只做新增：新定义 KnowledgeBase；KnowledgeDocument 增 knowledgeBase、validFrom、docType、owner、reviewDue、original（对象键不在契约里）；ContextItem 增 locator。 1.6.0 相对 1.5.0 只做新增（KB3，D61 起）：KnowledgeDocument 增 ingest（原件转成文本的状态），status 增 pending（原件的文本还在提取，这一版尚未生效、不取代任何版本）；ContextItem 的 locator 增 slide、sheet、range（PPTX 的幻灯片、XLSX 的工作表与单元格范围）。 1.7.0 相对 1.6.0 只做新增（KB8，D71 起）：ContextItem 的 match 增 exact，增 hits（find 在这一项的 excerpt 里命中的位置：offset 与 length，按字符，即 Unicode 码点，excerpt 是返回的原样）与 hitCount（这一块里命中的总数）。解析请求的 knowledgeBases 与 docTypes、POST /v1/context/read 与 POST /v1/context/find 在 api/openapi.yaml 里；read 与 find 产出的包还是 ContextPackage；read、find 的请求另有可选的 scope（点名别的成员的个人库）与 sources（D78），purpose 是调用者给的（缺省 read 或 find）。",
   "oneOf": [
     {
       "$ref": "#/$defs/ContextPackage"
@@ -15,6 +15,9 @@
     },
     {
       "$ref": "#/$defs/KnowledgeDocument"
+    },
+    {
+      "$ref": "#/$defs/KnowledgeBase"
     },
     {
       "$ref": "#/$defs/Envelope"
@@ -190,9 +193,42 @@
           "enum": [
             "lexical",
             "semantic",
-            "both"
+            "both",
+            "exact"
           ],
-          "description": "哪个检索器命中（D11）：全文、向量或两者"
+          "description": "哪个检索器命中（D11）：全文、向量或两者；exact（1.7.0）：find 在这一块里按原词找到了那段文字"
+        },
+        "hits": {
+          "type": "array",
+          "maxItems": 100,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["offset", "length"],
+            "properties": {
+              "offset": {"type": "integer", "minimum": 0, "description": "命中处在这一项的 excerpt 里的起点，按字符（Unicode 码点），excerpt 是返回的原样：标题行与开头的省略号都算在内"},
+              "length": {"type": "integer", "minimum": 1, "description": "命中的那段文字在 excerpt 里的长度，按字符；空白按规范化匹配，所以可能与所找文字的长度不同；跨过两块之间的接缝的命中截到这一块的末尾"}
+            }
+          },
+          "description": "find 在这一项的 excerpt 里命中的位置，按先后排列（1.7.0）；只列完全落在 excerpt 里的命中，摘录以第一处为中心。这一块里命中的总数是 hitCount"
+        },
+        "hitCount": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "find 在这一块里命中的总数（1.7.0）；hits 里列出的是其中落在 excerpt 里的（且在 maxHits 之内的）"
+        },
+        "locator": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "知识块在文档里的位置：标题路径、页码、表名（D49）。excerpt 只是这一块的正文，它所在的章节在这里",
+          "properties": {
+            "headings": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "page": {"type": "integer", "minimum": 1, "description": "PDF 的页；Word 文档里是第几个显式分页符之后"},
+            "slide": {"type": "integer", "minimum": 1, "description": "PPTX 的幻灯片序号（1.6.0）"},
+            "sheet": {"type": "string", "minLength": 1, "description": "XLSX 的工作表名（1.6.0）"},
+            "range": {"type": "string", "pattern": "^[A-Z]{1,3}[0-9]+:[A-Z]{1,3}[0-9]+$", "description": "这一块覆盖的单元格范围，例如 A12:F40（1.6.0）"},
+            "table": {"type": "string", "minLength": 1}
+          }
         },
         "flags": {
           "type": "array",
@@ -600,8 +636,10 @@
             "active",
             "superseded",
             "revoked",
-            "expired"
-          ]
+            "expired",
+            "pending"
+          ],
+          "description": "pending（1.6.0）：这一版的原件正在转成文本，尚未生效，不取代任何版本，也不被检索；文本提交时变为 active。ingest 说明进展"
         },
         "validUntil": {
           "type": "string",
@@ -649,6 +687,141 @@
           "type": "integer",
           "minimum": 1,
           "description": "该文档行每次状态变化加一（D19）；version 是同一 URI 的第几版"
+        },
+        "knowledgeBase": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$",
+          "description": "所属知识库的名字。管理员省略时归入来源同名的企业级知识库；成员省略时归入本人的个人库。一个版本的身份是（租户、知识库、uri）：不同知识库里相同的 uri 是两份文档。指明知识库的上传用 kb://<知识库名>/<路径> 作 uri"
+        },
+        "validFrom": {
+          "type": "string",
+          "format": "date-time",
+          "description": "这一版开始生效的业务时间。晚于现在的版本不取代当前有效的那一版；没有这个字段表示从一开始就有效"
+        },
+        "docType": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$",
+          "description": "文档类别，用于过滤和以后按类别分块"
+        },
+        "owner": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.:/@-]{1,256}$",
+          "description": "负责这份文档的主体"
+        },
+        "reviewDue": {
+          "type": "string",
+          "format": "date-time",
+          "description": "应复核的时间"
+        },
+        "awaitsOriginal": {
+          "type": "boolean",
+          "description": "写入字段（1.7.0，D77）：这一版一开始就是 pending，等着随后存进来的 PDF 或 Office 原件转成的文本；文本提交的那一刻它才生效。已经生效的版本不会再换文本：给它存要转换的原件是 409，写一个新版本"
+        },
+        "original": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "这一版的原件。对象键不在契约里",
+          "required": ["mediaType", "byteSize", "sha256"],
+          "properties": {
+            "mediaType": {"type": "string", "minLength": 1},
+            "byteSize": {"type": "integer", "minimum": 1},
+            "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+          }
+        },
+        "ingest": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "原件（PDF、Word、PowerPoint、Excel）转成文本的进展（1.6.0，D63）：这一版最近一次转换。没有转换的版本没有这个字段",
+          "required": ["state", "attempts", "updatedAt"],
+          "properties": {
+            "state": {"enum": ["queued", "running", "succeeded", "truncated", "failed"], "description": "truncated：转换成功，但有内容没有收（工作表超过 1 万行或 200 列）；notice 说明收了多少"},
+            "attempts": {"type": "integer", "minimum": 0},
+            "error": {"type": "string", "pattern": "^[a-z_]{1,64}$", "description": "失败的原因码（failed，或排队等待重试的那次失败）：corrupt、unsupported、limits、no_text、conversion_timeout、conversion_oom、empty_output、text_too_large、quota_exceeded、sandbox_busy、gateway_unavailable 等"},
+            "notice": {"type": "string", "maxLength": 3000, "description": "给上传的人看的说明：被截掉的工作表，没有文字层的页。多条用换行隔开"},
+            "updatedAt": {"type": "string", "format": "date-time"},
+            "nextAttemptAt": {"type": "string", "format": "date-time", "description": "失败后排队重试的，下次尝试的时间"}
+          }
+        }
+      }
+    },
+    "KnowledgeBase": {
+      "title": "KnowledgeBase",
+      "description": "知识库：谁管、谁能看、缺省敏感级别与配额。作用域是 tenant（企业）、organization / team / project（部门，指向单元目录）或 subject（个人）。thread 与 agent 不用于知识库。个人库的来源是 user，信任级别因此是 informational。",
+      "x-idp-telos-owner": "idp.telos.cmi",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "knowledgeBaseId",
+        "name",
+        "displayName",
+        "scope",
+        "managers",
+        "defaultSensitivity",
+        "sensitivityCeiling",
+        "source",
+        "quotaDocuments",
+        "quotaBytes",
+        "ocr",
+        "status",
+        "createdBy",
+        "createdAt"
+      ],
+      "properties": {
+        "knowledgeBaseId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$"
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "scope": {
+          "$ref": "#/$defs/Scope"
+        },
+        "managers": {
+          "$ref": "#/$defs/ACL",
+          "description": "管理者的主体与角色。空表示只有管理员能管理"
+        },
+        "defaultSensitivity": {
+          "enum": ["public", "internal", "confidential", "restricted"]
+        },
+        "sensitivityCeiling": {
+          "enum": ["public", "internal", "confidential", "restricted"]
+        },
+        "source": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$",
+          "description": "这个库里上传文档使用的来源"
+        },
+        "quotaDocuments": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "文档数上限，0 表示不限"
+        },
+        "quotaBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "索引文本与原件的字节上限，0 表示不限（个人库为 0 时用成员缺省配额）"
+        },
+        "ocr": {
+          "type": "boolean",
+          "description": "入库时是否对没有文字层的页做识别"
+        },
+        "status": {
+          "enum": ["active", "archived"]
+        },
+        "createdBy": {
+          "type": "string",
+          "minLength": 1
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
         }
       }
     },
