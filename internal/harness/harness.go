@@ -141,6 +141,8 @@ type Harness struct {
 	// CMIToken is the HOST's own credential for the CMI, minted and refreshed by itself (D36); set
 	// instead of CMIKey, which is a token that stops working when it expires.
 	CMIToken func(context.Context) (string, error)
+	// CMIRefresh renews a session-bound member credential for the CMI (D68); nil when the CMI credential is not renewable.
+	CMIRefresh func(ctx context.Context, refreshToken string) (*credential.Token, error)
 	// Remember appends an episodic memory to the CMI when a run of a CMI-context agent completes
 	// (D33); nil disables. The write happens after the terminal transition and never affects the run.
 	Remember *cmiclient.Remember
@@ -155,6 +157,8 @@ type Harness struct {
 
 	// Retry is the retry policy toward each provider by name (D45); a provider without an entry gets the defaults.
 	Retry map[string]model.RetryPolicy
+	// RewriteTimeout bounds the question rewrite's model call (D66); zero is DefaultRewriteTimeout.
+	RewriteTimeout time.Duration
 	// CancelPoll is how often a run in progress asks the store whether its owner asked to cancel it (default 1 s, D46).
 	CancelPoll time.Duration
 
@@ -252,6 +256,9 @@ type turn struct {
 	viewRaw    float64                              // the raw estimate of the request now being sent
 	viewFixed  float64                              // ... and corrected
 	hint       string                               // what the budget note adds about the context this step
+	citeNext   int                                  // the number the next knowledge item of the run gets (D67)
+	cmiCred    *credential.Token                    // the member's credential for the CMI, as last loaded or renewed (D68)
+	cmiLoaded  bool                                 // cmiCred was asked of the store
 }
 
 // Formats a gateway tool's input schema gives a property that takes a member's file (D37): the model writes
@@ -313,6 +320,7 @@ func (h *Harness) Run(ctx context.Context, c *run.Claim) (err error) {
 	}
 	t.flagged = map[string]bool{}
 	t.limits = h.limitsFor(t.def)
+	t.startCitations() // D67
 	defer t.watch()()
 	out, err := guard.NewOutput(rc.BlockedPatterns, t.def.Guards.Output.Patterns, t.def.Guards.Output.Redact)
 	if err != nil {
@@ -673,6 +681,10 @@ func (t *turn) prepareTools() error {
 		}
 		t.tools = append(t.tools, model.ToolSpec{Name: agent.ResourceReadTool, Description: "Read a reference document published with one of your skills. Available: " + strings.Join(names, ", ") + ".",
 			Parameters: json.RawMessage(`{"type":"object","properties":{"skill":{"type":"string"},"name":{"type":"string"}},"required":["skill","name"],"additionalProperties":false}`)})
+	}
+	// D65: the HOST's knowledge tools, when the release turns them on
+	for _, name := range t.knowledgeEnabled() {
+		t.tools = append(t.tools, knowledgeSpecs[name])
 	}
 	return nil
 }
@@ -1124,6 +1136,9 @@ func (t *turn) execute(tc run.ToolCall) (bool, error) {
 	}
 	if tc.Tool == agent.ResourceReadTool && t.resources != nil {
 		return true, t.readResource(tc)
+	}
+	if t.knowledgeOn(tc.Tool) {
+		return t.knowledgeCall(tc)
 	}
 	if t.gateway == nil {
 		return false, t.answer(tc, run.CallFailed, "", "no gateway configured")
@@ -2233,7 +2248,7 @@ func (t *turn) hostTool(name string) bool {
 	if _, ok := t.subagents[name]; ok {
 		return true
 	}
-	return name == agent.ResourceReadTool && len(t.resources) > 0
+	return (name == agent.ResourceReadTool && len(t.resources) > 0) || t.knowledgeOn(name)
 }
 
 // guardedMessages assembles what the model reads this step: the input-guard preamble when wrapping is
@@ -2246,11 +2261,16 @@ func (t *turn) guardedMessages() ([]agui.Message, error) {
 	// D44: tool results of a run that may call a tool sending content outside the enterprise are always wrapped as
 	// untrusted. A release is immutable while the HOST's configuration is not, so the release's "off" is overridden here
 	// and not refused when the release is published.
-	if t.hasOutwardTools() && in.ToolResults == guard.ModeOff {
+	// D65: so are the results of the knowledge tools, which are document text
+	if (t.hasOutwardTools() || t.hasKnowledgeTools()) && in.ToolResults == guard.ModeOff {
 		in.ToolResults = guard.ModeWrap
 		if !t.flagged["raised"] {
 			t.flagged["raised"] = true
-			raised := map[string]any{"configured": guard.ModeOff, "applied": guard.ModeWrap, "reason": "the run has tools that send content outside the enterprise"}
+			why := "the run has tools that send content outside the enterprise"
+			if !t.hasOutwardTools() {
+				why = "the run has knowledge tools, whose results are document text"
+			}
+			raised := map[string]any{"configured": guard.ModeOff, "applied": guard.ModeWrap, "reason": why}
 			if marked := t.callableMarked(); len(marked) > 0 { // D51: say when it is the gateway's marker
 				raised["marked"] = marked
 			}
@@ -2519,11 +2539,13 @@ func (t *turn) verifyContext() (bool, error) {
 						kept = append(kept, c)
 					}
 				}
-				entries := cmiclient.ContextOf(pkg)
+				// D67: the refreshed entries are numbered on from where the run's counter is, so that no number means two things
+				first := t.citeNext
+				entries, next := cmiclient.ContextFrom(pkg.Items, first)
 				// D44: the refresh applies the screen the run was created under, with the ceiling recorded then
 				if ceiling := t.rc.Run.Input.ContextCeiling; ceiling != "" {
 					s := cmiclient.Screen(pkg.Items, ceiling)
-					entries = s.Context()
+					entries, next = s.ContextFrom(first)
 					if s.Withheld > 0 {
 						event["refreshedWithheld"] = s.Withheld
 						refreshEvents = append(refreshEvents, s.Event(t.rc.Run.Input.ContextTrigger, t.rc.Run.Input.ContextVia))
@@ -2531,6 +2553,8 @@ func (t *turn) verifyContext() (bool, error) {
 				}
 				t.rc.Run.Input.Context = append(kept, entries...)
 				event["refreshedPackageId"], event["refreshedItems"] = pkg.PackageID, len(pkg.Items)
+				event["firstIndex"], event["numbered"] = first, next-first
+				t.citeNext = next
 			} else {
 				event["refreshError"] = sanitize(err)
 			}
@@ -2560,6 +2584,9 @@ func (t *turn) mayResend(tc run.ToolCall) bool {
 	}
 	if tc.Tool == agent.ResourceReadTool && t.resources != nil {
 		return true
+	}
+	if t.knowledgeOn(tc.Tool) {
+		return true // it only reads: the CMI is asked again and the package of the call that was lost was never recorded (D65)
 	}
 	if t.gateway == nil || agent.MatchesTool(t.gateway.NeverResendTools, tc.Tool) {
 		return false

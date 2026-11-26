@@ -53,10 +53,22 @@ type Request struct {
 	// PresencePenalty, when set, is sent where the provider documents the field (OpenAI-compatible presence_penalty); the
 	// other adapters leave it out. The host sets it only for the retry of a runaway answer (D60).
 	PresencePenalty *float64
+	// Effort is how hard the model should think (D63-2): "", EffortOff, EffortLow, EffortMedium or EffortHigh. Empty leaves the
+	// provider's own default. An adapter that cannot map it ignores it. Only the OpenAI-compatible adapter maps it so far
+	// (reasoning_effort); the question rewrite of D66 is its only user.
+	Effort string
 	// Watch, when set, is told by the adapter when the request was sent and when the answer first produced output (D54).
 	// An adapter that streams calls it; one that does not leaves the timing absent. Never nil-checked by the caller.
 	Watch *Stopwatch
 }
+
+// Thinking efforts of Request.Effort.
+const (
+	EffortOff    = "off"
+	EffortLow    = "low"
+	EffortMedium = "medium"
+	EffortHigh   = "high"
+)
 
 // Delta is a streamed fragment.
 type Delta struct {

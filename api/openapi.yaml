@@ -296,7 +296,7 @@ components:
     ForwardedProps:
       description: >-
         Caller options (ADR-0001 D19). The idp.host/ keys are the published contract object
-        urn:idp:telos:host:1.11.0#/$defs/RunOptions; keys outside the idp.host/ namespace are kept with
+        urn:idp:telos:host:1.12.0#/$defs/RunOptions; keys outside the idp.host/ namespace are kept with
         the run and ignored; an unknown idp.host/ key is rejected (422).
       type: object
       properties:

@@ -27,7 +27,10 @@ func TestCMIContractPin(t *testing.T) {
 	if err := json.Unmarshal(raw, &schema); err != nil {
 		t.Fatal(err)
 	}
-	optional := map[string]bool{"title": true, "validUntil": true} // read when present
+	optional := map[string]bool{"title": true, "validUntil": true, "match": true} // read when present
+	// KB8 (HOST D65): fields of contract versions later than the pinned one, read when the CMI sends them and ignored otherwise: locator
+	// (1.5.0) and hits (1.7.0, docs/adr/kb8-cmi-api.md, not yet registered). When the pin moves to 1.7.0 they join optional.
+	later := map[string]bool{"locator": true, "hits": true}
 	check := func(def string, v any) {
 		d := schema.Defs[def]
 		required := map[string]bool{}
@@ -37,7 +40,9 @@ func TestCMIContractPin(t *testing.T) {
 		rt := reflect.TypeOf(v)
 		for i := 0; i < rt.NumField(); i++ {
 			name, _, _ := strings.Cut(rt.Field(i).Tag.Get("json"), ",")
-			if _, ok := d.Properties[name]; !ok {
+			if _, ok := d.Properties[name]; !ok && later[name] {
+				continue
+			} else if !ok {
 				t.Errorf("the HOST reads %s.%s, which idp.telos.cmi does not define", def, name)
 			} else if !required[name] && !optional[name] {
 				t.Errorf("the HOST relies on %s.%s, which idp.telos.cmi does not require", def, name)

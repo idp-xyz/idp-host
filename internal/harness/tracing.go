@@ -94,3 +94,25 @@ func (t *turn) startModelSpan(ctx context.Context, step, attempt int, ref agent.
 		span.End()
 	}
 }
+
+// startRewriteSpan is startModelSpan for the question rewrite (D66), which has no run yet: the span is a child of the request's.
+func (h *Harness) startRewriteSpan(ctx context.Context, ref agent.ModelRef) (context.Context, func(outcome string, resp *model.Response)) {
+	if h.Tracer == nil {
+		return ctx, func(string, *model.Response) {}
+	}
+	ctx, span := h.Tracer.Start(ctx, "idp.model.call", trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
+		attribute.String("idp.model.purpose", "context.rewrite"), attribute.String("idp.model.provider", ref.Provider), attribute.String("idp.model.name", ref.Model)))
+	if h.TraceProviders[ref.Provider] {
+		ctx = observability.WithPropagation(ctx)
+	}
+	return ctx, func(outcome string, resp *model.Response) {
+		span.SetAttributes(attribute.String("idp.model.outcome", outcome))
+		if outcome != "ok" {
+			span.SetStatus(codes.Error, outcome)
+		}
+		if resp != nil {
+			span.SetAttributes(attribute.Int("idp.model.prompt_tokens", resp.Usage.PromptTokens), attribute.Int("idp.model.completion_tokens", resp.Usage.CompletionTokens))
+		}
+		span.End()
+	}
+}

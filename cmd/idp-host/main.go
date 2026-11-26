@@ -18,6 +18,7 @@
 //	IDP_HOST_WORKERS             worker goroutines (default 2; 0 = API only)
 //	IDP_HOST_INSTANCE            this replica's id (default: hostname); it names the worker's leases
 //	IDP_HOST_LEASE               claim lease (default 30s)
+//	IDP_HOST_REWRITE_TIMEOUT     how long the model call that rewrites a follow-up question may take, in all (default 8s, D66);
 //	IDP_HOST_STOP_GRACE          on SIGTERM, how long runs in progress may finish before they are cut short (default 20s, D47);
 //	                             keep it below the termination grace period of the platform
 //	IDP_HOST_CREDENTIAL_KEY[_FILE]  32-byte key (64 hex chars) that encrypts delegated gateway tokens
@@ -367,10 +368,15 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 			if err != nil {
 				return fmt.Errorf("cmi: %w", err)
 			}
-			cmiAuth = api.GatewayAuth{ActorToken: c.Auth.ActorToken, Exchanger: &credential.Exchanger{TokenEndpoint: c.Auth.TokenEndpoint, ClientID: c.Auth.ClientID, ClientSecret: c.Auth.ClientSecret, Audience: c.Auth.Audience,
+			cmiAuth = api.GatewayAuth{ActorToken: c.Auth.ActorToken, Exchanger: &credential.Exchanger{TokenEndpoint: c.Auth.TokenEndpoint, ClientID: c.Auth.ClientID, ClientSecret: c.Auth.ClientSecret, Audience: c.Auth.Audience, SessionBound: c.Auth.SessionBound,
 				HTTP: &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil, TLSClientConfig: tokenTLS}}}}
 		}
 	}
+	var cmiRefresh func(context.Context, string) (*credential.Token, error)
+	if cmiAuth.Exchanger != nil && cmiAuth.Exchanger.SessionBound { // D68: a run renews the member's CMI credential within the member's session
+		cmiRefresh = cmiAuth.Exchanger.Refresh
+	}
+	router := model.NewRouter() // the question rewrite (D66) and the workers' steps learn from the same observations
 	var remember *cmiclient.Remember
 	if c := cfg.CMI; c != nil && c.Remember != nil && c.Remember.Enabled { // ADR-0001 D33
 		r := c.Remember
@@ -417,6 +423,10 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 	if err != nil {
 		return fmt.Errorf("IDP_HOST_LEASE: %w", err)
 	}
+	rewriteTimeout, err := time.ParseDuration(env("IDP_HOST_REWRITE_TIMEOUT", "8s"))
+	if err != nil || rewriteTimeout <= 0 {
+		return fmt.Errorf("IDP_HOST_REWRITE_TIMEOUT: want a duration such as 8s, got %q", env("IDP_HOST_REWRITE_TIMEOUT", ""))
+	}
 	stopGrace, err := time.ParseDuration(env("IDP_HOST_STOP_GRACE", "20s"))
 	if err != nil || stopGrace < 0 {
 		return fmt.Errorf("IDP_HOST_STOP_GRACE: want a duration such as 20s, got %q", env("IDP_HOST_STOP_GRACE", ""))
@@ -429,7 +439,7 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 	wctx, cancelWorkers := context.WithCancel(ctx)
 	defer cancelWorkers()
 	if workers > 0 {
-		h := &harness.Harness{Store: store, Providers: registry, Gateways: gateways, Classifiers: classifiers, A2A: a2aClient, CMI: cmiClient, CMIKey: cmiKey, CMIToken: cmiToken, Remember: remember, Retry: retry, ModelContext: cfg.ModelContext(), ModelOutput: cfg.ModelOutput(), Metrics: worker.NewMetrics(metrics), Log: log}
+		h := &harness.Harness{Store: store, Providers: registry, Gateways: gateways, Classifiers: classifiers, A2A: a2aClient, CMI: cmiClient, CMIKey: cmiKey, CMIToken: cmiToken, CMIRefresh: cmiRefresh, Router: router, Remember: remember, Retry: retry, ModelContext: cfg.ModelContext(), ModelOutput: cfg.ModelOutput(), Metrics: worker.NewMetrics(metrics), Log: log}
 		if observability.Exporting() { // D57: the worker's spans are made when a collector is configured, and only then
 			h.Tracer, h.TraceProviders = tp.Tracer("idp-host/worker"), traceProviders
 		}
@@ -461,6 +471,9 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 		}
 	}
 	srvAPI := &api.API{Files: api.FilePolicy{Local: localProviders, Ceiling: cfg.Files.Ceiling, ExternalTools: externalTools}, Store: store, Auth: verifier, Gateways: gatewayAuth, Providers: registry.Names(), Log: log, Metrics: metrics, Version: version, CMI: cmiClient, CMIKey: cmiKey, CMIToken: cmiToken, CMIAuth: cmiAuth}
+	if cmiClient != nil { // D66: the question rewrite is a managed model call of the harness, made here for the request that creates a run
+		srvAPI.Rewriter = &harness.Harness{Providers: registry, Router: router, Log: log, RewriteTimeout: rewriteTimeout}
+	}
 	srv := &http.Server{Addr: env("IDP_HOST_LISTEN", "127.0.0.1:8450"), Handler: observability.HTTPMiddleware(tp, "idp-host/api", srvAPI.Handler()),
 		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 0, IdleTimeout: 120 * time.Second}
 	if cert := env("IDP_HOST_TLS_CERT_FILE", ""); cert != "" {

@@ -310,3 +310,49 @@ func TestToolPolicyMatchesExternalToolPatterns(t *testing.T) {
 		t.Fatal("MatchesTool")
 	}
 }
+
+// D65, D66: the knowledge tools and the rewrite are switches of the context policy, and the prefix of the tools is the HOST's.
+func TestKnowledgeToolsAndRewriteAreSwitchesOfTheContextPolicy(t *testing.T) {
+	with := func(c ContextPolicy) *Document {
+		d := sample()
+		d.Definition.Tools = ToolPolicy{}
+		d.Definition.Context = c
+		return d
+	}
+	for name, c := range map[string]ContextPolicy{
+		"search only": {CMI: true, Tools: []string{KnowledgeSearchTool}},
+		"all three":   {CMI: true, Tools: KnowledgeTools, Rewrite: RewriteModel},
+		"rewrite off": {CMI: true, Rewrite: RewriteOff},
+	} {
+		if _, err := Seal(with(c)); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	for name, c := range map[string]ContextPolicy{
+		"unknown tool":      {CMI: true, Tools: []string{"knowledge__delete"}},
+		"a gateway's name":  {CMI: true, Tools: []string{"parcel__get_shipment"}},
+		"repeated tool":     {CMI: true, Tools: []string{KnowledgeFindTool, KnowledgeFindTool}},
+		"unknown rewrite":   {CMI: true, Rewrite: "history"},
+		"tools without cmi": {Tools: []string{KnowledgeSearchTool}},
+		"rewrite without":   {Rewrite: RewriteModel},
+	} {
+		if _, err := Seal(with(c)); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	// the prefix is the HOST's: an allow list may not name a knowledge tool, and the gateway's tools of that name are never offered
+	for _, name := range KnowledgeTools {
+		d := sample()
+		d.Definition.Tools.Allow = []string{name}
+		if _, err := Seal(d); err == nil || !Reserved(name) {
+			t.Errorf("%s is reserved: %v", name, err)
+		}
+	}
+	c := ContextPolicy{CMI: true, Tools: []string{KnowledgeReadTool}, Rewrite: RewriteModel}
+	if !c.KnowledgeToolOn(KnowledgeReadTool) || c.KnowledgeToolOn(KnowledgeFindTool) || !c.HasKnowledgeTools() || !c.RewritesQuestion() {
+		t.Errorf("%+v", c)
+	}
+	if (ContextPolicy{Tools: []string{KnowledgeReadTool}}).KnowledgeToolOn(KnowledgeReadTool) || (ContextPolicy{CMI: true}).RewritesQuestion() {
+		t.Error("nothing is on without context.cmi, or without the switch")
+	}
+}

@@ -137,7 +137,7 @@ func contextSeen(e *env) string {
 func TestRefreshedContextIsScreenedWithTheCeilingRecordedAtCreation(t *testing.T) {
 	d := def()
 	d.Context = agent.ContextPolicy{CMI: true, OnStale: "refresh"}
-	old := []agui.Context{{Description: "caller", Value: "mine"}, {Description: "CMI knowledge from handbook (old)", Value: "OLD-BODY"}, {Description: cmiclient.ContextCMIWithheld, Value: "OLD-NOTE"}}
+	old := []agui.Context{{Description: "caller", Value: "mine"}, {Description: "CMI [1] knowledge from handbook (old)", Value: "OLD-BODY"}, {Description: cmiclient.ContextCMIWithheld, Value: "OLD-NOTE"}}
 	e := setup(t)
 	e.h.CMI, e.h.CMIKey = refreshCMI(t), "k"
 	m := newMem(d, user("please sum"), run.Input{Context: old, ContextCeiling: "internal", ContextTrigger: "external-model"})
@@ -165,6 +165,10 @@ func TestRefreshedContextIsScreenedWithTheCeilingRecordedAtCreation(t *testing.T
 	}
 	if st := eventNamed(m, agui.CustomContextStale); len(st) != 1 || st[0]["refreshedItems"] != 3 || st[0]["refreshedWithheld"] != 2 {
 		t.Fatalf("%v", st)
+	}
+	// D67: the refreshed entries are numbered on from the run's counter (2: the old entry had [1]), and the event says so
+	if st := eventNamed(m, agui.CustomContextStale); st[0]["firstIndex"] != 2 || st[0]["numbered"] != 1 || !strings.Contains(seen, "CMI [2] knowledge") {
+		t.Fatalf("%v %s", st, seen)
 	}
 	// created without a screen (no external model, no external tool): the refresh gives everything, as before D44
 	e = setup(t)

@@ -154,6 +154,12 @@ func (p *Provider) body(req model.Request, stream bool) map[string]any {
 	if req.MaxOutputTokens > 0 {
 		b[p.cfg.MaxTokensField] = req.MaxOutputTokens
 	}
+	switch req.Effort { // D63-2, as far as the question rewrite needs it
+	case model.EffortLow, model.EffortMedium, model.EffortHigh:
+		b["reasoning_effort"] = req.Effort
+	case model.EffortOff:
+		b["reasoning_effort"] = "none"
+	}
 	if stream && p.cfg.UsageInStream {
 		b["stream_options"] = map[string]any{"include_usage": true}
 	}

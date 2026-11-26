@@ -256,15 +256,21 @@ func (s *SourceSet) Batch() *SourceBatch {
 // Check compares the citation marks of the final answer with the set (D49): a source whose number is cited gets Cited, and
 // a number that is not among the sources is recorded as unverified. It marks and never changes the answer. It only finds a
 // number that does not exist, not a source that exists and does not support the sentence.
-func (s *SourceSet) Check(answer string) {
+func (s *SourceSet) Check(answer string) { s.checkKnowing(answer, 0) }
+
+// checkKnowing is Check for a run that also numbered knowledge items 1..knowledge (D67): those numbers exist, so they are not
+// reported as unverified. They are not web sources and are never marked cited here.
+func (s *SourceSet) checkKnowing(answer string, knowledge int) {
 	known := map[int]int{}
 	for i := range s.Items {
 		s.Items[i].Cited = false
 		known[s.Items[i].N] = i
 	}
-	cited, unknown := CitationMarks(answer, func(n int) bool { _, ok := known[n]; return ok })
+	cited, unknown := CitationMarks(answer, func(n int) bool { _, ok := known[n]; return ok || (n >= 1 && n <= knowledge) })
 	for _, n := range cited {
-		s.Items[known[n]].Cited = true
+		if i, ok := known[n]; ok {
+			s.Items[i].Cited = true
+		}
 	}
 	s.Checked = true
 	s.Unverified = unknown
@@ -387,9 +393,14 @@ func (s *SourceSet) Worth() bool {
 // entirely: a bracketed number in such an answer is not a citation. It reports whether there is anything to store and to
 // announce (see Worth).
 func (s *SourceSet) CheckAtEnd(answer string, outward bool) bool {
+	return s.CheckAtEndKnowing(answer, outward, 0)
+}
+
+// CheckAtEndKnowing is CheckAtEnd for a run whose knowledge items were numbered 1..knowledge (D67).
+func (s *SourceSet) CheckAtEndKnowing(answer string, outward bool, knowledge int) bool {
 	if len(s.Items) == 0 && !outward {
 		return s.Worth()
 	}
-	s.Check(answer)
+	s.checkKnowing(answer, knowledge)
 	return s.Worth()
 }

@@ -65,6 +65,9 @@ type API struct {
 	// CMIToken is the HOST's own credential for the CMI, minted and refreshed by itself (D36); set
 	// instead of CMIKey, which is a token that stops working when it expires.
 	CMIToken func(context.Context) (string, error)
+	// Rewriter makes the managed model call that rewrites the first question of a thread with earlier turns (D66); nil: no
+	// rewrite is made whatever the release says. The harness implements it.
+	Rewriter cmiclient.Rewriter
 	Log      *slog.Logger
 	Metrics  *observability.Metrics
 	Version  string
@@ -653,9 +656,16 @@ func (a *API) createRun(r *http.Request, p authorization.Principal, ref, key str
 		input.Context = append(input.Context, agui.Context{Description: ContextAttachmentsWithheld, Value: withheldNote(withheld, ceiling)})
 	}
 	// D32: context from the CMI, resolved for the caller before the run is queued
-	packageID, extra, err := a.resolveContext(r, p, doc, in, &input)
+	packageID, extra, cmiCred, err := a.resolveContext(r, p, doc, in, &input)
 	if err != nil {
 		return nil, false, err
+	}
+	// D68: the knowledge tools call the CMI as the member in the worker, which has no token of the caller's: the credential
+	// this exchange made is kept with the run, sealed, like the gateway's. Only a release that turned them on keeps one.
+	if pol := doc.Definition.Context; !pol.HasKnowledgeTools() || opts.ToolExecution != "" {
+		cmiCred = nil
+	} else if cmiCred != nil && a.Store.Box == nil {
+		return nil, false, transport.Fail(http.StatusConflict, "CONFLICT", "this host keeps no member credential for the knowledge tools (IDP_HOST_CREDENTIAL_KEY is not set)")
 	}
 	if len(withheld) > 0 {
 		a.Log.Info("attachments withheld from a run that may send content outside the enterprise", "tenant", p.Tenant, "agent", ag.ID, "files", len(withheld), "ceiling", ceiling, "external", outw.Models, "trigger", trigger, "via", outw.Via)
@@ -663,7 +673,7 @@ func (a *API) createRun(r *http.Request, p authorization.Principal, ref, key str
 	}
 	out, replayed, err := a.Store.CreateRun(r.Context(), p.Tenant, postgres.CreateRunInput{ThreadID: in.ThreadID, RunID: in.RunID, AgentRef: ag.ID, Owner: p.Subject,
 		IdempotencyKey: key, Messages: in.Messages, Input: input, Credential: cred, FileTickets: tickets, TraceID: observability.TraceID(r.Context()), Traceparent: observability.Traceparent(r.Context()),
-		ReleaseID: releaseID, ExecutionRef: opts.ExecutionRef, ContextPackageID: packageID, Extra: extra})
+		ReleaseID: releaseID, ExecutionRef: opts.ExecutionRef, ContextPackageID: packageID, Extra: extra, CMICredential: cmiCred})
 	return out, replayed, err
 }
 
@@ -722,17 +732,18 @@ func (a *API) listGateway(ctx context.Context, gateway, runGateway string, cred 
 // resolveContext asks the CMI for a package when the release wants one (D32) and appends its items
 // to the run's context. The caller's own context comes first; CMI items follow it. A CMI failure
 // skips the context (recorded on the run's stream) or refuses the run, as the release decides.
-func (a *API) resolveContext(r *http.Request, p authorization.Principal, doc *agent.Document, in agui.RunAgentInput, input *run.Input) (string, []agui.Event, error) {
+func (a *API) resolveContext(r *http.Request, p authorization.Principal, doc *agent.Document, in agui.RunAgentInput, input *run.Input) (string, []agui.Event, *credential.Token, error) {
 	pol := doc.Definition.Context
 	if !pol.CMI {
-		return "", nil, nil
+		return "", nil, nil, nil
 	}
-	skip := func(reason string, err error) (string, []agui.Event, error) {
+	var events []agui.Event // what the stream records of this resolve: the rewrite, then the package (or why there is none)
+	skip := func(reason string, err error) (string, []agui.Event, *credential.Token, error) {
 		if pol.OnError == "fail" {
-			return "", nil, transport.Fail(http.StatusBadGateway, "CONTEXT_UNAVAILABLE", "the context infrastructure is unavailable: "+reason)
+			return "", nil, nil, transport.Fail(http.StatusBadGateway, "CONTEXT_UNAVAILABLE", "the context infrastructure is unavailable: "+reason)
 		}
 		a.Log.Warn("CMI context skipped", "reason", reason, "error", err)
-		return "", []agui.Event{agui.Custom(agui.CustomContextSkipped, map[string]any{"reason": reason})}, nil
+		return "", append(events, agui.Custom(agui.CustomContextSkipped, map[string]any{"reason": reason})), nil, nil
 	}
 	if a.CMI == nil {
 		return skip("no CMI configured on this host", nil)
@@ -751,6 +762,7 @@ func (a *API) resolveContext(r *http.Request, p authorization.Principal, doc *ag
 		query = query[:4096]
 	}
 	bearer := a.CMIKey
+	var cmiCred *credential.Token
 	if a.CMIToken != nil {
 		tok, err := a.CMIToken(r.Context())
 		if err != nil {
@@ -764,7 +776,16 @@ func (a *API) resolveContext(r *http.Request, p authorization.Principal, doc *ag
 		if err != nil {
 			return skip("delegation to the CMI refused", err)
 		}
-		bearer = cred.AccessToken
+		bearer, cmiCred = cred.AccessToken, cred
+	}
+	// D66: the question of a thread that has earlier turns is rewritten before the first retrieval, when the release lets the
+	// HOST. The managed model call falls back to the original question; the event says what the query was and why.
+	if pol.RewritesQuestion() && a.Rewriter != nil {
+		if pi, ok := cmiclient.PriorTurns(in.Messages); ok {
+			out := a.Rewriter.RewriteQuestion(r.Context(), doc.Effective(), pi)
+			query = out.Query
+			events = append(events, out.Event)
+		}
 	}
 	req := cmiclient.Request{Query: query, Purpose: pol.Purpose, Kinds: pol.Kinds, Sources: pol.Sources}
 	if in.ThreadID != "" {
@@ -786,20 +807,22 @@ func (a *API) resolveContext(r *http.Request, p authorization.Principal, doc *ag
 	// D44: a run that may send content outside the enterprise is not given entries above the ceiling (or without a valid
 	// level); the model is told how many. "items" stays what the CMI returned; "appended" is how many entries ended up at
 	// the tail of the context, which the store needs to compare a replayed request without them.
-	entries := cmiclient.ContextOf(pkg)
-	var events []agui.Event
+	// D67: the knowledge items are numbered from 1; the tools of the run go on from where this stops
+	entries, next := cmiclient.ContextFrom(pkg.Items, 1)
 	var withheld *cmiclient.Screening
 	if input.ContextCeiling != "" {
 		s := cmiclient.Screen(pkg.Items, input.ContextCeiling)
-		entries, withheld = s.Context(), &s
+		entries, next = s.ContextFrom(1)
+		withheld = &s
 	}
 	input.Context = append(input.Context, entries...)
-	events = append(events, agui.Custom(agui.CustomContextResolved, map[string]any{"packageId": pkg.PackageID, "digest": pkg.Digest, "items": len(pkg.Items), "appended": len(entries), "tokens": pkg.Tokens}))
+	events = append(events, agui.Custom(agui.CustomContextResolved, map[string]any{"packageId": pkg.PackageID, "digest": pkg.Digest, "items": len(pkg.Items), "appended": len(entries), "tokens": pkg.Tokens,
+		"query": query, "firstIndex": 1, "numbered": next - 1}))
 	if withheld != nil && withheld.Withheld > 0 {
 		a.Log.Info("CMI context entries withheld from a run that may send content outside the enterprise", "tenant", p.Tenant, "count", withheld.Withheld, "ceiling", input.ContextCeiling, "trigger", input.ContextTrigger, "via", input.ContextVia)
 		events = append(events, withheld.Event(input.ContextTrigger, input.ContextVia))
 	}
-	return pkg.PackageID, events, nil
+	return pkg.PackageID, events, cmiCred, nil
 }
 
 // delegate exchanges the caller's token; the HOST's own actor token is cached until it is close to expiry.

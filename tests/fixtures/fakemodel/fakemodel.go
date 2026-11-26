@@ -219,6 +219,63 @@ func webFlow(messages []Message, has func(string) bool, toolName func(string) st
 	return Turn{Text: "Result: " + last.Content}, true
 }
 
+// the knowledge flows (idp-host D65): "know: <query>" searches and answers citing the numbers of what it found;
+// "know-dig: <query> | <text>" searches, then looks for <text> in the document of the first result with knowledge__find, then
+// answers citing the numbers of the find; "know-read: <query> | <page>" searches, then reads that page of the first result's document.
+// The answer is "Answer: <query> [n][m]" with every number of the last result, so that a test sees which numbers the model was given.
+var knowRE = regexp.MustCompile(`(?s)^(know|know-dig|know-read):\s*(.+)$`)
+var knowNumberRE = regexp.MustCompile(`(?m)^\[(\d+)\] `)
+var knowDocRE = regexp.MustCompile(`(?m)^document: (\S+?);`)
+
+func knowFlow(messages []Message, has func(string) bool, _ func(string) string) (Turn, bool) {
+	var m []string
+	user := -1
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" {
+			m, user = knowRE.FindStringSubmatch(messages[i].Content), i
+			break
+		}
+	}
+	if m == nil || !has("knowledge__search") {
+		return Turn{}, false
+	}
+	query, extra, _ := strings.Cut(m[2], "|")
+	query, extra = strings.TrimSpace(query), strings.TrimSpace(extra)
+	call := func(tool string, args map[string]any) (Turn, bool) {
+		b, _ := json.Marshal(args)
+		return Turn{Reasoning: "look it up", ToolCalls: []Call{{Name: tool, Args: string(b)}}}, true
+	}
+	var results []string
+	for _, x := range messages[user+1:] {
+		if x.Role == "tool" {
+			results = append(results, x.Content)
+		}
+	}
+	answer := func(last string) (Turn, bool) {
+		var nums string
+		for _, n := range knowNumberRE.FindAllStringSubmatch(last, -1) {
+			nums += "[" + n[1] + "]"
+		}
+		return Turn{Text: "Answer: " + query + " " + nums}, true
+	}
+	switch len(results) {
+	case 0:
+		return call("knowledge__search", map[string]any{"query": query})
+	case 1:
+		doc := knowDocRE.FindStringSubmatch(results[0])
+		switch {
+		case m[1] == "know-dig" && doc != nil && has("knowledge__find"):
+			return call("knowledge__find", map[string]any{"documentId": doc[1], "text": extra})
+		case m[1] == "know-read" && doc != nil && has("knowledge__read"):
+			page := 1
+			fmt.Sscanf(extra, "%d", &page)
+			return call("knowledge__read", map[string]any{"documentId": doc[1], "locator": map[string]any{"page": page}})
+		}
+		return answer(results[0])
+	}
+	return answer(results[len(results)-1])
+}
+
 // the call flow: "call: <tool> <JSON arguments>" calls the offered tool whose name is <tool> or ends in "__<tool>" with exactly those
 // arguments (none: {}), then reports the tool's result text as "Result: <text>", an error as it is. For acceptances against a real third
 // party (platform R1), where the arguments are the point: the model double does not invent them.
@@ -271,6 +328,9 @@ var additionRE = regexp.MustCompile(`(\d+)\s*\+\s*(\d+)`)
 // Server is the fake.
 type Server struct {
 	Script Script
+	// Rewrite answers the question rewrite of idp-host D66 (a request whose system message carries RewriteMarker); nil is
+	// DefaultRewrite. It gets the earlier messages (oldest first) and the last question.
+	Rewrite func(history []Message, question string) Turn
 	// LlamaTimings makes the OpenAI-wire stream answer the way llama.cpp does (D54): usage with prompt_tokens_details.cached_tokens
 	// and a timings object in the last chunk. Off, nothing of it is sent, as before.
 	LlamaTimings bool
@@ -286,6 +346,7 @@ type Server struct {
 	history                   [][]Message // every request, including the host's budget note
 	lastTools                 []string
 	lastMax                   int
+	efforts                   []string
 	models                    []string
 }
 
@@ -316,6 +377,13 @@ func (s *Server) Last() []Message {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]Message(nil), s.last...)
+}
+
+// Efforts returns the reasoning_effort of every OpenAI-wire request, in order ("" for one that sent none).
+func (s *Server) Efforts() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.efforts...)
 }
 
 // History returns every request, in order, including notes the script itself does not see.
@@ -359,6 +427,9 @@ func DefaultScript(messages []Message, tools []string) Turn {
 		return t
 	}
 	if t, ok := webFlow(messages, has, toolName); ok {
+		return t
+	}
+	if t, ok := knowFlow(messages, has, toolName); ok {
 		return t
 	}
 	if t, ok := callFlow(messages, has, toolName); ok {
@@ -596,7 +667,47 @@ func (s *Server) decide(msgs []Message, tools []string) Turn {
 		}
 		plain = append(plain, m)
 	}
+	if q, hist, ok := RewriteRequest(plain); ok {
+		if s.Rewrite != nil {
+			return s.Rewrite(hist, q)
+		}
+		return DefaultRewrite(hist, q)
+	}
 	return s.Script(plain, tools)
+}
+
+// RewriteMarker is the first line of the instructions of the HOST's question rewrite (idp-host D66).
+const RewriteMarker = "idp.host/context.rewrite"
+
+var rewriteRE = regexp.MustCompile(`(?s)^Earlier messages:\n(.*)\n\nLast question:\n(.*)$`)
+
+// RewriteRequest recognises the HOST's question rewrite: a system message that starts with RewriteMarker and one user message that
+// lists the earlier messages ("user: ..." and "assistant: ...", one per line) and the last question.
+func RewriteRequest(msgs []Message) (question string, history []Message, ok bool) {
+	if len(msgs) != 2 || msgs[0].Role != "system" || !strings.HasPrefix(msgs[0].Content, RewriteMarker) || msgs[1].Role != "user" {
+		return "", nil, false
+	}
+	m := rewriteRE.FindStringSubmatch(msgs[1].Content)
+	if m == nil {
+		return "", nil, false
+	}
+	for _, line := range strings.Split(m[1], "\n") {
+		if role, text, found := strings.Cut(line, ": "); found && (role == "user" || role == "assistant") {
+			history = append(history, Message{Role: role, Content: text})
+		}
+	}
+	return m[2], history, true
+}
+
+// DefaultRewrite is a deterministic stand-in for a model that makes a question stand alone: the question followed by the
+// newest earlier user message, "<question> (regarding: <earlier>)". With nothing earlier it repeats the question.
+func DefaultRewrite(history []Message, question string) Turn {
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Role == "user" {
+			return Turn{Text: question + " (regarding: " + history[i].Content + ")"}
+		}
+	}
+	return Turn{Text: question}
 }
 
 func (s *Server) recordMax(n int) {
@@ -611,7 +722,9 @@ type oaiRequest struct {
 	Model     string `json:"model"`
 	Stream    bool   `json:"stream"`
 	MaxTokens int    `json:"max_tokens"`
-	Messages  []struct {
+	// ReasoningEffort is what the HOST asked for the thinking (D63-2): recorded per request, see Efforts
+	ReasoningEffort string `json:"reasoning_effort"`
+	Messages        []struct {
 		Role       string          `json:"role"`
 		Content    json.RawMessage `json:"content"`
 		ToolCallID string          `json:"tool_call_id"`
@@ -640,6 +753,9 @@ func (s *Server) openai(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.recordMax(req.MaxTokens)
+	s.mu.Lock()
+	s.efforts = append(s.efforts, req.ReasoningEffort)
+	s.mu.Unlock()
 	var msgs []Message
 	for _, m := range req.Messages {
 		var content string

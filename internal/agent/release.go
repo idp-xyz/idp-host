@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"path"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -36,12 +37,39 @@ const (
 	SubagentToolPrefix = "agent__"
 	ResourceToolPrefix = "resource__"
 	ResourceReadTool   = ResourceToolPrefix + "read"
+
+	// KnowledgeToolPrefix names the HOST's own knowledge tools (D65): they read the CMI as the member, not through a gateway.
+	// A release turns them on by name in context.tools; a gateway tool with the prefix is never offered.
+	KnowledgeToolPrefix = "knowledge__"
+	KnowledgeSearchTool = KnowledgeToolPrefix + "search"
+	KnowledgeReadTool   = KnowledgeToolPrefix + "read"
+	KnowledgeFindTool   = KnowledgeToolPrefix + "find"
+)
+
+// KnowledgeTools lists the HOST's knowledge tools in the order they are offered.
+var KnowledgeTools = []string{KnowledgeSearchTool, KnowledgeReadTool, KnowledgeFindTool}
+
+// Rewrite values of context.rewrite (D66).
+const (
+	RewriteOff   = "off"   // the last user message is the query, as before (default)
+	RewriteModel = "model" // a thread with earlier turns: the release's model writes the last question as one self-contained sentence
 )
 
 // Reserved reports whether a tool name belongs to the HOST's reserved prefixes.
 func Reserved(tool string) bool {
-	return strings.HasPrefix(tool, SubagentToolPrefix) || strings.HasPrefix(tool, ResourceToolPrefix)
+	return strings.HasPrefix(tool, SubagentToolPrefix) || strings.HasPrefix(tool, ResourceToolPrefix) || strings.HasPrefix(tool, KnowledgeToolPrefix)
 }
+
+// KnowledgeToolOn reports whether the release's context policy turns the HOST's knowledge tool on (D65).
+func (c ContextPolicy) KnowledgeToolOn(tool string) bool {
+	return c.CMI && slices.Contains(c.Tools, tool)
+}
+
+// HasKnowledgeTools reports whether any of the knowledge tools is on.
+func (c ContextPolicy) HasKnowledgeTools() bool { return c.CMI && len(c.Tools) > 0 }
+
+// RewritesQuestion reports whether the release lets the HOST rewrite the first question of a thread that has earlier turns (D66).
+func (c ContextPolicy) RewritesQuestion() bool { return c.CMI && c.Rewrite == RewriteModel }
 
 // SubagentToolName is the model-facing tool name of a sub-agent reference.
 func SubagentToolName(name string) string { return SubagentToolPrefix + name }
@@ -99,6 +127,8 @@ type ContextPolicy struct {
 	Sources   []string `json:"sources,omitempty"`   // knowledge sources (empty = all visible)
 	OnError   string   `json:"onError,omitempty"`   // skip (default) | fail
 	OnStale   string   `json:"onStale,omitempty"`   // continue (default) | refresh | fail: what a stale package means at a later step (CMI D24)
+	Tools     []string `json:"tools,omitempty"`     // the HOST's knowledge tools this release turns on: knowledge__search | knowledge__read | knowledge__find (D65)
+	Rewrite   string   `json:"rewrite,omitempty"`   // off (default) | model: the question of a thread with earlier turns is rewritten before the first retrieval (D66)
 }
 
 // Guards are the release's content guards.
@@ -415,7 +445,7 @@ func (d *Definition) Validate() error {
 	if err := d.Evaluation.Validate(); err != nil {
 		bad("evaluation: %v", err)
 	}
-	if c := d.Context; c.CMI || c.Purpose != "" || c.MaxTokens != 0 || c.MaxItems != 0 || len(c.Kinds) > 0 || len(c.Sources) > 0 || c.OnError != "" {
+	if c := d.Context; c.CMI || c.Purpose != "" || c.MaxTokens != 0 || c.MaxItems != 0 || len(c.Kinds) > 0 || len(c.Sources) > 0 || c.OnError != "" || len(c.Tools) > 0 || c.Rewrite != "" {
 		if !c.CMI {
 			bad("context: settings need context.cmi = true")
 		}
@@ -437,6 +467,16 @@ func (d *Definition) Validate() error {
 		}
 		if c.OnStale != "" && c.OnStale != "continue" && c.OnStale != "refresh" && c.OnStale != "fail" {
 			bad("context.onStale must be continue, refresh or fail")
+		}
+		seenK := map[string]bool{}
+		for _, k := range c.Tools {
+			if !slices.Contains(KnowledgeTools, k) || seenK[k] {
+				bad("context.tools entries must be %s, each at most once", strings.Join(KnowledgeTools, ", "))
+			}
+			seenK[k] = true
+		}
+		if c.Rewrite != "" && c.Rewrite != RewriteOff && c.Rewrite != RewriteModel {
+			bad("context.rewrite must be off or model")
 		}
 	}
 	l := d.Limits

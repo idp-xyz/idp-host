@@ -53,11 +53,18 @@ func Screen(items []Item, ceiling string) Screening {
 // Context is what the run is given: one entry per kept item and, when anything was withheld, one note. Its length is the
 // number of entries appended to the run's context.
 func (s Screening) Context() []agui.Context {
-	out := ContextOf(&Package{Items: s.Kept})
+	out, _ := s.ContextFrom(0)
+	return out
+}
+
+// ContextFrom is Context with the kept knowledge items numbered from first (ContextFrom in cmiclient.go, D67); it returns
+// the number the next knowledge item gets.
+func (s Screening) ContextFrom(first int) ([]agui.Context, int) {
+	out, next := ContextFrom(s.Kept, first)
 	if s.Withheld > 0 {
 		out = append(out, agui.Context{Description: ContextCMIWithheld, Value: s.Note()})
 	}
-	return out
+	return out, next
 }
 
 // Note is what the model is told: counts and levels, and nothing of the entries.

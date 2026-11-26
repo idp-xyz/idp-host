@@ -239,3 +239,15 @@ func TestTheCheckMarksCitedSourcesAndSkipsARunWithNothingToCheck(t *testing.T) {
 		t.Errorf("an outward run that cited nothing has nothing to announce: %+v", quiet)
 	}
 }
+
+// D67: a run whose knowledge items were numbered 1..3 does not have them reported as unverified web citations; a number beyond is.
+func TestKnowledgeNumbersAreKnownToTheCitationCheck(t *testing.T) {
+	var s run.SourceSet
+	if !s.CheckAtEndKnowing("per [2], not [9]", true, 3) || fmt.Sprint(s.Unverified) != "[9]" {
+		t.Fatalf("%v", s.Unverified)
+	}
+	var none run.SourceSet
+	if none.CheckAtEndKnowing("per [2]", false, 3) || none.Checked {
+		t.Error("a run without outward tools and without web sources is not checked")
+	}
+}

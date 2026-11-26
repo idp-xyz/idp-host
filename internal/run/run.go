@@ -107,6 +107,10 @@ type Context struct {
 	// two) may lack the records of some of them or the tool messages of finished ones; the harness repairs it from this.
 	LastCalls       []ToolCall
 	BlockedPatterns []string // the tenant policy's blocked output patterns (D28)
+	// CitationNext is the number the next knowledge item of the run gets (D67): one past the last number any package of the
+	// run gave, from the run's own events. 0 when no store told (a store that does not keep it): the harness then counts what
+	// the run's context holds.
+	CitationNext int
 }
 
 type stopKey struct{}

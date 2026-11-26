@@ -340,6 +340,12 @@ const (
 	CustomContextResolved = "idp.host/context.resolved"
 	CustomContextSkipped  = "idp.host/context.skipped"
 	CustomContextStale    = "idp.host/context.stale" // a later step found the package stale (CMI D24)
+	// CustomContextPackage: a knowledge tool call made a package (D65): {packageId, tool, query | documentId+locator | documentId+text,
+	// itemCount, firstIndex}; the items given to the model are numbered firstIndex .. firstIndex+itemCount-1 (D67).
+	CustomContextPackage = "idp.host/context.package"
+	// CustomContextRewrite: the first question of a thread with earlier turns was rewritten (D66): {mode, outcome, original,
+	// query, reason?, model?, usage?}. query is what the first retrieval used.
+	CustomContextRewrite = "idp.host/context.rewrite"
 	// model routing (ADR-0001 D29)
 	CustomModelRouted = "idp.host/model.routed"
 	// CustomModelRetry: a request to a model failed with an error worth another try and the host waits before it makes

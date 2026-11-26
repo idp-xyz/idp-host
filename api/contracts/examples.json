@@ -1,5 +1,5 @@
 {
-  "description": "idp.telos.host 1.11.0 的示例：每一个都是 idp-host 实际产出或原样接受的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录，RunOptions 经 run.ParseOptions 解析后原样往返）。",
+  "description": "idp.telos.host 1.12.0 的示例：每一个都是 idp-host 实际产出或原样接受的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录，RunOptions 经 run.ParseOptions 解析后原样往返）。",
   "generatedBy": "go test ./internal/run -run TestContract -update",
   "examples": [
     {
@@ -28,8 +28,14 @@
             "onError": "skip",
             "onStale": "refresh",
             "purpose": "parcel operations assistant",
+            "rewrite": "model",
             "sources": [
               "ops-handbook"
+            ],
+            "tools": [
+              "knowledge__search",
+              "knowledge__read",
+              "knowledge__find"
             ]
           },
           "evaluation": {
@@ -294,7 +300,7 @@
     {
       "definition": "Envelope",
       "value": {
-        "digest": "sha256:5b73bc7ee88a23f9ce1dce82e2d8efb54cc9a493fef3008034e09fdf39643c68",
+        "digest": "sha256:3db82abeef8d3d583aa5c606885f177cc804a13ed4d26456a583a7027a75d060",
         "document": {
           "agentId": "9e8d7c6b-0000-4000-8000-000000000002",
           "agentName": "parcel-assistant",
@@ -319,8 +325,14 @@
               "onError": "skip",
               "onStale": "refresh",
               "purpose": "parcel operations assistant",
+              "rewrite": "model",
               "sources": [
                 "ops-handbook"
+              ],
+              "tools": [
+                "knowledge__search",
+                "knowledge__read",
+                "knowledge__find"
               ]
             },
             "evaluation": {
@@ -552,7 +564,7 @@
         "deadlineAt": "2026-11-03T13:10:00Z",
         "finishedAt": "2026-11-03T13:00:09Z",
         "owner": "carol",
-        "releaseDigest": "sha256:5b73bc7ee88a23f9ce1dce82e2d8efb54cc9a493fef3008034e09fdf39643c68",
+        "releaseDigest": "sha256:3db82abeef8d3d583aa5c606885f177cc804a13ed4d26456a583a7027a75d060",
         "releaseId": "7f3c1a2e-5b6d-4c8e-9f01-23456789abcd",
         "runId": "run_01JD7Q3Z8M8T0G3C6N4V9S2A1B",
         "startedAt": "2026-11-03T13:00:01Z",
@@ -570,7 +582,7 @@
         "createdAt": "2026-11-03T13:10:00Z",
         "deadlineAt": "2026-11-03T13:20:00Z",
         "owner": "carol",
-        "releaseDigest": "sha256:5b73bc7ee88a23f9ce1dce82e2d8efb54cc9a493fef3008034e09fdf39643c68",
+        "releaseDigest": "sha256:3db82abeef8d3d583aa5c606885f177cc804a13ed4d26456a583a7027a75d060",
         "releaseId": "7f3c1a2e-5b6d-4c8e-9f01-23456789abcd",
         "runId": "run_01JD7Q3Z8M8T0G3C6N4V9S2A1C",
         "startedAt": "2026-11-03T13:10:01Z",
@@ -587,7 +599,7 @@
         "createdAt": "2026-11-03T13:20:00Z",
         "deadlineAt": "2026-11-03T13:30:00Z",
         "owner": "carol",
-        "releaseDigest": "sha256:5b73bc7ee88a23f9ce1dce82e2d8efb54cc9a493fef3008034e09fdf39643c68",
+        "releaseDigest": "sha256:3db82abeef8d3d583aa5c606885f177cc804a13ed4d26456a583a7027a75d060",
         "releaseId": "7f3c1a2e-5b6d-4c8e-9f01-23456789abcd",
         "runId": "run_01JD7Q3Z8M8T0G3C6N4V9S2A1E",
         "startedAt": "2026-11-03T13:20:01Z",
@@ -625,7 +637,7 @@
         "finishedAt": "2026-11-03T13:30:04Z",
         "owner": "alice",
         "purpose": "evaluation",
-        "releaseDigest": "sha256:5b73bc7ee88a23f9ce1dce82e2d8efb54cc9a493fef3008034e09fdf39643c68",
+        "releaseDigest": "sha256:3db82abeef8d3d583aa5c606885f177cc804a13ed4d26456a583a7027a75d060",
         "releaseId": "7f3c1a2e-5b6d-4c8e-9f01-23456789abcd",
         "runId": "eval_7f3c1a2e5b6d4c8e9f0123456789abcd_0",
         "startedAt": "2026-11-03T13:30:01Z",
@@ -643,7 +655,7 @@
         "deadlineAt": "2026-11-03T13:50:00Z",
         "finishedAt": "2026-11-03T13:40:20Z",
         "owner": "carol",
-        "releaseDigest": "sha256:5b73bc7ee88a23f9ce1dce82e2d8efb54cc9a493fef3008034e09fdf39643c68",
+        "releaseDigest": "sha256:3db82abeef8d3d583aa5c606885f177cc804a13ed4d26456a583a7027a75d060",
         "releaseId": "7f3c1a2e-5b6d-4c8e-9f01-23456789abcd",
         "runId": "run_01JD7Q3Z8M8T0G3C6N4V9S2A1F",
         "sources": [
@@ -691,7 +703,7 @@
         "failureMessage": "the run reached its limit of 12 steps",
         "finishedAt": "2026-11-03T13:25:00Z",
         "owner": "carol",
-        "releaseDigest": "sha256:5b73bc7ee88a23f9ce1dce82e2d8efb54cc9a493fef3008034e09fdf39643c68",
+        "releaseDigest": "sha256:3db82abeef8d3d583aa5c606885f177cc804a13ed4d26456a583a7027a75d060",
         "releaseId": "7f3c1a2e-5b6d-4c8e-9f01-23456789abcd",
         "runId": "run_01JD7Q3Z8M8T0G3C6N4V9S2A1D",
         "startedAt": "2026-11-03T13:20:01Z",
@@ -705,14 +717,14 @@
       "value": {
         "idp.host/executionRef": "execution:shipment-7f3a",
         "idp.host/maxOutputTokens": 1024,
-        "idp.host/releaseDigest": "sha256:5b73bc7ee88a23f9ce1dce82e2d8efb54cc9a493fef3008034e09fdf39643c68",
+        "idp.host/releaseDigest": "sha256:3db82abeef8d3d583aa5c606885f177cc804a13ed4d26456a583a7027a75d060",
         "idp.host/toolExecution": "caller"
       }
     },
     {
       "definition": "RunOptions",
       "value": {
-        "idp.host/releaseDigest": "sha256:5b73bc7ee88a23f9ce1dce82e2d8efb54cc9a493fef3008034e09fdf39643c68"
+        "idp.host/releaseDigest": "sha256:3db82abeef8d3d583aa5c606885f177cc804a13ed4d26456a583a7027a75d060"
       }
     },
     {

@@ -1603,3 +1603,63 @@ strata serve: prompt 20096 tokens = 2491 reused + 17605 read in 4364 ms (4034.5 
 | D64-6 | **审计**：`idp.host/context.withheld` 增加 `source: "tool_result"`、工具名与被扣留的字段数，不记内容。 | 要能回答"为什么模型这一步没看到这些数据"，又不在审计里重复数据本身。 |
 
 **由 HOST 维护方实施**。顺序是先做 idp-mcp D54 的声明与现有目标的登记，再在 HOST 里强制。与 D63-2、D63-10 一起排进 HOST 的工作，排在知识库的 HOST 工具之后。
+
+## 47. D65–D68：知识检索工具、问题改写、引用编号与成员令牌（2026-11-25 实施，KB8，契约 1.12.0，平台 knowledge-base-plan 第 2.9 节第 1 条、第 2.10 节第 3 条、第 2.11 节第 5 条；接口约定 `docs/adr/kb8-cmi-api.md`）
+
+HOST 一侧的 KB8。CMI 一侧（`context/read`、`context/find`、解析的 `knowledgeBases` 与 `docTypes`，契约 `idp.telos.cmi` 1.7.0）由 idp-cmi 实施；这里照约定文件与它文末 2026-11-25 的说明写，测试用 `tests/fixtures/fakecmi`（按约定文件做的假 CMI）。**还没有对真实 idp-cmi 跑过**。
+
+| # | 决策 | 理由 |
+|---|---|---|
+| D65 | **三个内置工具，不经网关，发布件按名字开启。** `context.tools` 列 `knowledge__search {query, entities?, asOf?, knowledgeBases?, docTypes?}`、`knowledge__read {documentId, locator?}`、`knowledge__find {documentId, text}`；要 `context.cmi = true`（校验）；`toolExecution: caller` 的运行与没有 CMI 的 HOST 都不提供。前缀 `knowledge__` 与 `agent__`、`resource__` 一样归 HOST：允许列表不能写，网关同名的工具不提供。参数严格校验：键名逐字符相同（Go 的解码器认 `Query`，这里不认）、类型、长度（查询 1000 字符、找的文字 200 字符、标题路径每项 200 字符）、`entities`、`knowledgeBases`、`docTypes` 各至多 8 项且不重复、实体类型与 id 的字符集、知识库名的字符集、`documentId` 的字符集、`asOf` 是日期（当天末，UTC）或 RFC 3339、`locator` 只能是 `page`、`slide`、`headings`、`sheet`（可带 `range`）之一，数字从 1 起。校验不过，调用不发给 CMI，模型读到 HOST 自己的话（说哪里错，不重复值），运行照常。CMI 的错误只映射成 HOST 的话：404 = "not found or not visible"，401/403 = 不可用或无权，400/422 = 请求被拒、检查参数，429 = 忙，其余与连不上 = 服务不可用；CMI 的正文、地址、令牌都不进结果。每次调用读的预算：`maxTokens` 取 D40 上限的四分之一字节数，`search` 另带发布件的 `maxItems`，`kinds` 只要知识、`sources` 用发布件的。 | 与 `resource__read` 同一做法，敏感上限（D44）与不可信标记（D27）都在 HOST 里，所以检索工具也只能在 HOST 里。严格校验是因为参数来自模型：宁可退回让它改，不把畸形的东西交给 CMI。`find` 与 `read` 的结果以只读、可重复的调用对待（D47）：EXECUTING 时 worker 中断，接手的 worker 重发。 |
+| D66 | **首次检索之前的问题改写。** `context.rewrite`：`off`（缺省，行为与以前相同）或 `model`。线程里已有前文（请求里最后一条用户消息之前，至少有一条有文字的用户或助手消息）且发布件允许时，创建运行的请求在向 CMI 解析之前，调 HOST 受管的模型调用（`Harness.RewriteQuestion`，D63-1 (b)）：用发布件自己的模型档案，路由器排候选，每个候选只试一次，低思考强度，输出上限 128 token，总时限 `IDP_HOST_REWRITE_TIMEOUT`（缺省 8 秒），温度 0，只给最近 6 条前文各截 600 字符；回答必须是非空的一行、至多 300 个字符、不被发布件的输出禁用模式命中、不是被输出上限截断的，否则不修，用原话。事件 `idp.host/context.rewrite {mode, outcome: rewritten | unchanged | fallback, original, query, reason?, provider, model, promptTokens, completionTokens, latencyMs}` 写在 `context.resolved` 之前；`resolved` 也带 `query`。CMI 不可用而跳过时，重写事件仍记。思考强度（D63-2）只做了重写要用的：`model.Request.Effort` 与 OpenAI 兼容适配器的 `reasoning_effort`，其余适配器忽略，D63-2 的其余部分与 D63-10（结构化输出）没有做；重写用纯文本加严格的事后检查。 | 计划第 2.10 节第 3 处：追问（"那第二条呢"）直接去查查不准。改写在创建运行的请求里做，是因为首次解析本来就在那里（D32），移到 worker 里要改存储与幂等。代价：创建请求多一次最长 8 秒的模型调用，只在有前文且发布件开启时；幂等重放也会再做一次（重放比较发生在解析之后，D32 的解析本来也是这样）。没有做 `history`（不调模型、把最近几条用户消息连起来）这一档，计划第 2.10 节列了它，未要求。 |
+| D67 | **引用编号在一次运行里连续。** 运行开头那个包的知识条目编 `[1]…`（描述写成 `CMI [n] knowledge from …`，仍以 `CMI ` 开头，D44 的识别不变；记忆条目没有编号），工具的每个包接着编，只编交给模型的条目（筛掉的、因 D40 没显示的不编）。计数器不另存一列：它是运行自己事件里最后一个编号之后的数（`context.resolved`、`context.package` 与刷新时的 `context.stale` 各记 `firstIndex` 与条数），`Store.Context` 读出来放在 `CitationNext`，所以接手、确认后的恢复、worker 重启都接着编，包事件与工具调用的答案在同一个事务里写，一次调用只编一次号。没有这个值的存储（测试替身）按上下文条目里的最大编号加一。`onStale = refresh` 换进来的条目接着计数器编。事件 `idp.host/context.package {packageId, digest, tool, query | documentId+locator | documentId+text, itemCount, firstIndex, returned, cut?}`；运行上的 `contextPackageId` 仍只是开头那个包，运行的表示没有变（契约里没有列包）。D49 的核对知道这些编号：回答里的 `[n]` 落在 1 到已编的最大号之间，不报为无法核对（`CheckAtEndKnowing`）。 | 回答里的 `[n]` 不分开头取的还是后来查的。事件就是持久化的账：不加迁移、不加列，也不会与包事件不一致。 |
+| D68 | **以成员的身份调 CMI，不用 HOST 自己的凭据，没有退路。** CMI 以委派方式接入（`cmi.auth.mode: delegation`）时，创建运行的请求里那次令牌交换（与首次解析同一次）得到的成员令牌，在发布件开了知识工具且 HOST 执行工具时，加密存入 `runs.cmi_credential`（迁移 0014；同一把 `IDP_HOST_CREDENTIAL_KEY`；没有这把钥匙时 409），运行结束与取消时清除，子运行继承。`cmi.auth.sessionBound` 时交换带 refresh token，worker 在过期前续期、CMI 回 401 时续期一次再发，续期后存回。**工具只用这个令牌**：没有它（CMI 不是以委派接入，或创建时交换失败，或续期不了），工具回"不可用"的错误，**从不改用 HOST 自己的 CMI 密钥或自己签发的服务令牌**。 | CMI 让写入服务与管理员凭文档 id 读任何成员的个人库；服务令牌一旦被工具用上，每个成员的个人库就都对模型开着。委派之外的接入方式（静态密钥、`client_credentials`）因此不能给这三个工具用，这是有意的：它们下的开头那次解析、D24 的复验与 D33 的写回仍照旧用 HOST 自己的凭据。 |
+
+**契约 `idp.telos.host` 1.12.0（只做新增）**：`ContextPolicy` 增 `tools`（至多 3 项，三个名字之一，不重复）与 `rewrite`（`off` | `model`）；`tools.allow` 与 skill 的工具不得以 `knowledge__` 开头。事件 `idp.host/context.package`、`idp.host/context.rewrite` 与 `resolved`、`stale` 的新字段不属于 schema。
+
+**实施**：`internal/agent`（`ContextPolicy.Tools/Rewrite`、`KnowledgeTools`、保留前缀）；`internal/cmiclient`（`Read`、`Find`、`StatusError`、`ContextFrom` 编号、`rewrite.go`）；`internal/harness`（`knowledge.go`、`knowledge_args.go`、`rewrite.go`；`prepareTools`、`execute`、`mayResend`、`hostTool`、`guardedMessages`、`verifyContext`）；`internal/api`（`Rewriter`、`resolveContext` 的改写、编号与成员令牌）；`internal/model` 与 OpenAI 适配器（`Effort`）；`adapters/store/postgres`（迁移 0014、`CMICredential`、`SaveCMICredential`、`citationNext`）；`internal/run`（`CheckAtEndKnowing`、`Context.CitationNext`）；`cmd/idp-host`（`cmi.auth.sessionBound`、`IDP_HOST_REWRITE_TIMEOUT`）。测试替身：`tests/fixtures/fakecmi`（按约定文件与 1.7.0 的说明）、`fakemodel` 的改写脚本（`Server.Rewrite`、`DefaultRewrite`）、`knowFlow`（`know:`、`know-dig:`、`know-read:`）与 `Efforts()`。
+
+**验证**：单元（`internal/harness` 的 `knowledge_test.go`、`rewrite_test.go`，`internal/cmiclient`、`internal/agent`、`internal/run`）；PostgreSQL（`tests/integration/knowledge_test.go`：一次运行多个包、编号连续、事件、成员身份、别人的个人文档 404、没开工具不提供、caller 模式不提供且不存令牌、带外部模型的运行按上限筛选、worker 在 `find` 中死去后重发且编号不重不漏、改写成功与回退、开关、没有前文不调模型、CMI 不可用）。每个 CMI 假替身的测试在结束时断言：工具从没有出示 HOST 自己的凭据。`contract_test` 的 CMI 钉住的是 1.4.0：`locator` 与 `hits` 是更晚版本的字段，作为"有则读"放行，钉住移到 1.7.0 要平台矩阵配合。端到端（compose）没有做：它需要真实的模型与 idp-cmi，在平台验收里做。
+
+**拿掉一个控制、看测试失败**（每一项在实现里拿掉一次，跑 `internal/harness` 的知识与改写测试，涉及存储或 API 的跑 `tests/integration` 的 `Knowledge|QuestionRewrite`，失败后恢复）
+
+| 控制 | 拿掉的东西 | 失败的测试 |
+|---|---|---|
+| 工具只在发布件开启时提供（D65） | `KnowledgeToolOn` 改为恒真 | `TestKnowledgeToolsAreOfferedOnlyWhenTheReleaseTurnsThemOn` |
+| caller 模式没有工具 | 去掉 `ToolExecution == caller` 的判断 | 同上 |
+| 键名逐字符相同 | 改成不分大小写 | `TestTheArgumentsAreCheckedBeforeAnythingIsSent` |
+| locator 只指一处 | `set != 1` 改为 `set > 1` | 同上 |
+| 列表至多 8 项 | 上限改成 80 | 同上 |
+| 查询必填 | 去掉空串判断 | 同上 |
+| 成员令牌是运行的凭据（D68） | `cmiBearer` 忽略存下的令牌 | `TestTheMemberCredentialOfTheRunIsWhatTheCMIIsCalledWith`、`TestACredentialCloseToExpiryIsRenewedAndSavedAndARefusedOneIsRenewedOnce` 等十余个 |
+| **没有退路：从不用 HOST 自己的凭据（D68）** | 没有成员令牌时改用 `h.cmiKey` | `TestARunWithoutAMemberCredentialNeverFallsBackToTheServiceCredential`（HOST 有密钥与签发令牌，三个工具都必须回"不可用"、假 CMI 一个请求也没收到）；每个知识测试结束时的断言也会失败 |
+| 令牌只在开了工具且 HOST 执行工具时存 | 创建时恒不存 | `TestKnowledgeToolsOnPostgres` |
+| 令牌随运行结束清除 | `UPDATE` 不清 `cmi_credential` | `TestKnowledgeToolsOnPostgres` |
+| 结果按上限筛（D44） | 不筛 | `TestACeilingWithholdsTheItemsAboveItFromTheToolResultsAndRecordsIt` |
+| `context.withheld` 事件（`source: knowledge_tool`） | 不写事件 | 同上 |
+| 工具结果一律不可信（D27） | 去掉 `hasKnowledgeTools` 的提升 | `TestAKnowledgeResultIsWrappedAsUntrustedWhateverTheReleaseSays` |
+| D40 的大小限制，在条目边界截断 | 去掉大小判断 | `TestAResultLongerThanTheLimitIsCutAtAPassageAndOnlyWhatIsShownIsNumbered` |
+| 404 = not found or not visible | 去掉 404 的映射 | `TestACMIErrorBecomesAToolErrorThatLeaksNothing`、`TestADocumentTheMemberCannotSeeIsNotFound` |
+| 中断的知识调用重发（D47） | `mayResend` 对知识工具回 false | `TestAKnowledgeCallThatWasInProgressWhenAWorkerStoppedIsSentAgain` |
+| 引用编号在运行内连续（D67）：计数器随调用前进 | 去掉 `citeNext += given` | `TestSearchReadAndFindCallTheCMIAndNumberWhatTheModelIsGiven` 等三个 |
+| 只给显示出来的条目编号 | 按全部条目编号 | `TestSearchReadAndFindCallTheCMIAndNumberWhatTheModelIsGiven` |
+| 计数器取自存储 | 忽略 `CitationNext` | `TestTheCounterStartsWhereTheStoreSaysTheRunLeftOff` |
+| 存储从事件算计数器，包括 `context.package` | SQL 不算 `context.package` | `TestKnowledgeNumbersSurviveAHandOverOnPostgres`（worker 在 `find` 中死去后重发，号码重复） |
+| 刷新换进的条目接着编号 | 从 1 重编 | `TestRefreshedContextIsScreenedWithTheCeilingRecordedAtCreation` |
+| D49 的核对认得知识编号 | 去掉 `n <= knowledge` | `TestKnowledgeNumbersAreKnownToTheCitationCheck`（存储一侧只靠这条单元测试与调用，没有单独的集成断言） |
+| 改写只在有前文时（D66） | `PriorTurns` 不要求有前文 | `TestTheQuestionRewriteOnPostgres`（没有前文的子例） |
+| 发布件的开关 | `RewritesQuestion` 恒真 | `TestTheQuestionRewriteOnPostgres`（开关子例） |
+| 回答必须一行 | 去掉换行检查 | `TestThePriorTurnsOfARequest`、`TestTheRewriteFallsBackToTheOriginalWhateverGoesWrong` |
+| 长度上限 300 字符 | 上限改成 100000 | 同上 |
+| 失败退回原话 | 失败时不返回原话 | `TestTheRewriteFallsBackToTheOriginalWhateverGoesWrong` |
+| 总时限 | 去掉超时 | `TestARewriteThatTakesTooLongIsGivenUp`（挂起，20 秒后测试超时失败） |
+| 低思考强度 | 不发 `Effort` | `TestTheRewriteIsOneGovernedLowEffortCallWhoseAnswerBecomesTheQuery` |
+| 输出上限 128 token | 不发上限 | 同上 |
+
+**没有做的、与留给平台验收的**
+- 没有对真实 idp-cmi 跑过。CMI 一侧文末说明里的几处按它读：`hits` 的单位在 CMI 侧还在变（改成相对于摘录，并加 `hitCount`），HOST 只把它如实告诉模型（"在所示文字的第几个字符"），不拿它算任何东西；条目的 `id` 可能不同于请求的 `documentId`（CMI 取 `asOf` 时的现行版本），HOST 用条目自己的 `id` 与 `ref`，不当作错误。
+- `knowledge__find` 的说明写明：没有找到只表示当前版本里没有这段原文，长的短语在少数情形下可能因跨块被漏掉，先试短的。
+- 编号撞车：联网来源的编号（idp-web 按调用者递增）与知识编号都是 `[n]`，同一次运行两者都有时 `[1]` 可以是两样东西；D49 的核对只能判断"存在"。子 agent 的知识编号也是自己从 1 起，父运行引用子 agent 回答里的 `[n]` 同理。要解决得给其中一种换前缀，是另一个决定。
+- 工具包不做 D24 的复验（只复验开头那个包）；运行的表示（`GET /v1/runs/{id}`）不列包，包只在事件里。
+- 没有 compose 与 kind 上的端到端；没有真实模型。D63-2 的其余部分与 D63-10 没有做。
+- 平台验收要查：成员 A 的个人库文档 B 读不到（404）；委派令牌确实是成员的（CMI 审计里的主体）；开头包与工具包的编号连续且与 Workspace 显示的出处一致；带外部工具的运行里高于上限的条目没有进模型（事件 `context.withheld` 的 `source: knowledge_tool`）；追问题上改写的那句话在事件里、CMI 审计里查的是它；改写关掉时没有额外的模型调用；运行结束后 `runs.cmi_credential` 为空；CMI 的 `hits` 最终形状与 HOST 的显示一致；`cmi.auth` 要配 `delegation`（与 `sessionBound`）这三个工具才可用。
