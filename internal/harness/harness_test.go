@@ -352,7 +352,7 @@ func setup(t *testing.T) *env {
 	xs := httptest.NewServer(fx.Handler())
 	t.Cleanup(xs.Close)
 	hc, _ := model.NewHTTPClient(5*time.Second, "")
-	p, err := openai.New(openai.Config{Name: "fake", BaseURL: ms.URL + "/v1", HTTP: hc, UsageInStream: true})
+	p, err := openai.New(openai.Config{Name: "fake", BaseURL: ms.URL + "/v1", HTTP: hc, UsageInStream: true, ReasoningEffort: true})
 	if err != nil {
 		t.Fatal(err)
 	}

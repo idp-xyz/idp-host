@@ -70,7 +70,7 @@ func (s *Store) CheckSources(ctx context.Context, c *run.Claim, answer string) e
 		if err != nil {
 			return err
 		}
-		if !set.CheckAtEndKnowing(answer, r.Input.ExternalTools, next-1) {
+		if !set.CheckAtEndKnowing(answer, r.Input.ExternalTools, max(next-1, 0)) {
 			return nil
 		}
 		if err := saveSources(ctx, tx, c.TenantID, c.RunID, set); err != nil {

@@ -113,6 +113,10 @@ type Context struct {
 	CitationNext int
 }
 
+// ErrCMICredentialUnusable: the run has a member credential for the CMI that cannot be used (it cannot be opened, or renewed). The
+// knowledge tools are then not offered, and the run goes on without them (D68).
+var ErrCMICredentialUnusable = errors.New("the member's credential for the CMI cannot be used")
+
 type stopKey struct{}
 
 // WithStop returns a context that tells the harness the worker was told to stop (D47) when stop is closed. It is not a
@@ -180,6 +184,8 @@ type Input struct {
 	ContextVia []string `json:"contextVia,omitempty"`
 	// ExternalTools: the release may call a tool that sends content outside the enterprise.
 	ExternalTools bool `json:"externalTools,omitempty"`
+	// ContextQuery is the question the first retrieval used when the question rewrite made it (D66); a refresh asks it again.
+	ContextQuery string `json:"contextQuery,omitempty"`
 }
 
 // ToolExecutionCaller: the caller executes every tool. The run offers the model only the caller's

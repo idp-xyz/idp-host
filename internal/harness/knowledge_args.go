@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -48,7 +49,7 @@ func refuse(format string, a ...any) error { return errArgs(fmt.Sprintf(format, 
 
 // strictObject decodes the arguments as a JSON object with exactly the allowed keys (case-sensitive: Go's decoder would accept
 // "Query" for "query") into dst, which must have no other fields.
-func strictObject(raw string, allowed []string, dst any) error {
+func strictObject(raw string, allowed []string, dst any, nested ...nestedKeys) error {
 	if strings.TrimSpace(raw) == "" {
 		raw = "{}"
 	}
@@ -65,6 +66,11 @@ func strictObject(raw string, allowed []string, dst any) error {
 			return refuse("unknown argument %q; the arguments are %s", clip(k, 40), strings.Join(allowed, ", "))
 		}
 	}
+	for _, n := range nested {
+		if err := n.check(keys[n.field]); err != nil {
+			return err
+		}
+	}
 	dec := json.NewDecoder(bytes.NewReader([]byte(raw)))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
@@ -76,6 +82,40 @@ func strictObject(raw string, allowed []string, dst any) error {
 			return refuse("unknown argument %s", clip(rest, 60))
 		}
 		return refuse("the arguments are not valid for this tool")
+	}
+	return nil
+}
+
+// nestedKeys says which keys an object at one level below the arguments may have: field is the argument, list says whether it
+// is an array of such objects. The same spelling rule holds at every level (Go's decoder would take "Page" for "page").
+type nestedKeys struct {
+	field   string
+	list    bool
+	allowed []string
+}
+
+func (n nestedKeys) check(raw json.RawMessage) error {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var objs []json.RawMessage
+	if n.list {
+		if err := json.Unmarshal(raw, &objs); err != nil {
+			return nil // the typed decode says what is wrong
+		}
+	} else {
+		objs = []json.RawMessage{raw}
+	}
+	for _, o := range objs {
+		var m map[string]json.RawMessage
+		if json.Unmarshal(o, &m) != nil {
+			continue
+		}
+		for k := range m {
+			if !slices.Contains(n.allowed, k) {
+				return refuse("unknown key %q in %s; the keys are %s", clip(k, 40), n.field, strings.Join(n.allowed, ", "))
+			}
+		}
 	}
 	return nil
 }
@@ -128,7 +168,7 @@ type searchArgs struct {
 // are the release's).
 func parseSearch(raw string, now time.Time) (cmiclient.Request, error) {
 	var a searchArgs
-	if err := strictObject(raw, []string{"query", "entities", "asOf", "knowledgeBases", "docTypes"}, &a); err != nil {
+	if err := strictObject(raw, []string{"query", "entities", "asOf", "knowledgeBases", "docTypes"}, &a, nestedKeys{"entities", true, []string{"type", "id"}}); err != nil {
 		return cmiclient.Request{}, err
 	}
 	q, err := line("query", a.Query, maxQueryRunes)
@@ -217,7 +257,7 @@ func parseDocumentID(id string) (string, error) {
 // path, or a sheet (with the cell range to read).
 func parseRead(raw string) (cmiclient.ReadRequest, error) {
 	var a readArgs
-	if err := strictObject(raw, []string{"documentId", "locator"}, &a); err != nil {
+	if err := strictObject(raw, []string{"documentId", "locator"}, &a, nestedKeys{"locator", false, []string{"page", "slide", "headings", "sheet", "range"}}); err != nil {
 		return cmiclient.ReadRequest{}, err
 	}
 	id, err := parseDocumentID(a.DocumentID)

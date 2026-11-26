@@ -18,11 +18,15 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"idp-host/adapters/identity"
 	"idp-host/internal/agent"
 	"idp-host/internal/agui"
 	"idp-host/internal/api"
+	"idp-host/internal/authorization"
 	"idp-host/internal/cmiclient"
 	"idp-host/internal/credential"
+	"idp-host/internal/harness"
+	"idp-host/internal/model"
 	"idp-host/internal/run"
 	"idp-host/tests/fixtures/fakecmi"
 	"idp-host/tests/fixtures/fakemodel"
@@ -71,8 +75,20 @@ func knowledgeEnv(t *testing.T, docs ...fakecmi.Doc) (*env, *fakecmi.Server) {
 	t.Cleanup(idp.Close)
 	x := &credential.Exchanger{TokenEndpoint: idp.URL, ClientID: "idp-host", ClientSecret: "s", Audience: "cmi", SessionBound: true, HTTP: idp.Client()}
 	client := &cmiclient.Client{Endpoint: cmi.URL, HTTP: cmi.Client()}
-	e.host.CMI, e.host.CMIAuth, e.host.Rewriter = client, api.GatewayAuth{Exchanger: x}, e.harness
+	// the question rewrite is made by the API's own harness (the worker's is another object), as main wires it
+	e.host.CMI, e.host.CMIAuth = client, api.GatewayAuth{Exchanger: x}
+	e.host.Rewriter = &harness.Harness{Providers: e.harness.Providers, Router: model.NewRouter(), Log: e.harness.Log}
 	e.harness.CMI, e.harness.CMIRefresh = client, x.Refresh
+	// the people who use the HOST as themselves; erin is one (carol and bob hold only host-user, as a service account may)
+	e.host.MemberRoles = []string{"ws-member"}
+	tok, err := identity.DevToken([]byte(devSecret), profile, "erin", e.tenantA, []string{authorization.RoleUser, "ws-member"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.tokens["erin"] = tok
+	if e.tokens["frank"], err = identity.DevToken([]byte(devSecret), profile, "frank", e.tenantA, []string{authorization.RoleUser, "ws-member"}, time.Hour); err != nil {
+		t.Fatal(err)
+	}
 	// the HOST has credentials of its own for the CMI; the tools must never present them (D68), and the cleanup fails the test if one did
 	e.harness.CMIKey, e.host.CMIKey = "host-service-key", "host-service-key"
 	e.harness.CMIToken = func(context.Context) (string, error) { return "host-service-key", nil }
@@ -120,29 +136,29 @@ func (e *env) credentialColumn(id string) (present bool, sealed []byte) {
 }
 
 func TestKnowledgeToolsOnPostgres(t *testing.T) {
-	e, fc := knowledgeEnv(t, handbookDoc(), fakecmi.Doc{ID: "doc-carol", Title: "Carol's notes", Source: "personal", KB: "personal-carol", Visible: []string{"carol"},
+	e, fc := knowledgeEnv(t, handbookDoc(), fakecmi.Doc{ID: "doc-carol", Title: "Carol's notes", Source: "personal", KB: "personal-carol", Visible: []string{"erin"},
 		Blocks: []fakecmi.Block{{Text: "returns: carol keeps her own notes on returns"}}})
 
 	t.Run("a run with several packages: member identity, events, continuous numbers, the first package stays on the run", func(t *testing.T) {
 		e.publish("librarian", knowledgeAgent(agent.KnowledgeTools, ""))
 		e.model.Script = fakemodel.DefaultScript
-		r := e.must(202, "POST", "/v1/agents/librarian/runs", "carol", runBody("kb-1", "know-dig: returns | fuel surcharge"), "Idempotency-Key", "kb1")
+		r := e.must(202, "POST", "/v1/agents/librarian/runs", "erin", runBody("kb-1", "know-dig: returns | fuel surcharge"), "Idempotency-Key", "kb1")
 		id := r["runId"].(string)
 		// the credential made at creation is kept with the run, sealed
 		present, sealed := e.credentialColumn(id)
-		if !present || strings.Contains(string(sealed), "member:carol") {
+		if !present || strings.Contains(string(sealed), "member:erin") {
 			t.Fatalf("the member's CMI credential is kept sealed: present %v", present)
 		}
 		e.drive()
-		got := e.must(200, "GET", "/v1/runs/"+id, "carol", nil)
+		got := e.must(200, "GET", "/v1/runs/"+id, "erin", nil)
 		if got["status"] != run.StatusCompleted {
 			t.Fatalf("%v", got)
 		}
 		if present, _ := e.credentialColumn(id); present {
 			t.Error("the credential is cleared when the run ends")
 		}
-		resolved := e.eventsOf(id, "carol", agui.CustomContextResolved)
-		pk := e.eventsOf(id, "carol", agui.CustomContextPackage)
+		resolved := e.eventsOf(id, "erin", agui.CustomContextResolved)
+		pk := e.eventsOf(id, "erin", agui.CustomContextPackage)
 		// the first retrieval matched the three blocks and carol's note (4 entries), numbered 1-4; the tools go on from 5
 		if len(resolved) != 1 || resolved[0]["packageId"] != got["contextPackageId"] || resolved[0]["firstIndex"] != float64(1) || resolved[0]["numbered"] != float64(4) || resolved[0]["query"] != "know-dig: returns | fuel surcharge" {
 			t.Fatalf("%v %v", resolved, got["contextPackageId"])
@@ -153,7 +169,7 @@ func TestKnowledgeToolsOnPostgres(t *testing.T) {
 		}
 		// every CMI call was made as the member, and the knowledge tools reached the three endpoints they should
 		for _, req := range fc.Requests() {
-			if req.Bearer != "member:carol" && !strings.HasSuffix(req.Path, "/verify") { // D24's check of the first package is the HOST's own, as before
+			if req.Bearer != "member:erin" && !strings.HasSuffix(req.Path, "/verify") { // D24's check of the first package is the HOST's own, as before
 				t.Errorf("%s was called as %q", req.Path, req.Bearer)
 			}
 		}
@@ -177,7 +193,7 @@ func TestKnowledgeToolsOnPostgres(t *testing.T) {
 		if !strings.Contains(answer, "[9] Returns policy") || !strings.Contains(answer, `<untrusted source="tool_result">`) {
 			t.Errorf("%q", answer)
 		}
-		msgs := e.must(200, "GET", "/v1/threads/kb-1/messages", "carol", nil)
+		msgs := e.must(200, "GET", "/v1/threads/kb-1/messages", "erin", nil)
 		if !strings.Contains(fmt.Sprint(msgs), "Answer: returns") {
 			t.Errorf("%v", msgs)
 		}
@@ -192,13 +208,13 @@ func TestKnowledgeToolsOnPostgres(t *testing.T) {
 			return fakemodel.Turn{ToolCalls: []fakemodel.Call{{Name: "knowledge__read", Args: `{"documentId":"doc-carol"}`}}}
 		}
 		defer func() { e.model.Script = fakemodel.DefaultScript }()
-		r := e.must(202, "POST", "/v1/agents/librarian-b/runs", "bob", runBody("kb-2", "show me carol's notes"), "Idempotency-Key", "kb2")
+		r := e.must(202, "POST", "/v1/agents/librarian-b/runs", "frank", runBody("kb-2", "show me carol's notes"), "Idempotency-Key", "kb2")
 		e.drive()
-		calls := e.must(200, "GET", "/v1/runs/"+r["runId"].(string)+"/tool-calls", "bob", nil)["toolCalls"].([]any)
+		calls := e.must(200, "GET", "/v1/runs/"+r["runId"].(string)+"/tool-calls", "frank", nil)["toolCalls"].([]any)
 		if c := calls[0].(map[string]any); c["state"] != run.CallFailed || !strings.Contains(fmt.Sprint(c["result"]), "not found or not visible") {
 			t.Fatalf("%v", c)
 		}
-		if reqs := fc.RequestsTo("/v1/context/read"); len(reqs) == 0 || reqs[len(reqs)-1].Bearer != "member:bob" {
+		if reqs := fc.RequestsTo("/v1/context/read"); len(reqs) == 0 || reqs[len(reqs)-1].Bearer != "member:frank" {
 			t.Errorf("%+v", reqs)
 		}
 	})
@@ -206,15 +222,25 @@ func TestKnowledgeToolsOnPostgres(t *testing.T) {
 	t.Run("a release that does not turn the tools on offers none", func(t *testing.T) {
 		d := knowledgeAgent(nil, "")
 		e.publish("plain-context", d)
-		r := e.must(202, "POST", "/v1/agents/plain-context/runs", "carol", runBody("kb-3", "returns?"), "Idempotency-Key", "kb3")
+		r := e.must(202, "POST", "/v1/agents/plain-context/runs", "erin", runBody("kb-3", "returns policy"), "Idempotency-Key", "kb3")
+		if present, _ := e.credentialColumn(r["runId"].(string)); present { // before the run ends and clears it
+			t.Error("a run that cannot use the tools keeps no member credential")
+		}
 		e.drive()
 		for _, name := range e.model.LastTools() {
 			if strings.HasPrefix(name, "knowledge__") {
 				t.Errorf("offered %s", name)
 			}
 		}
-		if present, _ := e.credentialColumn(r["runId"].(string)); present {
-			t.Error("a run that cannot use the tools keeps no member credential")
+		// a release without the tools sees the text it saw before KB8: the first package's entries are not numbered
+		var seen string
+		for _, m := range e.model.Last() {
+			if strings.HasPrefix(m.Content, "CMI ") {
+				seen += m.Content
+			}
+		}
+		if !strings.Contains(seen, "CMI knowledge from") || strings.Contains(seen, "CMI [") {
+			t.Errorf("%q", seen)
 		}
 		// a published release names the tools it turns on, and the API refuses an unknown one
 		bad := knowledgeAgent([]string{"knowledge__delete"}, "")
@@ -224,7 +250,7 @@ func TestKnowledgeToolsOnPostgres(t *testing.T) {
 	t.Run("a run whose tools the caller executes gets none and keeps no credential", func(t *testing.T) {
 		body := runBody("kb-4", "returns?")
 		body["forwardedProps"] = map[string]any{"idp.host/toolExecution": "caller"}
-		r := e.must(202, "POST", "/v1/agents/librarian/runs", "carol", body, "Idempotency-Key", "kb4")
+		r := e.must(202, "POST", "/v1/agents/librarian/runs", "erin", body, "Idempotency-Key", "kb4")
 		if present, _ := e.credentialColumn(r["runId"].(string)); present {
 			t.Error("kept a credential")
 		}
@@ -251,10 +277,10 @@ func TestKnowledgeToolsOnPostgres(t *testing.T) {
 		}
 		defer func() { e.model.Script = fakemodel.DefaultScript }()
 		before := len(e.model.History())
-		r := e.must(202, "POST", "/v1/agents/screened/runs", "carol", runBody("kb-5", "the deal"), "Idempotency-Key", "kb5")
+		r := e.must(202, "POST", "/v1/agents/screened/runs", "erin", runBody("kb-5", "the deal"), "Idempotency-Key", "kb5")
 		e.drive()
 		id := r["runId"].(string)
-		w := e.eventsOf(id, "carol", agui.CustomContextWithheld)
+		w := e.eventsOf(id, "erin", agui.CustomContextWithheld)
 		var tool map[string]any
 		for _, v := range w {
 			if v["source"] == "knowledge_tool" {
@@ -271,7 +297,7 @@ func TestKnowledgeToolsOnPostgres(t *testing.T) {
 				}
 			}
 		}
-		raw, _ := json.Marshal(e.eventsOf(id, "carol", agui.CustomContextPackage))
+		raw, _ := json.Marshal(e.eventsOf(id, "erin", agui.CustomContextPackage))
 		if strings.Contains(string(raw), "BODY-CONFIDENTIAL") {
 			t.Error("the event repeats what was withheld")
 		}
@@ -315,7 +341,7 @@ func TestKnowledgeNumbersSurviveAHandOverOnPostgres(t *testing.T) {
 			<-release
 		}
 	}
-	r := e.must(202, "POST", "/v1/agents/librarian/runs", "carol", runBody("kb-hand", "returns"), "Idempotency-Key", "kbh")
+	r := e.must(202, "POST", "/v1/agents/librarian/runs", "erin", runBody("kb-hand", "returns"), "Idempotency-Key", "kbh")
 	id := r["runId"].(string)
 	ctx := context.Background()
 	c1, err := e.store.Claim(ctx, "w1", 300*time.Millisecond)
@@ -329,16 +355,16 @@ func TestKnowledgeNumbersSurviveAHandOverOnPostgres(t *testing.T) {
 	kill()
 	<-done
 	close(release)
-	calls := e.must(200, "GET", "/v1/runs/"+id+"/tool-calls", "carol", nil)["toolCalls"].([]any)
+	calls := e.must(200, "GET", "/v1/runs/"+id+"/tool-calls", "erin", nil)["toolCalls"].([]any)
 	if len(calls) != 2 || calls[1].(map[string]any)["state"] != run.CallExecuting {
 		t.Fatalf("setup: the find should rest as EXECUTING: %v", calls)
 	}
 	e.resumes(id, c1)
-	if got := e.must(200, "GET", "/v1/runs/"+id, "carol", nil); got["status"] != run.StatusCompleted {
+	if got := e.must(200, "GET", "/v1/runs/"+id, "erin", nil); got["status"] != run.StatusCompleted {
 		t.Fatalf("%v", got)
 	}
-	resolved := e.eventsOf(id, "carol", agui.CustomContextResolved)
-	pk := e.eventsOf(id, "carol", agui.CustomContextPackage)
+	resolved := e.eventsOf(id, "erin", agui.CustomContextResolved)
+	pk := e.eventsOf(id, "erin", agui.CustomContextPackage)
 	// "returns" matched the three blocks (1-3); the search for "refunds" matched one (4); the find, sent again by worker 2, is 5
 	if resolved[0]["numbered"] != float64(3) || len(pk) != 2 || pk[0]["firstIndex"] != float64(4) || pk[0]["itemCount"] != float64(1) || pk[1]["firstIndex"] != float64(5) || pk[1]["itemCount"] != float64(1) {
 		t.Fatalf("%v %v", resolved, pk)
@@ -352,7 +378,7 @@ func TestKnowledgeNumbersSurviveAHandOverOnPostgres(t *testing.T) {
 	if !strings.Contains(seen, "[4] Returns policy") || !strings.Contains(seen, "[5] Returns policy") || strings.Count(seen, "[5] Returns policy") != 1 {
 		t.Errorf("%q", seen)
 	}
-	if evs := e.interrupted(id); len(evs) != 1 || evs[0]["resent"] != true || evs[0]["tool"] != "knowledge__find" {
+	if evs := e.eventsOf(id, "erin", agui.CustomToolInterrupted); len(evs) != 1 || evs[0]["resent"] != true || evs[0]["tool"] != "knowledge__find" {
 		t.Errorf("the stream says the find was sent again: %v", evs)
 	}
 }
@@ -417,8 +443,35 @@ func TestTheQuestionRewriteOnPostgres(t *testing.T) {
 		}
 		// the same request replays the same run (the rewrite and the first retrieval are made again before the store finds the replay,
 		// as the retrieval always was: D32)
+		calls, resolves := rewrites(), len(fc.RequestsTo("/v1/context/resolve"))
 		if again := e.must(200, "POST", "/v1/agents/rewriter/runs", "carol", first, "Idempotency-Key", "rw1"); again["runId"] != id {
 			t.Fatal("replay returned another run")
+		}
+		if rewrites() != calls || len(fc.RequestsTo("/v1/context/resolve")) != resolves {
+			t.Errorf("a replay made a model call or a retrieval: %d %d", rewrites(), len(fc.RequestsTo("/v1/context/resolve")))
+		}
+		// the stored run: step 0 holds the rewrite's tokens, so that the tenant's budget counts them
+		if steps := e.stepTokens(id); steps <= 0 {
+			t.Errorf("the rewrite's tokens are not the run's: %d", steps)
+		}
+	})
+
+	t.Run("the earlier turns are the thread's: a follow-up that carries only the new message is rewritten too", func(t *testing.T) {
+		e.model.Rewrite = func(history []fakemodel.Message, q string) fakemodel.Turn {
+			if len(history) < 2 || !strings.Contains(history[0].Content, "return rules") {
+				t.Errorf("the model was not shown the stored turns: %+v", history)
+			}
+			return fakemodel.Turn{Text: "What is the second return rule?"}
+		}
+		msg := func(id, text string) map[string]any {
+			return map[string]any{"threadId": "rw-hist", "messages": []map[string]any{{"id": id, "role": "user", "content": text}}, "tools": []any{}, "context": []any{}}
+		}
+		e.must(202, "POST", "/v1/agents/rewriter/runs", "carol", msg("h1", "what are the return rules"), "Idempotency-Key", "rwh1")
+		e.drive()
+		before := rewrites()
+		e.must(202, "POST", "/v1/agents/rewriter/runs", "carol", msg("h2", "and the second one?"), "Idempotency-Key", "rwh2")
+		if rewrites() != before+1 || lastResolve()["query"] != "What is the second return rule?" {
+			t.Fatalf("%d %d %v", before, rewrites(), lastResolve()["query"])
 		}
 	})
 
@@ -480,5 +533,254 @@ func TestTheQuestionRewriteOnPostgres(t *testing.T) {
 		if len(e.eventsOf(r["runId"].(string), "carol", agui.CustomContextRewrite)) != 1 {
 			t.Error("the query that was tried is recorded even when the package is not")
 		}
+	})
+
+	t.Run("the tenant's blocked patterns apply to the rewrite", func(t *testing.T) {
+		e.must(200, "PUT", "/api/v1/policy", "alice", map[string]any{"blockedPatterns": []string{"TENANTBAN"}})
+		defer e.must(200, "PUT", "/api/v1/policy", "alice", map[string]any{"blockedPatterns": []string{}})
+		e.model.Rewrite = func([]fakemodel.Message, string) fakemodel.Turn {
+			return fakemodel.Turn{Text: "What is the TENANTBAN rule?"}
+		}
+		r := e.must(202, "POST", "/v1/agents/rewriter/runs", "carol", turns("and the eighth one?", true), "Idempotency-Key", "rw7")
+		e.drive()
+		rw := e.eventsOf(r["runId"].(string), "carol", agui.CustomContextRewrite)
+		if lastResolve()["query"] != "and the eighth one?" || len(rw) != 1 || rw[0]["reason"] != "guard" {
+			t.Fatalf("%v %v", lastResolve()["query"], rw)
+		}
+	})
+
+	t.Run("the daily budget is asked before the model is: an exhausted tenant makes no rewrite call", func(t *testing.T) {
+		e.must(200, "PUT", "/api/v1/policy", "alice", map[string]any{"maxConcurrentRuns": 0, "tokensPerDay": 1})
+		defer e.must(200, "PUT", "/api/v1/policy", "alice", map[string]any{"maxConcurrentRuns": 0, "tokensPerDay": 0})
+		before := rewrites()
+		st, out := e.call("POST", "/v1/agents/rewriter/runs", "carol", turns("and the ninth one?", true), "Idempotency-Key", "rw8")
+		if st != 429 || !strings.Contains(fmt.Sprint(out), "budget") || rewrites() != before {
+			t.Fatalf("%d %v rewrites %d -> %d", st, out, before, rewrites())
+		}
+	})
+}
+
+// stepTokens is what the run's step 0 (the question rewrite) was charged.
+func (e *env) stepTokens(id string) int {
+	e.t.Helper()
+	conn, err := pgx.Connect(context.Background(), e.ownerURL)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	var n int
+	if err := conn.QueryRow(context.Background(), `SELECT coalesce(sum(prompt_tokens + completion_tokens), 0) FROM run_steps WHERE run_id = $1 AND step = 0`, id).Scan(&n); err != nil {
+		e.t.Fatal(err)
+	}
+	return n
+}
+
+func (e *env) credentialRow(id string) (own bool, ref string) {
+	e.t.Helper()
+	conn, err := pgx.Connect(context.Background(), e.ownerURL)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	var sealed []byte
+	var r *string
+	if err := conn.QueryRow(context.Background(), `SELECT cmi_credential, cmi_credential_ref FROM runs WHERE id = $1`, id).Scan(&sealed, &r); err != nil {
+		e.t.Fatal(err)
+	}
+	if r != nil {
+		ref = *r
+	}
+	return len(sealed) > 0, ref
+}
+
+func offered(e *env) bool {
+	for _, n := range e.model.LastTools() {
+		if strings.HasPrefix(n, "knowledge__") {
+			return true
+		}
+	}
+	return false
+}
+
+// D68: only a member gets a member credential and the tools: not a principal that holds host-user alone (a service account), not a
+// peer that comes in through A2A whatever roles it holds, nobody when no member roles are configured.
+func TestOnlyMembersGetTheKnowledgeToolsOnPostgres(t *testing.T) {
+	e, _ := knowledgeEnv(t, handbookDoc())
+	e.publish("librarian", knowledgeAgent(agent.KnowledgeTools, ""))
+	e.model.Script = fakemodel.DefaultScript
+
+	// a member
+	r := e.must(202, "POST", "/v1/agents/librarian/runs", "erin", runBody("om-1", "returns?"), "Idempotency-Key", "om1")
+	if own, _ := e.credentialRow(r["runId"].(string)); !own {
+		t.Error("a member's run keeps the credential")
+	}
+	e.drive()
+	if !offered(e) {
+		t.Error("a member is offered the tools")
+	}
+	// a principal that holds host-user and is not a member (carol; a service account that is a CMI writer would be the same)
+	r = e.must(202, "POST", "/v1/agents/librarian/runs", "carol", runBody("om-2", "returns?"), "Idempotency-Key", "om2")
+	if own, _ := e.credentialRow(r["runId"].(string)); own {
+		t.Error("a non-member's run keeps a credential")
+	}
+	e.drive()
+	if offered(e) {
+		t.Error("a non-member is offered the tools")
+	}
+	// an A2A peer holding the member role: not offered either
+	msg := map[string]any{"kind": "message", "role": "user", "messageId": "om-a2a", "contextId": "om-3", "parts": []map[string]any{{"kind": "text", "text": "returns?"}}}
+	res := e.must(200, "POST", "/a2a/agents/librarian", "erin", map[string]any{"jsonrpc": "2.0", "id": "1", "method": "message/send", "params": map[string]any{"message": msg}})
+	id := res["result"].(map[string]any)["id"].(string)
+	if own, _ := e.credentialRow(id); own {
+		t.Error("an A2A run keeps a member credential")
+	}
+	e.drive()
+	if offered(e) {
+		t.Error("an A2A run is offered the tools")
+	}
+	// no member roles configured: nobody
+	e.host.MemberRoles = nil
+	r = e.must(202, "POST", "/v1/agents/librarian/runs", "erin", runBody("om-4", "returns?"), "Idempotency-Key", "om4")
+	if own, _ := e.credentialRow(r["runId"].(string)); own {
+		t.Error("with no member roles nobody keeps a credential")
+	}
+	e.drive()
+	if offered(e) {
+		t.Error("with no member roles nobody is offered the tools")
+	}
+}
+
+// D68: a credential that cannot be opened, and one cleared by a cancel; a sub-agent uses the root's and holds no copy; the runs
+// that share a credential renew it once.
+func TestTheMemberCredentialOfARunOnPostgres(t *testing.T) {
+	e, fc := knowledgeEnv(t, handbookDoc())
+	e.publish("librarian", knowledgeAgent(agent.KnowledgeTools, ""))
+	e.model.Script = func(msgs []fakemodel.Message, tools []string) fakemodel.Turn {
+		if msgs[len(msgs)-1].Role == "tool" {
+			return fakemodel.Turn{Text: "done"}
+		}
+		return fakemodel.Turn{ToolCalls: []fakemodel.Call{{Name: "knowledge__search", Args: `{"query":"returns"}`}}}
+	}
+
+	t.Run("cleared when the run is canceled", func(t *testing.T) {
+		r := e.must(202, "POST", "/v1/agents/librarian/runs", "erin", runBody("mc-1", "returns?"), "Idempotency-Key", "mc1")
+		id := r["runId"].(string)
+		if own, _ := e.credentialRow(id); !own {
+			t.Fatal("no credential")
+		}
+		e.must(200, "POST", "/v1/runs/"+id+"/cancel", "erin", nil)
+		if own, _ := e.credentialRow(id); own {
+			t.Error("a canceled run keeps its credential")
+		}
+	})
+
+	t.Run("a credential that cannot be opened: the run completes without the tools", func(t *testing.T) {
+		r := e.must(202, "POST", "/v1/agents/librarian/runs", "erin", runBody("mc-2", "returns?"), "Idempotency-Key", "mc2")
+		id := r["runId"].(string)
+		conn, err := pgx.Connect(context.Background(), e.ownerURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close(context.Background())
+		if _, err := conn.Exec(context.Background(), `UPDATE runs SET cmi_credential = '\x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20'::bytea WHERE id = $1`, id); err != nil {
+			t.Fatal(err)
+		}
+		before := len(fc.RequestsTo("/v1/context/resolve"))
+		e.drive()
+		if got := e.must(200, "GET", "/v1/runs/"+id, "erin", nil); got["status"] != run.StatusCompleted {
+			t.Fatalf("%v", got)
+		}
+		if offered(e) || len(fc.RequestsTo("/v1/context/resolve")) != before {
+			t.Error("the tools were offered or the CMI was called with a credential nobody could open")
+		}
+	})
+
+	t.Run("kept when the first retrieval fails", func(t *testing.T) {
+		d := knowledgeAgent(agent.KnowledgeTools, "")
+		e.publish("librarian-down", d)
+		fc.FailWith["/v1/context/resolve"] = 503
+		r := e.must(202, "POST", "/v1/agents/librarian-down/runs", "erin", runBody("mc-0", "returns?"), "Idempotency-Key", "mc0")
+		if own, _ := e.credentialRow(r["runId"].(string)); !own {
+			t.Error("a skipped retrieval cost the run its credential")
+		}
+		e.drive()
+	})
+
+	t.Run("a sub-agent points at the root's credential and the runs that share it renew it once", func(t *testing.T) {
+		e.publish("helper-k", knowledgeAgent(agent.KnowledgeTools, ""))
+		lead := definition("", nil, nil)
+		lead.Subagents = []agent.SubagentRef{{Name: "helper-k", Description: "Looks things up."}}
+		e.publish("lead-k", lead)
+		e.model.Script = func(msgs []fakemodel.Message, tools []string) fakemodel.Turn {
+			last := msgs[len(msgs)-1]
+			has := func(n string) bool {
+				for _, t := range tools {
+					if t == n {
+						return true
+					}
+				}
+				return false
+			}
+			switch {
+			case last.Role == "tool":
+				return fakemodel.Turn{Text: "done: " + last.Content[:min(40, len(last.Content))]}
+			case has("agent__helper-k"):
+				return fakemodel.Turn{ToolCalls: []fakemodel.Call{{Name: "agent__helper-k", Args: `{"input":"find returns"}`}}}
+			case has("knowledge__search"):
+				return fakemodel.Turn{ToolCalls: []fakemodel.Call{{Name: "knowledge__search", Args: `{"query":"returns"}`}}}
+			}
+			return fakemodel.Turn{Text: "nothing"}
+		}
+		r := e.must(202, "POST", "/v1/agents/lead-k/runs", "erin", runBody("mc-3", "go"), "Idempotency-Key", "mc3")
+		root := r["runId"].(string)
+		if own, _ := e.credentialRow(root); !own {
+			t.Fatal("the root keeps the credential for a sub-agent that has the tools, though its own release has none")
+		}
+		if ok, err := e.worker.Once(context.Background()); err != nil || !ok {
+			t.Fatal(ok, err)
+		}
+		child := e.must(200, "GET", "/v1/runs/"+root+"/subruns", "erin", nil)["runs"].([]any)[0].(map[string]any)["runId"].(string)
+		if own, ref := e.credentialRow(child); own || ref != root {
+			t.Fatalf("the child holds a copy (%v) or points elsewhere (%q)", own, ref)
+		}
+		// the renewal is serialised under the row lock of the run that holds it: four at once, one call to the authorization server
+		cl, err := e.store.Claim(context.Background(), "w-renew", time.Minute)
+		if err != nil || cl == nil {
+			t.Fatal(err, cl)
+		}
+		seen, err := e.store.CMICredential(context.Background(), cl)
+		if err != nil || seen == nil {
+			t.Fatal(err, seen)
+		}
+		var renewals atomic.Int32
+		var wg sync.WaitGroup
+		results := make([]string, 4)
+		for i := range results {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				tok, err := e.store.RenewCMICredential(context.Background(), cl, seen, func(_ context.Context, refresh string) (*credential.Token, error) {
+					renewals.Add(1)
+					time.Sleep(50 * time.Millisecond)
+					return &credential.Token{AccessToken: "member:erin-renewed", RefreshToken: refresh, ExpiresAt: time.Now().Add(time.Hour)}, nil
+				})
+				if err == nil {
+					results[i] = tok.AccessToken
+				}
+			}()
+		}
+		wg.Wait()
+		if renewals.Load() != 1 {
+			t.Errorf("the refresh token was renewed %d times", renewals.Load())
+		}
+		for _, got := range results {
+			if got != "member:erin-renewed" {
+				t.Errorf("%v", results)
+			}
+		}
+		if err := e.store.Release(context.Background(), cl); err != nil {
+			t.Fatal(err)
+		}
+		e.drive() // the child and then the root finish
 	})
 }

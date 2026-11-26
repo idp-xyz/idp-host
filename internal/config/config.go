@@ -121,7 +121,10 @@ type Provider struct {
 	APIKeyFile     string `yaml:"apiKeyFile"` // production
 	UsageInStream  *bool  `yaml:"usageInStream"`
 	MaxTokensField string `yaml:"maxTokensField"`
-	CAFile         string `yaml:"caFile"`
+	// ReasoningEffort declares that this provider's models take reasoning_effort (kind openai); the question rewrite asks for a low
+	// effort only of a provider that says so (D63-2, D66).
+	ReasoningEffort bool   `yaml:"reasoningEffort"`
+	CAFile          string `yaml:"caFile"`
 	// Insecure allows plain http to a non-loopback host; honored only in development mode.
 	Insecure bool `yaml:"insecure"`
 	// External says whether what is sent to this provider leaves the enterprise (D43). Absent means it does: a provider

@@ -39,6 +39,9 @@ type Config struct {
 	IdleTimeout time.Duration
 	// MaxStreamBytes bounds the bytes of one streamed answer; zero means model.MaxResponse. Tests inject a small one.
 	MaxStreamBytes int
+	// ReasoningEffort declares that the models of this provider take the reasoning_effort field (D63-2: OpenAI's reasoning models,
+	// DeepSeek's none/low/high/max). Without it the field is never sent: a model that does not know it may refuse the request.
+	ReasoningEffort bool
 	// AllowPlainHTTP permits http:// to non-loopback hosts (development only).
 	AllowPlainHTTP bool
 }
@@ -154,10 +157,11 @@ func (p *Provider) body(req model.Request, stream bool) map[string]any {
 	if req.MaxOutputTokens > 0 {
 		b[p.cfg.MaxTokensField] = req.MaxOutputTokens
 	}
-	switch req.Effort { // D63-2, as far as the question rewrite needs it
-	case model.EffortLow, model.EffortMedium, model.EffortHigh:
-		b["reasoning_effort"] = req.Effort
-	case model.EffortOff:
+	switch effort := req.Effort; { // D63-2, as far as the question rewrite needs it; only for a provider that declared it takes the field
+	case !p.cfg.ReasoningEffort:
+	case effort == model.EffortLow || effort == model.EffortMedium || effort == model.EffortHigh:
+		b["reasoning_effort"] = effort
+	case effort == model.EffortOff:
 		b["reasoning_effort"] = "none"
 	}
 	if stream && p.cfg.UsageInStream {

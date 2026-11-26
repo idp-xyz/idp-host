@@ -93,7 +93,7 @@ func resolveWith(t *testing.T, items string, input run.Input) (run.Input, []agui
 	in := agui.RunAgentInput{Messages: []agui.Message{{ID: "u", Role: agui.RoleUser, Content: "question"}}}
 	input.Context = []agui.Context{{Description: "caller", Value: "mine"}}
 	r := httptest.NewRequest("POST", "/", nil)
-	_, events, _, err := a.resolveContext(r, authorization.Principal{Tenant: "t1"}, doc, in, &input)
+	_, events, _, err := a.resolveContext(r, authorization.Principal{Tenant: "t1"}, doc, in, &input, nil, nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}

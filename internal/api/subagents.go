@@ -96,3 +96,41 @@ func (w *walk) visit(doc *agent.Document, depth int, path string) {
 		w.visit(child, depth+1, name+"/")
 	}
 }
+
+// subagentsHaveKnowledgeTools reports whether a local sub-agent a run of doc can reach has the knowledge tools on (D65, D68): such a
+// run keeps the member's CMI credential and numbers its first package, so that the sub-agent can use the tools as the member.
+// It follows what D22 lets a run reach, reads each (release, depth) once and at most maxSubagentLoads releases; a release that
+// cannot be read is not counted (nothing is lost: the sub-agent then has no credential and no tools).
+func (p FilePolicy) subagentsHaveKnowledgeTools(ctx context.Context, tenant string, doc *agent.Document) bool {
+	if p.Release == nil {
+		return false
+	}
+	seen, loads := map[walked]bool{}, 0
+	var visit func(d *agent.Document, depth int) bool
+	visit = func(d *agent.Document, depth int) bool {
+		limit := d.Definition.Limits.MaxSubagentDepth
+		if limit == 0 {
+			limit = agent.DefaultLimits.MaxSubagentDepth
+		}
+		if depth >= limit || depth >= agent.MaxSubagentDepth {
+			return false
+		}
+		for _, sub := range d.Subagents {
+			key := walked{sub.Digest, depth + 1}
+			if sub.A2A != nil || seen[key] || loads >= maxSubagentLoads {
+				continue
+			}
+			seen[key] = true
+			loads++
+			child, err := p.Release(ctx, tenant, sub.AgentID, sub.Digest)
+			if err != nil || child == nil {
+				continue
+			}
+			if child.Definition.Context.HasKnowledgeTools() || visit(child, depth+1) {
+				return true
+			}
+		}
+		return false
+	}
+	return visit(doc, 0)
+}

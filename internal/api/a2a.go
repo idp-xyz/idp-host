@@ -244,7 +244,7 @@ func (a *API) a2aSend(w http.ResponseWriter, r *http.Request, p authorization.Pr
 		}
 	}
 	in := agui.RunAgentInput{ThreadID: m.ContextID, Messages: []agui.Message{{ID: m.MessageID, Role: agui.RoleUser, Content: text}}, Tools: []agui.Tool{}, Context: []agui.Context{}, ForwardedProps: forwarded}
-	out, _, err := a.createRun(r, p, r.PathValue("ref"), "a2a:"+m.MessageID, in)
+	out, _, err := a.createRun(r.WithContext(withA2A(r.Context())), p, r.PathValue("ref"), "a2a:"+m.MessageID, in)
 	if err != nil {
 		a.rpcStoreError(w, req.ID, err)
 		return

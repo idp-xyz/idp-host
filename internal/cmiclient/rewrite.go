@@ -40,14 +40,23 @@ const (
 
 // RewriteInput is what the API hands to the rewriter.
 type RewriteInput struct {
-	Question string         // the last user message
-	History  []agui.Message // the earlier user and assistant messages, oldest first
+	Question        string         // the last user message
+	History         []agui.Message // the earlier user and assistant messages, oldest first
+	BlockedPatterns []string       // the tenant's blocked output patterns (D28), which the rewritten question must not match either
+}
+
+// RewriteUsage is what the rewrite's model call used; the run it was made for is charged for it (step 0, D66).
+type RewriteUsage struct {
+	Provider, Model                string
+	PromptTokens, CompletionTokens int
+	LatencyMs                      int64
 }
 
 // RewriteOutcome is what the rewriter hands back. Query is never empty: it is the original when the rewrite did not work.
 type RewriteOutcome struct {
 	Query string
-	Event agui.Event // idp.host/context.rewrite, written with the run's other context events
+	Event agui.Event    // idp.host/context.rewrite, written with the run's other context events
+	Usage *RewriteUsage // nil when no model answered
 }
 
 // Rewriter makes the managed model call of the rewrite; the harness implements it.
@@ -80,7 +89,7 @@ func PriorTurns(msgs []agui.Message) (in RewriteInput, ok bool) {
 	if len(in.History) > RewriteMaxHistory {
 		in.History = in.History[len(in.History)-RewriteMaxHistory:]
 	}
-	in.Question = Cut(msgs[last].Content, RewriteQuestionMax)
+	in.Question = CutBytes(msgs[last].Content, RewriteQuestionMax)
 	return in, true
 }
 
@@ -117,7 +126,7 @@ func CleanRewrite(raw string) (string, string) {
 
 // RewriteEvent builds idp.host/context.rewrite. extra is merged in (provider, model, usage, latencyMs).
 func RewriteEvent(outcome, original, query, reason string, extra map[string]any) agui.Event {
-	v := map[string]any{"mode": agent.RewriteModel, "outcome": outcome, "original": Cut(original, RewriteQuestionMax), "query": query}
+	v := map[string]any{"mode": agent.RewriteModel, "outcome": outcome, "original": CutBytes(original, RewriteQuestionMax), "query": query}
 	if reason != "" {
 		v["reason"] = reason
 	}
@@ -125,4 +134,17 @@ func RewriteEvent(outcome, original, query, reason string, extra map[string]any)
 		v[k] = x
 	}
 	return agui.Custom(agui.CustomContextRewrite, v)
+}
+
+// CutBytes keeps the first n bytes of s, ending on a character boundary: the one rule by which a question is cut before it is sent
+// to the CMI or the rewrite, on every path (4096 bytes, as the CMI's limit is read).
+func CutBytes(s string, n int) string {
+	s = strings.ToValidUTF8(s, "\uFFFD")
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }

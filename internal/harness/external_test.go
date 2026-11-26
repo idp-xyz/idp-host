@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -142,6 +143,7 @@ func TestRefreshedContextIsScreenedWithTheCeilingRecordedAtCreation(t *testing.T
 	e.h.CMI, e.h.CMIKey = refreshCMI(t), "k"
 	m := newMem(d, user("please sum"), run.Input{Context: old, ContextCeiling: "internal", ContextTrigger: "external-model"})
 	m.rc.Run.ContextPackageID = "pkg_1"
+	m.rc.CitationNext = 2 // the first package numbered its entry [1] (the run has the tools in reach)
 	e.h.Store = m
 	if err := e.h.Run(context.Background(), claim); err != nil {
 		t.Fatal(err)
@@ -181,6 +183,8 @@ func TestRefreshedContextIsScreenedWithTheCeilingRecordedAtCreation(t *testing.T
 	}
 	if seen := contextSeen(e); !strings.Contains(seen, "BODY-2") || !strings.Contains(seen, "BODY-3") || len(eventNamed(m, agui.CustomContextWithheld)) != 0 {
 		t.Fatalf("%s", seen)
+	} else if strings.Contains(seen, "CMI [2]") || strings.Contains(seen, "CMI [3]") {
+		t.Errorf("a run that did not number its first package does not number a refresh: %s", seen) // the old entry's own [1] is left as it was
 	}
 }
 
@@ -224,4 +228,34 @@ func TestChildRunsAreCreatedWithTheGatewaysExternalToolPatterns(t *testing.T) {
 		return
 	}
 	t.Fatal("no child run was created")
+}
+
+// D66: a refresh asks the question the first retrieval used (as the rewrite made it), and cuts a long one as every path does.
+func TestARefreshAsksTheRewrittenQuestion(t *testing.T) {
+	var asked []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/verify") {
+			_, _ = fmt.Fprint(w, `{"packageId":"pkg_1","stale":true,"staleItems":["k1"],"redacted":false}`)
+			return
+		}
+		var b map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&b)
+		asked = append(asked, b["query"].(string))
+		_, _ = fmt.Fprint(w, `{"packageId":"pkg_2","digest":"sha256:`+strings.Repeat("ab", 32)+`","package":{"items":[],"budget":{"usedTokens":0}}}`)
+	}))
+	defer srv.Close()
+	d := def()
+	d.Context = agent.ContextPolicy{CMI: true, OnStale: "refresh"}
+	e := setup(t)
+	e.h.CMI, e.h.CMIKey = &cmiclient.Client{Endpoint: srv.URL, HTTP: srv.Client()}, "k"
+	m := newMem(d, user("please sum"), run.Input{ContextQuery: "What is the second return rule?"})
+	m.rc.Run.ContextPackageID = "pkg_1"
+	e.h.Store = m
+	if err := e.h.Run(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	if len(asked) != 1 || asked[0] != "What is the second return rule?" {
+		t.Fatalf("%v", asked)
+	}
 }

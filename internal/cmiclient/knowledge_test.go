@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"idp-host/internal/agui"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -74,5 +75,20 @@ func TestKnowledgeItemsAreNumberedInOrderAndAMemoryHasNoNumber(t *testing.T) {
 	out, n := s2.ContextFrom(7)
 	if n != 8 || len(out) != 2 || !strings.HasPrefix(out[0].Description, "CMI [7] ") || out[1].Description != ContextCMIWithheld {
 		t.Fatalf("%d %+v", n, out)
+	}
+}
+
+func TestAQuestionIsCutByBytesAtACharacterBoundary(t *testing.T) {
+	q := strings.Repeat("字", 2000) // 6000 bytes
+	got := CutBytes(q, 4096)
+	if len(got) > 4096 || len(got) < 4094 || strings.ContainsRune(got, '\uFFFD') || !strings.HasPrefix(q, got) {
+		t.Fatalf("%d", len(got))
+	}
+	if CutBytes("short", 4096) != "short" || CutBytes("a\xffb", 10) != "a\uFFFDb" {
+		t.Error("short and invalid text")
+	}
+	in, ok := PriorTurns([]agui.Message{{Role: agui.RoleUser, Content: "one"}, {Role: agui.RoleUser, Content: q}})
+	if !ok || len(in.Question) != len(got) {
+		t.Errorf("the rewrite path cuts as the retrieval path does: %d %d", len(in.Question), len(got))
 	}
 }

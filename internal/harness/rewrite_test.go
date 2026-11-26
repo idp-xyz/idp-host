@@ -4,7 +4,9 @@ package harness
 
 import (
 	"context"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -166,5 +168,79 @@ func TestThePriorTurnsOfARequest(t *testing.T) {
 		if q, why := cmiclient.CleanRewrite(c.in); q != c.q || why != c.why {
 			t.Errorf("%q: %q %q", c.in, q, why)
 		}
+	}
+}
+
+type stepCounter struct {
+	mu       sync.Mutex
+	outcomes []string
+}
+
+func (s *stepCounter) StepFinished(_, _, outcome string, _ time.Duration, _ model.Usage) {
+	s.mu.Lock()
+	s.outcomes = append(s.outcomes, outcome)
+	s.mu.Unlock()
+}
+func (*stepCounter) ToolCall(string, string, time.Duration) {}
+func (*stepCounter) RunFinished(string)                     {}
+func (*stepCounter) Guard(string, string)                   {}
+
+func TestTheTenantsBlockedPatternsApplyToTheRewriteAndItsUseIsCounted(t *testing.T) {
+	e := setup(t)
+	sc := &stepCounter{}
+	e.h.Metrics = sc
+	e.model.Rewrite = func([]fakemodel.Message, string) fakemodel.Turn {
+		return fakemodel.Turn{Text: "What is the TENANTBAN rule?"}
+	}
+	in := followUp()
+	in.BlockedPatterns = []string{"TENANTBAN"}
+	out := e.h.RewriteQuestion(context.Background(), def(), in)
+	v := eventValue(out.Event)
+	if out.Query != in.Question || v["reason"] != "guard" || out.Usage == nil || out.Usage.Provider != "fake" || out.Usage.CompletionTokens == 0 {
+		t.Fatalf("%q %v %+v", out.Query, v, out.Usage)
+	}
+	if len(sc.outcomes) != 1 || sc.outcomes[0] != "rewrite" {
+		t.Errorf("the step metric counts the call: %v", sc.outcomes)
+	}
+}
+
+func TestTheRewriteDoesNotFeedTheRouter(t *testing.T) {
+	e := setup(t)
+	e.h.Router = model.NewRouter()
+	d := def()
+	d.Model.Routing = &agent.Routing{Strategy: agent.RouteLatency, Candidates: []agent.Candidate{{Provider: "fake", Model: "fake-1"}}}
+	before, _ := e.h.Router.Order(d.Model, model.Needs{})
+	e.model.Rewrite = func([]fakemodel.Message, string) fakemodel.Turn { return fakemodel.Turn{Status: 500} }
+	e.h.RewriteQuestion(context.Background(), d, followUp())
+	after, decisions := e.h.Router.Order(d.Model, model.Needs{})
+	if len(before) != len(after) || fmt.Sprint(decisions) != fmt.Sprint(decisionsOf(e, d)) {
+		t.Fatalf("%v", decisions)
+	}
+	for _, dec := range decisions {
+		if dec.Reason != "ordered" && dec.Score != 0 {
+			t.Errorf("the router learned from a rewrite: %+v", dec)
+		}
+	}
+}
+
+func decisionsOf(e *env, d agent.Definition) []model.Decision {
+	_, ds := model.NewRouter().Order(d.Model, model.Needs{})
+	return ds
+}
+
+func TestACanceledRewriteIsNotATimeoutAndNoProviderIsNoCandidate(t *testing.T) {
+	e := setup(t)
+	e.h.Providers = model.NewRegistry(hangs{})
+	d := def()
+	d.Model.Provider = "hangs"
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(30 * time.Millisecond); cancel() }()
+	out := e.h.RewriteQuestion(ctx, d, followUp())
+	if v := eventValue(out.Event); v["reason"] != "canceled" {
+		t.Errorf("%v", v)
+	}
+	d.Model.Provider = "nowhere"
+	if v := eventValue(e.h.RewriteQuestion(context.Background(), d, followUp()).Event); v["reason"] != "no_candidate" {
+		t.Errorf("%v", v)
 	}
 }

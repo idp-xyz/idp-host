@@ -496,6 +496,8 @@ func TestContractRejectsWhatOpenRejects(t *testing.T) {
 		path  string
 		value any
 	}{
+		"context tools without cmi":   {"definition.context", map[string]any{"tools": []any{"knowledge__find"}}},
+		"context rewrite without cmi": {"definition.context", map[string]any{"rewrite": "model"}},
 		"skill name mismatch":         {"skills.0.name", "other-skill"},
 		"embedded skill missing":      {"skills", []any{}},
 		"skill version mismatch":      {"skills.0.version", 3},

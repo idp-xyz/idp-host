@@ -29,6 +29,7 @@ type CreateRunInput struct {
 	Input          run.Input
 	Credential     *credential.Token // delegated gateway token, sealed before storage
 	FileTickets    *run.FileTickets  // the member's file tickets (D37), sealed before storage
+	RewriteUsage   *RewriteUsage     // the model call that rewrote the question (D66), counted as the run's step 0
 	CMICredential  *credential.Token // the member's CMI credential for the knowledge tools (D68), sealed before storage
 	TraceID        string
 	Traceparent    string // the W3C traceparent of the request, for the worker's turn to continue (D57)
@@ -158,15 +159,7 @@ func (s *Store) CreateRun(ctx context.Context, tenant string, in CreateRunInput)
 					return err
 				}
 			}
-			hashSrc := map[string]any{"agent": a.ID, "messages": in.Messages, "input": in.Input, "release": in.ReleaseID, "executionRef": in.ExecutionRef}
-			if n := contextItems(in.Extra); n > 0 && n <= len(in.Input.Context) {
-				// the CMI's items are resolved afresh on every request, so a replay compares the request
-				// without them
-				stripped := in.Input
-				stripped.Context = in.Input.Context[:len(in.Input.Context)-n]
-				hashSrc["input"] = stripped
-			}
-			hash, err := canonical.Digest(hashSrc)
+			hash, err := requestHash(a.ID, in)
 			if err != nil {
 				return err
 			}
@@ -201,23 +194,8 @@ func (s *Store) CreateRun(ctx context.Context, tenant string, in CreateRunInput)
 			if err != nil {
 				return err
 			}
-			if policy.MaxConcurrentRuns > 0 {
-				n, err := activeRuns(ctx, tx)
-				if err != nil {
-					return err
-				}
-				if n >= policy.MaxConcurrentRuns {
-					return fail("QUOTA_EXCEEDED", "the tenant's limit of %d concurrent runs is reached", policy.MaxConcurrentRuns)
-				}
-			}
-			if policy.TokensPerDay > 0 {
-				used, err := s.tokensLastDay(ctx, tx)
-				if err != nil {
-					return err
-				}
-				if used >= policy.TokensPerDay {
-					return fail("QUOTA_EXCEEDED", "the tenant's daily token budget (%d) is exhausted", policy.TokensPerDay)
-				}
+			if err := s.checkQuota(ctx, tx, policy); err != nil {
+				return err
 			}
 			// AG-UI callers send the whole conversation each run: messages already on the thread are
 			// skipped by id, and - for clients that re-label what the HOST produced - an assistant
@@ -307,6 +285,14 @@ func (s *Store) CreateRun(ctx context.Context, tenant string, in CreateRunInput)
 					return fail("CONFLICT", "run %s exists", runID)
 				}
 				return err
+			}
+			if u := in.RewriteUsage; u != nil {
+				// D66: the question rewrite was a model call made for this run before it existed; its tokens are the run's, as step 0, so
+				// that the tenant's daily budget (D15) counts them
+				if _, err := tx.Exec(ctx, `INSERT INTO run_steps (tenant_id, run_id, step, provider, model, prompt_tokens, completion_tokens, latency_ms, stop_reason, finished_at)
+					VALUES ($1, $2, 0, $3, $4, $5, $6, $7, 'rewrite', now())`, tenant, runID, u.Provider, u.Model, u.PromptTokens, u.CompletionTokens, u.LatencyMs); err != nil {
+					return err
+				}
 			}
 			if _, err := appendMessages(ctx, tx, tenant, threadID, runID, fresh); err != nil {
 				return err
@@ -562,7 +548,7 @@ func (s *Store) cancelResting(ctx context.Context, tx pgx.Tx, tenant string, r *
 	if _, err := tx.Exec(ctx, `UPDATE tool_calls SET state = 'REJECTED', decided_by = $2, decided_at = now() WHERE run_id = $1 AND state = 'PENDING_CONFIRMATION'`, r.ID, "cancel"); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE runs SET status = 'CANCELED', failure_code = 'CANCELED', failure_message = $2, finished_at = now(), lease_owner = NULL, lease_until = NULL, credential = NULL, credential_refresh = NULL, cmi_credential = NULL, file_tickets = NULL WHERE id = $1`, r.ID, reason); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE runs SET status = 'CANCELED', failure_code = 'CANCELED', failure_message = $2, finished_at = now(), lease_owner = NULL, lease_until = NULL, credential = NULL, credential_refresh = NULL, cmi_credential = NULL, cmi_credential_ref = NULL, file_tickets = NULL WHERE id = $1`, r.ID, reason); err != nil {
 		return err
 	}
 	if err := appendEvents(ctx, tx, tenant, r.ID, []agui.Event{agui.RunError(reason, "CANCELED")}); err != nil {
@@ -1050,7 +1036,7 @@ func (s *Store) Finish(ctx context.Context, c *run.Claim, status, failureCode, f
 			return err
 		}
 		if finished {
-			if _, err := tx.Exec(ctx, `UPDATE runs SET credential = NULL, credential_refresh = NULL, cmi_credential = NULL, file_tickets = NULL WHERE id = $1`, c.RunID); err != nil {
+			if _, err := tx.Exec(ctx, `UPDATE runs SET credential = NULL, credential_refresh = NULL, cmi_credential = NULL, cmi_credential_ref = NULL, file_tickets = NULL WHERE id = $1`, c.RunID); err != nil {
 				return err
 			}
 		}
@@ -1195,7 +1181,8 @@ func (s *Store) CreateChildRun(ctx context.Context, c *run.Claim, in run.ChildRu
 				return err
 			}
 			if doc.Definition.Context.HasKnowledgeTools() { // D68: the child's knowledge tools call the CMI as the same member
-				if _, err := tx.Exec(ctx, `UPDATE runs SET cmi_credential = (SELECT cmi_credential FROM runs WHERE id = $2) WHERE id = $1`, childID, parent.ID); err != nil {
+				// D68: the child points at the run that holds the credential (the root's), not at a copy of it
+				if _, err := tx.Exec(ctx, `UPDATE runs SET cmi_credential_ref = (SELECT CASE WHEN cmi_credential IS NOT NULL THEN id ELSE cmi_credential_ref END FROM runs WHERE id = $2) WHERE id = $1`, childID, parent.ID); err != nil {
 					return err
 				}
 			}
@@ -1503,59 +1490,112 @@ func sealToken(box *credential.Box, t *credential.Token) ([]byte, error) {
 	return box.Seal(plain)
 }
 
-// CMICredential returns the member's CMI credential the run was created with (D68), nil when it carries none. Like
-// RunCredential it does not refuse an expired token: the caller may renew it.
+// credentialHolder is the run whose row holds the credential of run id: itself, or the run its cmi_credential_ref names (D68).
+func credentialHolder(ctx context.Context, tx pgx.Tx, id string) (string, error) {
+	var ref *string
+	if err := tx.QueryRow(ctx, `SELECT cmi_credential_ref FROM runs WHERE id = $1`, id).Scan(&ref); err != nil {
+		return "", err
+	}
+	if ref != nil && *ref != "" {
+		return *ref, nil
+	}
+	return id, nil
+}
+
+// openToken reads the sealed token document; run.ErrCMICredentialUnusable when it cannot be opened (a rotated key, damage).
+func (s *Store) openToken(sealed []byte) (*credential.Token, error) {
+	if s.Box == nil {
+		return nil, run.ErrCMICredentialUnusable
+	}
+	plain, err := s.Box.Open(sealed)
+	if err != nil {
+		return nil, run.ErrCMICredentialUnusable
+	}
+	var d struct {
+		A string `json:"a"`
+		R string `json:"r"`
+		E int64  `json:"e"`
+	}
+	if err := json.Unmarshal(plain, &d); err != nil || d.A == "" {
+		return nil, run.ErrCMICredentialUnusable
+	}
+	out := &credential.Token{AccessToken: d.A, RefreshToken: d.R}
+	if d.E > 0 {
+		out.ExpiresAt = time.Unix(d.E, 0)
+	}
+	return out, nil
+}
+
+// CMICredential returns the member's CMI credential of the run (D68): its own, or the root run's that it points at. nil with no
+// error when the run has none; run.ErrCMICredentialUnusable when there is one that cannot be opened. It does not refuse an
+// expired token: the caller may renew it.
 func (s *Store) CMICredential(ctx context.Context, c *run.Claim) (*credential.Token, error) {
 	var out *credential.Token
 	err := s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
 		if _, err := s.owned(ctx, tx, c); err != nil {
 			return err
 		}
+		holder, err := credentialHolder(ctx, tx, c.RunID)
+		if err != nil {
+			return err
+		}
 		var sealed []byte
-		if err := tx.QueryRow(ctx, `SELECT cmi_credential FROM runs WHERE id = $1`, c.RunID).Scan(&sealed); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT cmi_credential FROM runs WHERE id = $1`, holder).Scan(&sealed); err != nil {
 			return err
 		}
 		if len(sealed) == 0 {
 			return nil
 		}
-		if s.Box == nil {
-			return errors.New("credential key not configured")
-		}
-		plain, err := s.Box.Open(sealed)
-		if err != nil {
-			return &run.Failure{Code: run.FailCredential, Message: "the CMI credential cannot be decrypted"}
-		}
-		var d struct {
-			A string `json:"a"`
-			R string `json:"r"`
-			E int64  `json:"e"`
-		}
-		if err := json.Unmarshal(plain, &d); err != nil {
-			return &run.Failure{Code: run.FailCredential, Message: "the CMI credential cannot be decrypted"}
-		}
-		out = &credential.Token{AccessToken: d.A, RefreshToken: d.R}
-		if d.E > 0 {
-			out.ExpiresAt = time.Unix(d.E, 0)
-		}
-		return nil
+		out, err = s.openToken(sealed)
+		return err
 	})
 	return out, err
 }
 
-// SaveCMICredential replaces the run's CMI credential with a renewed one (D68); fenced by the claim.
-func (s *Store) SaveCMICredential(ctx context.Context, c *run.Claim, tok *credential.Token) error {
-	if s.Box == nil {
-		return errors.New("credential key not configured")
-	}
-	sealed, err := sealToken(s.Box, tok)
-	if err != nil {
-		return err
-	}
-	return s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
+// RenewCMICredential renews the credential the claimed run uses (D68) under the row lock of the run that holds it, so that the
+// runs that share it (a root run and its sub-agents) never renew one refresh token twice: the one that gets the lock
+// finds, when the credential is no longer the one it saw, that another has renewed it and takes that; otherwise it calls renew
+// with the stored refresh token and stores the result. Fenced by the claim.
+func (s *Store) RenewCMICredential(ctx context.Context, c *run.Claim, seen *credential.Token, renew func(ctx context.Context, refreshToken string) (*credential.Token, error)) (*credential.Token, error) {
+	var out *credential.Token
+	err := s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
 		if _, err := s.owned(ctx, tx, c); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, `UPDATE runs SET cmi_credential = $2 WHERE id = $1`, c.RunID, sealed)
-		return err
+		holder, err := credentialHolder(ctx, tx, c.RunID)
+		if err != nil {
+			return err
+		}
+		var sealed []byte
+		if err := tx.QueryRow(ctx, `SELECT cmi_credential FROM runs WHERE id = $1 FOR UPDATE`, holder).Scan(&sealed); err != nil {
+			return err
+		}
+		if len(sealed) == 0 {
+			return run.ErrCMICredentialUnusable
+		}
+		cur, err := s.openToken(sealed)
+		if err != nil {
+			return err
+		}
+		if seen != nil && cur.AccessToken != seen.AccessToken {
+			out = cur // renewed meanwhile by a run that shares it
+			return nil
+		}
+		tok, err := renew(ctx, cur.RefreshToken)
+		if err != nil {
+			return err
+		}
+		if tok.RefreshToken == "" {
+			tok.RefreshToken = cur.RefreshToken
+		}
+		if sealed, err = sealToken(s.Box, tok); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE runs SET cmi_credential = $2 WHERE id = $1`, holder, sealed); err != nil {
+			return err
+		}
+		out = tok
+		return nil
 	})
+	return out, err
 }

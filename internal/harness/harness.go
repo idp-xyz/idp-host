@@ -259,6 +259,8 @@ type turn struct {
 	citeNext   int                                  // the number the next knowledge item of the run gets (D67)
 	cmiCred    *credential.Token                    // the member's credential for the CMI, as last loaded or renewed (D68)
 	cmiLoaded  bool                                 // cmiCred was asked of the store
+	cmiFailed  bool                                 // the member's CMI credential could not be renewed: no more calls this turn (D68)
+	kTools     []string                             // the knowledge tools this turn offers (setupKnowledge)
 }
 
 // Formats a gateway tool's input schema gives a property that takes a member's file (D37): the model writes
@@ -587,6 +589,9 @@ func (h *Harness) fail(ctx context.Context, c *run.Claim, code, msg string) erro
 // prepareTools resolves the gateway credential and the tool catalog the model may use.
 func (t *turn) prepareTools() error {
 	h := t.h
+	if err := t.setupKnowledge(); err != nil {
+		return err
+	}
 	if len(t.def.Tools.Allow) > 0 {
 		gw := h.Gateways[t.def.Tools.Gateway]
 		if gw == nil {
@@ -2262,13 +2267,13 @@ func (t *turn) guardedMessages() ([]agui.Message, error) {
 	// untrusted. A release is immutable while the HOST's configuration is not, so the release's "off" is overridden here
 	// and not refused when the release is published.
 	// D65: so are the results of the knowledge tools, which are document text
-	if (t.hasOutwardTools() || t.hasKnowledgeTools()) && in.ToolResults == guard.ModeOff {
+	if (t.hasOutwardTools() || t.hasKnowledgeTools() || t.historyHasKnowledge()) && in.ToolResults == guard.ModeOff {
 		in.ToolResults = guard.ModeWrap
 		if !t.flagged["raised"] {
 			t.flagged["raised"] = true
 			why := "the run has tools that send content outside the enterprise"
 			if !t.hasOutwardTools() {
-				why = "the run has knowledge tools, whose results are document text"
+				why = "the run has knowledge tools, or the thread holds results of them, which are document text"
 			}
 			raised := map[string]any{"configured": guard.ModeOff, "applied": guard.ModeWrap, "reason": why}
 			if marked := t.callableMarked(); len(marked) > 0 { // D51: say when it is the gateway's marker
@@ -2518,9 +2523,12 @@ func (t *turn) verifyContext() (bool, error) {
 		query := ""
 		for i := len(t.rc.Messages) - 1; i >= 0; i-- {
 			if m := t.rc.Messages[i]; m.Role == agui.RoleUser && m.Content != "" {
-				query = m.Content
+				query = cmiclient.CutBytes(m.Content, 4096)
 				break
 			}
+		}
+		if q := t.rc.Run.Input.ContextQuery; q != "" {
+			query = q // the question the first retrieval used, as the rewrite made it (D66)
 		}
 		if query != "" {
 			req := cmiclient.Request{Query: query, Purpose: t.def.Context.Purpose, Kinds: t.def.Context.Kinds, Sources: t.def.Context.Sources}
@@ -2540,7 +2548,12 @@ func (t *turn) verifyContext() (bool, error) {
 					}
 				}
 				// D67: the refreshed entries are numbered on from where the run's counter is, so that no number means two things
-				first := t.citeNext
+				// (only a run that numbered its first package, or has the tools, numbers: a release without them sees the old text). The
+				// numbers the replaced entries had stay with the thread's earlier results; the new ones are not given again.
+				first := 0
+				if t.def.Context.HasKnowledgeTools() || t.rc.CitationNext > 0 {
+					first = t.citeNext
+				}
 				entries, next := cmiclient.ContextFrom(pkg.Items, first)
 				// D44: the refresh applies the screen the run was created under, with the ceiling recorded then
 				if ceiling := t.rc.Run.Input.ContextCeiling; ceiling != "" {
@@ -2553,8 +2566,10 @@ func (t *turn) verifyContext() (bool, error) {
 				}
 				t.rc.Run.Input.Context = append(kept, entries...)
 				event["refreshedPackageId"], event["refreshedItems"] = pkg.PackageID, len(pkg.Items)
-				event["firstIndex"], event["numbered"] = first, next-first
-				t.citeNext = next
+				if first > 0 {
+					event["firstIndex"], event["numbered"] = first, next-first
+					t.citeNext = next
+				}
 			} else {
 				event["refreshError"] = sanitize(err)
 			}

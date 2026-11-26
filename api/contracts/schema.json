@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:idp:telos:host:1.12.0",
-  "title": "idp.telos.host 1.5.0",
+  "title": "idp.telos.host 1.12.0",
   "description": "idp-host（Agent Hosting & Coordination）对外发布的契约：AgentRelease（agent 行为的不可变发布件，ADR-0001 D2；1.1.0 起可嵌入 Skill，D17）、SkillRelease（skill 的不可变发布件）、Envelope（发布件加内容摘要）、AgentRun（一次运行的记录，API 返回的形态；1.3.0 起可为子 agent 运行，D22）和 RunOptions（1.2.0 起：创建运行时的调用方选项，D19）。1.3.0 新增：Definition 的 subagents 与 skillMerge（D22、D24）、Limits 的 maxSubagentDepth、SkillDefinition 的 resources（D23）、AgentRelease 的 subagents、AgentRun 的 parentRunId / depth 与状态 AWAITING_SUBAGENT。1.4.0 新增：Definition 的 guards（输入护栏与输出过滤，D27、D28）与 evaluation（评估集，D26），AgentRun 的 purpose。1.5.0 新增：ModelProfile 的 routing（模型路由，D29）、SubagentRef / EmbeddedSubagent 的 a2a（远端 A2A agent，D30）。1.8.0 新增：RunOptions 的 idp.host/attachments 与 idp.host/delivery（成员文件进出运行，D37；定义 FileAttachment、FileDelivery）。1.9.0 新增：FileAttachment 的 sensitivity（敏感级别，D43：高于租户上限的附件不交给可能使用外部模型的发布件）。1.10.0 只改描述（D44）：说明 HOST 对 CMI 条目按敏感级别筛选；没有改动任何形状，新的事件名与事件字段不属于 schema。1.11.0 新增：AgentRun 的 sources 与 unverifiedCitations（运行的网页来源和回答中无法核对的引用编号，D49；定义 RunSource），都是可选字段。1.12.0 新增：ContextPolicy 的 tools 与 rewrite（HOST 自己的知识检索工具 knowledge__search / knowledge__read / knowledge__find，D65；运行开头对有前文的问题的改写，D66），都是可选字段；事件 idp.host/context.package、idp.host/context.rewrite 与 context.resolved 的新字段不属于 schema。生产者是 idp-host，权威副本在 idp-host/api/contracts/，由 go test ./internal/run -run TestContract 保证与实现一致；idp-contracts 中的副本只能与之逐字节相同。JSON Schema 只描述形状与可本地判定的规则；摘要是否匹配由 agent.Open / agent.OpenSkill 判定，运行时不变量由 HOST 的状态机判定。",
   "oneOf": [
     {"$ref": "#/$defs/AgentRelease"},

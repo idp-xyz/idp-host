@@ -18,6 +18,8 @@
 //	IDP_HOST_WORKERS             worker goroutines (default 2; 0 = API only)
 //	IDP_HOST_INSTANCE            this replica's id (default: hostname); it names the worker's leases
 //	IDP_HOST_LEASE               claim lease (default 30s)
+//	IDP_HOST_MEMBER_ROLES        comma-separated roles of the people who use the HOST as themselves; only they get the knowledge tools (D68);
+//	                             none set: nobody does
 //	IDP_HOST_REWRITE_TIMEOUT     how long the model call that rewrites a follow-up question may take, in all (default 8s, D66);
 //	IDP_HOST_STOP_GRACE          on SIGTERM, how long runs in progress may finish before they are cut short (default 20s, D47);
 //	                             keep it below the termination grace period of the platform
@@ -242,7 +244,7 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 			if p.UsageInStream != nil {
 				usage = *p.UsageInStream
 			}
-			prov, err := openai.New(openai.Config{Name: p.Name, BaseURL: p.BaseURL, APIKey: p.APIKey, HTTP: hc, UsageInStream: usage, MaxTokensField: p.MaxTokensField, AllowPlainHTTP: p.Insecure, IdleTimeout: p.IdleTimeout()})
+			prov, err := openai.New(openai.Config{Name: p.Name, BaseURL: p.BaseURL, APIKey: p.APIKey, HTTP: hc, UsageInStream: usage, MaxTokensField: p.MaxTokensField, ReasoningEffort: p.ReasoningEffort, AllowPlainHTTP: p.Insecure, IdleTimeout: p.IdleTimeout()})
 			if err != nil {
 				return err
 			}
@@ -471,8 +473,17 @@ func serve(log *slog.Logger, apiEnabled bool) error {
 		}
 	}
 	srvAPI := &api.API{Files: api.FilePolicy{Local: localProviders, Ceiling: cfg.Files.Ceiling, ExternalTools: externalTools}, Store: store, Auth: verifier, Gateways: gatewayAuth, Providers: registry.Names(), Log: log, Metrics: metrics, Version: version, CMI: cmiClient, CMIKey: cmiKey, CMIToken: cmiToken, CMIAuth: cmiAuth}
+	for _, role := range strings.Split(env("IDP_HOST_MEMBER_ROLES", ""), ",") { // D68: who may have the knowledge tools; none configured: nobody
+		if role = strings.TrimSpace(role); role != "" {
+			srvAPI.MemberRoles = append(srvAPI.MemberRoles, role)
+		}
+	}
 	if cmiClient != nil { // D66: the question rewrite is a managed model call of the harness, made here for the request that creates a run
-		srvAPI.Rewriter = &harness.Harness{Providers: registry, Router: router, Log: log, RewriteTimeout: rewriteTimeout}
+		rw := &harness.Harness{Providers: registry, Router: router, Log: log, RewriteTimeout: rewriteTimeout, Metrics: worker.NewMetrics(metrics)}
+		if observability.Exporting() { // traced and measured like the workers' calls
+			rw.Tracer, rw.TraceProviders = tp.Tracer("idp-host/api"), traceProviders
+		}
+		srvAPI.Rewriter = rw
 	}
 	srv := &http.Server{Addr: env("IDP_HOST_LISTEN", "127.0.0.1:8450"), Handler: observability.HTTPMiddleware(tp, "idp-host/api", srvAPI.Handler()),
 		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 0, IdleTimeout: 120 * time.Second}

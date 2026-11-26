@@ -372,3 +372,26 @@ func TestADelegatedRunIsGivenTheTurnsTraceContext(t *testing.T) {
 		}
 	}
 }
+
+// D66: the question rewrite is a model call span, child of the request's, and carries no text.
+func TestTheRewriteIsASpanWithoutText(t *testing.T) {
+	e := setup(t)
+	exp := traced(e)
+	e.model.Rewrite = func([]fakemodel.Message, string) fakemodel.Turn {
+		return fakemodel.Turn{Text: "What is the second rule for acme?"}
+	}
+	ctx := observability.ContinueTrace(context.Background(), "00-"+reqTrace+"-"+reqSpan+"-01", reqTrace)
+	e.h.RewriteQuestion(ctx, def(), followUp())
+	spans := byName(exp.GetSpans(), "idp.model.call")
+	if len(spans) != 1 || spans[0].Parent.SpanID().String() != reqSpan {
+		t.Fatalf("%+v", exp.GetSpans())
+	}
+	if v, _ := attr(spans[0], "idp.model.purpose"); v.AsString() != "context.rewrite" {
+		t.Errorf("%v", spans[0].Attributes)
+	}
+	for _, a := range spans[0].Attributes {
+		if strings.Contains(a.Value.Emit(), "second rule") || strings.Contains(a.Value.Emit(), "acme") {
+			t.Errorf("a span carries text: %v", a)
+		}
+	}
+}
