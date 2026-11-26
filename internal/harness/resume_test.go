@@ -79,6 +79,38 @@ func (c *crashStore) AnswerToolCall(ctx context.Context, cl *run.Claim, id, stat
 	return c.memStore.AnswerToolCall(ctx, cl, id, state, result, isErr, msg, src, ev)
 }
 
+var errSplit = errors.New("split answer")
+
+// AnswerCited is AnswerToolCall's crash points for an answer the HOST numbers (D70): the answer is made, then the worker dies instead of
+// writing it (or writes the call's state only, when the test splits the answer as D47's predecessor did).
+func (c *crashStore) AnswerCited(ctx context.Context, cl *run.Claim, id string, cite run.CiteFunc) error {
+	var split run.Answer
+	err := c.memStore.AnswerCited(ctx, cl, id, func(first int, tree *run.TreeNumbers) (run.Answer, error) {
+		a, err := cite(first, tree)
+		if err != nil {
+			return a, err
+		}
+		if c.dead.Load() || c.dieOnToolMessage || (c.dieOnState != "" && a.State == c.dieOnState) || c.answerKilled(id) {
+			c.dead.Store(true)
+			return run.Answer{}, run.ErrFenced
+		}
+		if c.splitAnswer {
+			split = a
+			return run.Answer{}, errSplit
+		}
+		return a, nil
+	})
+	if errors.Is(err, errSplit) {
+		err = c.memStore.UpdateToolCall(ctx, cl, id, split.State, split.Result, split.IsError, nil)
+		c.dead.Store(true)
+		if err != nil {
+			return err
+		}
+		return run.ErrFenced
+	}
+	return err
+}
+
 func (c *crashStore) RecordToolCalls(ctx context.Context, cl *run.Claim, calls []run.ToolCall, ev []agui.Event) error {
 	if c.dead.Load() || c.dieOnRecords {
 		c.dead.Store(true)

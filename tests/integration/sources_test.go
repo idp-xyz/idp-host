@@ -222,7 +222,7 @@ func TestRunSourcesOnPostgres(t *testing.T) {
 					t.Errorf("%s: not in the order of the numbers: %v", c.topic, srcs)
 				}
 				prev = s["n"].(float64)
-				if want := web.number("delegated:"+e.tokens[c.who], s["url"].(string)); s["n"] != float64(want) {
+				if want := web.number("delegated:"+e.tokens[c.who], s["url"].(string)); s["webN"] != float64(want) { // D70: n is the HOST's number, webN idp-web's
 					t.Errorf("%s: %v should be %d", c.topic, s, want)
 				}
 				if _, has := s["cited"]; !has || !strings.Contains(s["title"].(string), "TITLE-INJECTION-9902") {

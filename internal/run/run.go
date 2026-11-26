@@ -107,10 +107,44 @@ type Context struct {
 	// two) may lack the records of some of them or the tool messages of finished ones; the harness repairs it from this.
 	LastCalls       []ToolCall
 	BlockedPatterns []string // the tenant policy's blocked output patterns (D28)
-	// CitationNext is the number the next knowledge item of the run gets (D67): one past the last number any package of the
-	// run gave, from the run's own events. 0 when no store told (a store that does not keep it): the harness then counts what
-	// the run's context holds.
-	CitationNext int
+}
+
+// Answer is what a tool call came to, as the store writes it (D47): the call's final state, its tool message, the sources the result
+// carried and the events, in one transaction.
+type Answer struct {
+	State   string
+	Result  string // the content of the tool message (an error's text when IsError and there is no result)
+	IsError bool
+	Msg     agui.Message
+	Src     *SourceBatch
+	Events  []agui.Event
+	// Used is how many numbers of the tree's counter the answer took, first .. first+Used-1 (D70). The store moves the counter by
+	// exactly this, in the same transaction, so that the numbers a model has read are the numbers the counter has given and a call
+	// that is answered once numbers once.
+	Used int
+}
+
+// CiteFunc makes the answer to a tool call once the tree's counter is held (D70): first is the number the next source of the tree
+// gets, tree what the tree already numbered. It runs inside the store's transaction, with the counter's row locked, so it must only
+// compute: no call to another service, no wait, and it may be called more than once.
+type CiteFunc func(first int, tree *TreeNumbers) (Answer, error)
+
+// TreeNumbers is what the run tree has already numbered that a later result may share: a web address read again keeps its number.
+type TreeNumbers struct {
+	// Web maps the number idp-web gave an address to the source the HOST numbered for it.
+	Web map[int]Source
+}
+
+// KnownWeb returns the HOST's number for the address idp-web numbered webN, when the tree has numbered it already.
+func (t *TreeNumbers) KnownWeb(webN int, url string) (int, bool) {
+	if t == nil {
+		return 0, false
+	}
+	s, ok := t.Web[webN]
+	if !ok || s.URL != url {
+		return 0, false
+	}
+	return s.N, true
 }
 
 // ErrCMICredentialUnusable: the run has a member credential for the CMI that cannot be used (it cannot be opened, or renewed). The
@@ -186,6 +220,11 @@ type Input struct {
 	ExternalTools bool `json:"externalTools,omitempty"`
 	// ContextQuery is the question the first retrieval used when the question rewrite made it (D66); a refresh asks it again.
 	ContextQuery string `json:"contextQuery,omitempty"`
+	// CitationNext and CitedSources carry from the resolution of the first package to the creation of the run (D70): the number the
+	// run tree's counter starts at, and the records of the knowledge items the package numbered. They are not part of the input that is
+	// stored or hashed.
+	CitationNext int      `json:"-"`
+	CitedSources []Source `json:"-"`
 }
 
 // ToolExecutionCaller: the caller executes every tool. The run offers the model only the caller's

@@ -554,6 +554,16 @@ func (d *dying) AnswerToolCall(ctx context.Context, c *run.Claim, id, state, res
 	return d.memStore.AnswerToolCall(ctx, c, id, state, result, isErr, msg, src, ev)
 }
 
+func (d *dying) AnswerCited(ctx context.Context, c *run.Claim, id string, cite run.CiteFunc) error {
+	d.mu.Lock()
+	d.n++
+	if d.n >= d.at {
+		d.fenced = true
+	}
+	d.mu.Unlock()
+	return d.memStore.AnswerCited(ctx, c, id, cite)
+}
+
 // Context lists the calls that are left by call id, highest first: the real store lists them by step, creation time (one
 // instant for the calls of a step) and id, which is not the order of the calls.
 func (d *dying) Context(ctx context.Context, c *run.Claim) (*run.Context, error) {

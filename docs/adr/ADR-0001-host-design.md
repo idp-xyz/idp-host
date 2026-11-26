@@ -1789,3 +1789,59 @@ D65–D68 的各行在这次修订后的代码上也重新跑过，全部仍然�
 | `sanitize(nil)`（D69-21） | 去掉空值判断 | `TestSanitizeTakesNil` |
 
 **没有证明的：**租约缩到 16 秒是一个常数，没有测试；租约用数据库时钟比较（而不是 Go 的）只有"过期的租约被接手"那一行间接覆盖，换时钟源本身没有测试。
+
+
+## 49. D70–D76：HOST 是一个运行树里唯一给引用编号的一方（2026-11-26，决策人委托维护方决定，契约 1.13.0）
+
+KB8 之后发现的问题（D69-5 的"调查"）：知识条目的 `[n]` 由 HOST 按运行编号，每个运行自己一个计数器、数的是自己的事件；网页来源的 `[n]` 是 idp-web 按调用者编的（递增、同一次运行里唯一、不连续），写在 idp-web 结果的文字里，HOST 只读 `structuredContent.citations` 里的 `n`。同时用两种来源的运行里 `[1]` 可以指两样东西，D49 的核对只能说"这个数存在"；子 agent 的编号从 1 重新数，父运行引用子 agent 回答里的 `[n]` 与自己的 `[n]` 可能重号；子运行还各自复制一份网关凭据与 refresh token，轮换时互相作废。决策人**委托维护方决定**，按下面改。它修订 D67（"计数器是运行自己事件里最后一个编号之后的数"）与 D69-5 的"子 agent""调查"两段（原文留在上面，以这一节为准），并完成 D69-6 留作待办的"网关凭据也用同样的做法"。
+
+| # | 决策（决策人委托维护方决定） | 理由 |
+|---|---|---|
+| D70 | **一个运行树一个计数器，在根运行上。** `runs.citation_next`（迁移 0017）只用根运行（没有父运行）那一行；根与它的子 agent、孙 agent 的每一个来源（知识条目、网页来源）都从它取号。编号在整棵树里唯一，按分配顺序递增。**分配是原子的**：`Store.AnswerCited` 在写工具调用的答案那个事务里，**先锁根运行的行、再锁自己的行**（祖先先于子孙，与 D69 的持有者优先、取消先锁根同序），用计数器当前的值做出答案（`CiteFunc(first, tree)`，只计算，不调别的服务），再把计数器移动**答案实际用了的个数**（`Answer.Used`），一起提交。所以：一个调用只编一次号；答案写不进去（栅栏、出错）就没有号被取走；计数器**没有空洞**（低于它的每个数都给了树里的某个来源）；锁只在这个事务里持有，事务里没有对外调用。因为 D40 的大小限制，没显示出来的来源不编号（与知识条目一样）。计数器随运行持久化，所以接手、确认后的恢复、worker 重启都接着编；D67 的"从事件里数"取消（`citationNext` 删去）。运行开头那个包（D69-15 的条件不变：运行保存或引用着成员令牌）的知识条目编 `1…n`，运行创建时计数器就是 `n+1`（`Input.CitationNext`，不入库的字段），条目记入根运行的来源表。`onStale = refresh` 换进来的条目用 `Store.CiteContext` 取号并同时记来源。**迁移**：每棵树的根取"这棵树里任何运行已给出的最大编号"加一，取事件里的 `firstIndex + itemCount/numbered`（D67 的数法）与来源表里的 `n`（idp-web 的编号）两者之大，没有则 1：在途的运行从当前最大值接着编，模型已经读过的号不会再给；子运行在这个版本之前自己从 1 编的号仍可能与父运行重号，模型读过的东西事后改不了。迁移按租户逐个做（行级安全对表所有者也生效）。 | 引用编号只有一个权威，两种来源才不会同号；锁根在先，与已有的锁序一致，不会成环；把号的分配与答案放在一个事务里，既不会重号也不会有崩溃留下的空洞。锁持有到该事务提交（几条语句，没有对外调用），不是只到分配那一刻：要不留空洞，取号与写答案必须一起提交。 |
+| D71 | **网页结果的文字由 HOST 写出，模型只读到 HOST 的编号。** 发布件的对外工具（D44、D51）成功返回、`structuredContent.citations` 里有条目时，`run.RenderWeb` 做出模型读到的文字，并按引用的顺序取 HOST 的号。**调查结果：idp-web 的结构化引用只有 `n`、`title`、`url`、`finalUrl`、`fetchedAt`、`rendered`、`sha256`，没有摘录、没有 `web_fetch` 要用的 `ref`、没有发表日期、没有页面正文，这些只在 idp-web 的文字里。**所以不能只靠结构化部分写结果（那样 `web_search` 之后无法 `web_fetch`）。做法：保留 idp-web 的文字，只改带编号的东西：每个来源那一块开头的 `[n]` 换成 HOST 的号（第一块在文字最开头，之后的各块在空行之后、以自己的号开头、下一行是 `address:` 加引用里那个地址；同一个块有两种读法时取靠后的，所以前一块的摘录不能把自己说成后一个来源的开头），**其余所有方括号里的数一律中和**（见 D72）。idp-web 的编号因此不到模型眼前；idp-web 编号到 HOST 编号的对应记在来源表（`webN`）和事件 `idp.host/citations.numbered {toolCallId, tool, mode, numbers: [{n, webN}], taken, notShown, invalid}` 里，供核对。同一个地址（idp-web 编号相同且地址相同）再读，沿用它在树里已有的号，不取新号（一页分几段读不会占几个号，也不会很快用满 100 条的来源表）；同一个 idp-web 编号对应另一个地址是另一个来源，取新号（旧版把它记为"冲突"，现在 `conflicts` 对网页不再增加）。被 D40 截掉的块不编号，记入 `droppedOverLimit`。文字不是 HOST 认识的形状时（第一块不在开头，或一块也对不上）退到"索引"：HOST 写一张带 HOST 编号的来源表（标题、地址），后面接着中和过的原文（`mode: indexed`）；引用都不合格时只中和（`mode: neutralised`）。**没有结构化引用的成功结果**：文字原样交给模型，照旧包成不可信，**不编号**，并记下：事件 `idp.host/citations.unnumbered {toolCallId, tool, reason: no_structured_citations}` 与来源表的 `unnumbered` 计数（事件 `idp.host/run.sources` 的 `unnumberedResults`）。**没有改 idp-web。**它要是在结构化引用里给出 `excerpt`、`ref`、`published` 与页面文字，HOST 就可以完全由结构化部分写结果，不再认它的文字形状：这是 idp-web 一侧的后续（见报告）。 | 决策要求不把 idp-web 的 `[n]` 交给模型；结构化部分缺内容，只能改文字里带编号的部分。这是对"由 `structuredContent.citations` 写出文字"的一处偏离，原因如上，不是省事。 |
+| D72 | **页面或文档里的"[3]"不能冒充 HOST 的编号：中和，不是转义。** 模型读到的文字里，不是 HOST 写在来源开头的那个 `[n]` 的每一处"方括号里的数"（`[3]`、`[1, 2]`、`[ 5 ]`、全角 `［3］`、`【4】`、`〔5〕`）都写成 `⟦3⟧`（保留里面的内容与空白）：仍读得出页面写了什么，但不是 `[n]` 形式，模型照规定写 `[n]` 时不会把它当成一个号，D49 的语法也不会把它当引用。有变动时在结果末尾加一句话说明 `⟦n⟧` 是页面自己的号。适用于网页结果（D71）、知识工具结果的标题、位置与摘录、运行开头那个包里编过号的条目（标题与摘录）；**没编号的上下文条目（发布件没有开工具、记忆条目）一字不改**。`[1.5]`、`array[i]`、Markdown 链接不是编号，不动。 | 选"中和"而不是"转义"，是因为转义（`\[3\]`）在 Markdown 里仍显示成 `[3]`，模型读起来没有区别；用另一种括号，写 `[n]` 的人与读 `[n]` 的人之间只剩 HOST 一个来源。残余：一段摘录若把后一个来源的头（编号、标题行、地址行）原样抄进前一个来源的块里，只能让自己那一段文字看起来像属于那个来源，造不出这一次结果里没有的号。 |
+| D73 | **知识工具与创建时的包用同一个计数器**（D70）。知识来源记入来源表：`kind: knowledge`、标题、`documentId`、`where`（页、标题路径…）、CMI 来源名，没有地址，不记正文。 | 一张表，一种编号。 |
+| D74 | **D49 的核对：一棵运行树一组有效的号。** 运行完成时回答里的 `[n]`，只要 `n` 小于根运行的计数器就是树里某个来源得到过的号（计数器没有空洞），不报为无法核对；没人给过的号照旧记为无法核对（只有 1 到 3 位的才报，D49-的 `maxUnverifiedDigits` 不变）。子 agent 引用父运行的号、父运行引用子 agent 回答里的号都有效。`cited` 对来源表里的条目标记，知识来源也标（原来"知识编号从不标 cited"）。一个运行自己没有来源、发布件也没有对外工具、而树里给过号时，仍做核对（它的回答可以引用父运行的号）；树里没有给过号则与以前一样跳过。**弱点，如实写下**：判据是"树里给过"，不是"这个运行读到过"：一个子 agent 引用了另一个子 agent 才读到的号，核对通过（它读不到那个号，只能是猜中或幻觉）。要更严得让每个运行记下自己读到的号，另议。 | 决策要求如此（"一棵树一组有效的号"）。 |
+| D75 | **运行的表示：同一张表、HOST 的号、带种类（契约 1.13.0，只增不改）。** `AgentRun.sources` 与事件 `idp.host/run.sources` 的每个来源：`n` 是 HOST 的号（回答里的 `[n]` 指向它，对现有消费者的含义不变：它仍是"回答引用的那个号"）；新增可选字段 `kind`（`web` | `knowledge`，缺省 web，HOST 总写出）、`webN`（idp-web 的编号，仅供核对）、`documentId`、`where`、`source`（知识来源）；`url` 只对网页来源必需（`allOf` 的条件），知识来源没有地址。1.13.0 之前记下的来源没有 `kind`，视为网页来源，它们的 `n` 是当时 idp-web 的编号。**对 Workspace 的影响**：它的解析（`parseSource`）要求每个来源有合格的 `url`，所以今天会把知识来源整条丢掉（记入 `dropped`，不报错），网页来源不受影响，字段多出来不碍事；Workspace 要显示知识来源得认 `kind` 与 `documentId`。事件 `idp.host/run.sources` 多一个 `unnumberedResults`。契约只在 `api/contracts/`，idp-contracts 里的副本要由平台另外发布 1.13.0（逐字节相同）。 | 一个运行一张表，模型读到什么号，成员就在表里查到什么号。 |
+| D76 | **网关凭据与 CMI 成员令牌同一个做法**（D69-6、D69-13）。子运行不再复制 `credential`、`credential_refresh`（`CreateChildRun`），指向持有者（根运行；孙运行指向同一个根）：`runs.credential_ref`。续期是同一份代码（`sharedcred.go` 的 `credKind`，CMI 令牌与网关凭据各一个）：持有者那一行上的短租约（`credential_renewing_until`，条件 UPDATE，**用数据库的时钟**）；拿到租约的运行**不持任何行锁**去调授权服务器，之后用**比较并交换**写回；没拿到租约的运行用手里仍然有效的令牌，过期了或是被拒后强制续期的就稍等再看；需要同时锁持有者与自己那两行时先锁持有者。写回时凭据已被清掉（根结束或取消）就不写回、并把租约还回去（事务提交：这一点是这次修的，原来 CMI 的比较并交换失败时没有把租约还回去，租约白占 16 秒）；IdP 已完成的续期在认领丢了时也写回。根运行结束或取消时清除凭据，子运行的 `credential_ref` 在自己结束时清掉；子运行每次调网关之前再读一次持有者那一行（`credential.Token.Shared`），根已结束就不再用内存里的旧令牌，这一回合以 `CREDENTIAL_EXPIRED` 结束（`gateway` 的静态令牌不受影响）。根运行自己的续期也走租约，所以根与子运行对同一个 refresh token 只续一次。这个版本之前创建的在途子运行仍带自己的副本（`credential_ref` 为空），照旧自己续期，没有改写它们。 | 同一个 refresh token 的多份副本在轮换时互相作废（D69-6 已写明，当时没有动）；单飞与锁序的论证同 D69-13。 |
+
+**拿掉一个控制、看测试失败**（D70–D76 的每一行；在仓库的隔离副本里，每次只改这一处，跑列出的测试，改回来再做下一行；同一个测试可以挡住几行）
+
+| 控制 | 拿掉的东西 | 失败的测试 |
+|---|---|---|
+| 来源块开头的号换成 HOST 的号（D71） | `RenderWeb` 原样返回 idp-web 的文字 | `TestIdpWebNumbersSevenAndNineBecomeContiguousHostNumbers`、`TestAnExcerptCannotSpoofANumberOrAFakeCitationList` |
+| 其余方括号里的数一律中和（D72） | `Neutralise` 什么也不改 | `TestAnExcerptCannotSpoofANumberOrAFakeCitationList`、`TestAFetchResultHeadIsRewrittenAndItsBodyNeutralised` |
+| 一个块有两种读法时取靠后的 | 改取靠前的 | `TestAFakeHeaderInAnEarlierExcerptDoesNotBecomeTheHeaderOfALaterSource` |
+| 块头要带引用里那个地址的 `address:` 行 | 去掉地址检查 | `TestAnInjectedHeaderAfterTheRealOneInTheLastBlockIsNotTakenForTheHeader` |
+| 同一地址再读沿用原号 | 不查树里已有的号 | `TestASourceReadAgainKeepsItsNumber` |
+| 已有的号要地址也相同 | `KnownWeb` 不比地址 | `TestANumberGivenAgainWithAnotherAddressKeepsTheFirstAndCountsAConflict` |
+| 没有结构化引用：原文、不编号 | 走"全部无效"的中和 | `TestAResultWithoutStructuredCitationsIsPassedThroughUnchanged` |
+| 没有结构化引用的结果有记录 | 不记 `unnumbered` | `TestAWebResultWithoutStructuredCitationsIsPassedThroughAndRecordedAsUnnumbered` |
+| 不认识的版式给来源表加中和过的原文 | 返回原文 | `TestALayoutTheHostDoesNotKnowGetsAListOfSourcesAndANeutralisedText` |
+| 被截掉的块不编号 | 只接受全部找到 | `TestACutResultNumbersOnlyTheSourcesItHolds` |
+| 引用都无效时中和原文 | 返回原文 | `TestDeclaredButUnusableCitationsNumberNothingAndNeutraliseTheText` |
+| 同一个号两种来源算冲突 | 不比较身份 | `TestSourcesOfBothKindsMergeAndTheCheckKnowsEveryNumberTheTreeGave` |
+| 树里给过号的运行也做核对（D74） | 恢复"没有来源没有对外工具就跳过" | `TestKnowledgeNumbersAreKnownToTheCitationCheck` |
+| 核对认整棵树的号（D74） | 存储只传 0 | `TestSeveralChildrenNumberFromOneCounterAndCiteEachOthersAndTheirParentsNumbersOnPostgres`（子 agent 引用父运行的 `[1]` 被报为无法核对） |
+| 计数器在根运行上（D70） | 从自己的行取号 | `TestTheCounterIsTakenRootFirstAndNeverGivenTwiceOnPostgres`、`TestSeveralChildren…` |
+| 先锁根、再锁自己 | 先锁自己的行 | `TestTheCounterIsTakenRootFirstAndNeverGivenTwiceOnPostgres`（等根的行时，自己的行已被锁：`NOWAIT` 拿不到） |
+| 计数器移动答案用掉的个数 | 不移动 | `TestTheCounterIsTakenRootFirstAndNeverGivenTwiceOnPostgres`、`TestSeveralChildren…` |
+| 运行开头的包定计数器的起点 | 起点恒为 1 | `TestSeveralChildren…`（计数器是 1，包的号被工具再给一次） |
+| 知识工具从计数器取号 | 恒从 1 编 | `TestSearchReadAndFindCallTheCMIAndNumberWhatTheModelIsGiven`、`TestTheCounterStartsWhereTheTreeLeftOff`、`TestWebAndKnowledgeResultsAreNumberedFromOneCounter…` |
+| 刷新换进来的条目从计数器取号 | 恒从 1 编 | `TestRefreshedContextIsScreenedWithTheCeilingRecordedAtCreation` |
+| 知识条目的标题与摘录中和 | 不中和 | `TestAKnowledgeExcerptCannotCarryANumberOfItsOwn` |
+| 编过号的上下文条目中和 | 不中和 | `TestANumberedContextEntryNeutralisesBracketedNumbersAndAnUnnumberedOneDoesNot`（同一个测试证明没编号的一字不改） |
+| 迁移：取树里各运行的事件 | 只看根的事件 | `TestMigrationContinuesRunsInFlightFromTheirMaximumOnPostgres` |
+| 迁移：取来源表里 idp-web 的号 | 去掉 | 同上 |
+| 迁移：取事件里的知识编号 | 去掉 | 同上 |
+| 子运行指向根的网关凭据，不复制（D76） | 不设 `credential_ref` | `TestAChildReferencesTheRootsGatewayCredentialAndTheTreeRenewsItOnceOnPostgres` |
+| 子运行读持有者的那一行 | 读自己的行 | 同上 |
+| 单飞：续期租约 | 去掉租约条件 | 同上（四个同时续期调了不止一次授权服务器） |
+| 比较并交换 | 写回不比较 | 同上（根结束后，续期的令牌写回去了） |
+| 比较并交换落空时还租约 | 不还 | 同上（租约留在根的行上） |
+| 续期失败或被取消时还租约 | 不还 | 同上（取消子例） |
+| 子运行每次调网关前读持有者（`Shared`） | 只在第一次读 | `TestAChildAsksTheHolderOfTheGatewayCredentialBeforeEveryCallAndStopsWhenTheRootHasEnded` |
+
+**没有证明的（如实写下）：**(1) 续期期间不持行锁、先锁持有者再锁自己：测试里有"续期进行时两行都 `NOWAIT` 拿得到、子运行的心跳不被挡住"，但没有拿掉它们再看失败（要在事务里调续期函数才能拿掉）；与 D69-13 一样，只靠代码与事务都很短。(2) `RunCredential` 给令牌打上 `Shared`、harness 在有 `RenewRunCredential` 的存储上走单飞续期：harness 的测试用自己的替身，PostgreSQL 的测试直接调存储，两者之间的连线只被 `TestHostEndToEnd` 的"session-bound-delegation"（根运行自己的续期经租约与比较并交换）覆盖，子运行的 harness 路径没有端到端测试。(3) 结束时清 `credential_ref`：没有测试。(4) 一个运行读到"别的子 agent 才读到的号"（D74 的弱点）：只写在上面，没有测试去证明它通过。(5) 并发取号只在存储层压过（36 个并发的 `AnswerCited`，三个子运行的认领），harness 里并行的工具调用用的是内存替身。(6) 锁的持有时间（一个事务）没有测量。
+
+**平台验收还要查：**PATH M5（网页来源与引用核对）：`sources[].n` 是 HOST 的号、带 `kind: web` 与 `webN`，回答里的 `[n]` 与来源表对得上；没有网页工具的助手回答里的 `[3]` 仍不产生来源与核对。PATH M2–M4 的结果文字里没有 idp-web 的号。PATH P3：`context.resolved`、`context.package` 的 `firstIndex` 仍接续。**建议新增一步**（M5 之后或 P3 之后）：同时开了知识工具与网页工具的发布件，一次运行里先查知识、再搜网页、再查知识：模型读到的 `[n]` 连续且没有 idp-web 的号，`run.sources` 一张表、两种 `kind`、`unverifiedCitations` 只含编造的号；再加一个委派到两个子 agent 的运行，检查两个子 agent 的号不重、父运行引用子 agent 回答里的号不被报为无法核对，子运行 `credential_ref` 指向根运行、`credential` 为空。**Workspace 要改的：**认 `kind` 与知识来源（没有 `url`），否则它今天把知识来源整条丢掉。**idp-web 要改的（后续，不是这次的前提）：**结构化引用里给出 `excerpt`、`ref`、`published` 与页面文字，HOST 才能完全由结构化部分写结果。

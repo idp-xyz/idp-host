@@ -31,7 +31,7 @@ var update = flag.Bool("update", false, "regenerate api/contracts/examples.json 
 
 const (
 	contractDir = "../../api/contracts"
-	contractID  = "urn:idp:telos:host:1.12.0"
+	contractID  = "urn:idp:telos:host:1.13.0"
 )
 
 type noLoader struct{}
@@ -161,16 +161,18 @@ func exampleRuns(releaseID, digest string) []run.Run {
 			ParentRunID: "run_01JD7Q3Z8M8T0G3C6N4V9S2A1E", Depth: 1, DeadlineAt: at.Add(30 * time.Minute), CreatedAt: at.Add(20*time.Minute + 2*time.Second), StartedAt: at.Add(20*time.Minute + 3*time.Second)},
 		{ID: "eval_7f3c1a2e5b6d4c8e9f0123456789abcd_0", ThreadID: "eval_7f3c1a2e5b6d4c8e9f0123456789abcd_0", AgentID: "9e8d7c6b-0000-4000-8000-000000000002", ReleaseID: releaseID, ReleaseDigest: digest, Owner: "alice",
 			Status: run.StatusCompleted, StepCount: 1, Purpose: run.PurposeEvaluation, DeadlineAt: at.Add(40 * time.Minute), CreatedAt: at.Add(30 * time.Minute), StartedAt: at.Add(30*time.Minute + time.Second), FinishedAt: at.Add(30*time.Minute + 4*time.Second)},
-		// 1.11.0 (D49): a run that searched and read; the numbers are the caller's, so not consecutive. [2] was cited, [3] was only
-		// found by the search, and the answer also wrote [7], which is not among the sources.
+		// 1.11.0 (D49), 1.13.0 (D70): a run that read a document of the knowledge base, searched and read the web; the numbers are the HOST's,
+		// one list for both kinds, in the order they were given (idp-web's own numbers, 7 and 9, are only in webN). [2] was cited, [3] was only
+		// found by the search, and the answer also wrote [8], which the tree never gave.
 		{ID: "run_01JD7Q3Z8M8T0G3C6N4V9S2A1F", ThreadID: "thr-ops-45", AgentID: "9e8d7c6b-0000-4000-8000-000000000002", ReleaseID: releaseID, ReleaseDigest: digest, Owner: "carol",
 			Status: run.StatusCompleted, StepCount: 4, DeadlineAt: at.Add(50 * time.Minute), CreatedAt: at.Add(40 * time.Minute), StartedAt: at.Add(40*time.Minute + time.Second), FinishedAt: at.Add(40*time.Minute + 20*time.Second),
 			Sources: []run.Source{
-				{N: 2, Title: "Port of Rotterdam: customs clearance times", URL: "https://www.portofrotterdam.example/en/customs", FetchedAt: "2026-11-03T13:41:07Z",
+				{N: 1, Kind: run.KindKnowledge, Title: "Customs handbook", DocumentID: "doc-handbook-12", Where: "page 3; Clearance > Times", Origin: "ops-handbook", Cited: true},
+				{N: 2, Kind: run.KindWeb, Title: "Port of Rotterdam: customs clearance times", URL: "https://www.portofrotterdam.example/en/customs", FetchedAt: "2026-11-03T13:41:07Z", WebN: 7,
 					SHA256: "5d41402abc4b2a76b9719d911017c592a1b2c3d4e5f60718293a4b5c6d7e8f90", Cited: true},
-				{N: 3, Title: "Duty rates, chapter 84", URL: "https://tariff.example/hs/84"},
-				{N: 5, Title: "报关单填写规范", URL: "https://customs.example.cn/guide?id=5", FetchedAt: "2026-11-03T13:41:30Z", SHA256: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}},
-			UnverifiedCitations: []int{7}},
+				{N: 3, Kind: run.KindWeb, Title: "Duty rates, chapter 84", URL: "https://tariff.example/hs/84", WebN: 9},
+				{N: 4, Kind: run.KindWeb, Title: "报关单填写规范", URL: "https://customs.example.cn/guide?id=5", FetchedAt: "2026-11-03T13:41:30Z", WebN: 12, SHA256: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}},
+			UnverifiedCitations: []int{8}},
 		{ID: "run_01JD7Q3Z8M8T0G3C6N4V9S2A1D", ThreadID: "thr-ops-43", AgentID: "9e8d7c6b-0000-4000-8000-000000000002", ReleaseID: releaseID, ReleaseDigest: digest, Owner: "carol",
 			Status: run.StatusFailed, StepCount: 12, CancelRequested: false, FailureCode: run.FailStepLimit, FailureMessage: "the run reached its limit of 12 steps",
 			ExecutionRef: "eer:execution:0192f3a1", DeadlineAt: at.Add(30 * time.Minute), CreatedAt: at.Add(20 * time.Minute), StartedAt: at.Add(20*time.Minute + time.Second), FinishedAt: at.Add(25 * time.Minute)},
@@ -243,7 +245,7 @@ func buildExamples(t *testing.T) []byte {
 		add("RunOptions", o)
 	}
 	b, err := json.MarshalIndent(examplesFile{
-		Description: "idp.telos.host 1.12.0 的示例：每一个都是 idp-host 实际产出或原样接受的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录，RunOptions 经 run.ParseOptions 解析后原样往返）。",
+		Description: "idp.telos.host 1.13.0 的示例：每一个都是 idp-host 实际产出或原样接受的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录，RunOptions 经 run.ParseOptions 解析后原样往返）。",
 		GeneratedBy: "go test ./internal/run -run TestContract -update",
 		Examples:    out,
 	}, "", "  ")
@@ -627,6 +629,8 @@ func elevenAttachments() []any {
 	return out
 }
 
+func with2(m map[string]any, key string, v any) map[string]any { m[key] = v; return m }
+
 // D49: the shape of the new fields is closed and bounded as the implementation validates what it records: a run that carries
 // a source the HOST would never have recorded is not a valid AgentRun.
 func TestContractRejectsRunSourcesTheHostWouldNotRecord(t *testing.T) {
@@ -646,19 +650,29 @@ func TestContractRejectsRunSourcesTheHostWouldNotRecord(t *testing.T) {
 	if err := k.validate("AgentRun", base(good())); err != nil {
 		t.Fatalf("a valid source is refused: %v", err)
 	}
+	if err := k.validate("AgentRun", base(map[string]any{"n": 2, "kind": "knowledge", "title": "t", "documentId": "d1", "where": "page 3", "source": "kb", "cited": true})); err != nil {
+		t.Fatalf("a knowledge source has no address and is valid: %v", err)
+	}
+	if err := k.validate("AgentRun", base(with2(good(), "webN", 7), good())); err != nil {
+		t.Fatalf("webN: %v", err)
+	}
 	with := func(key string, v any) map[string]any { m := good(); m[key] = v; return m }
 	cases := map[string][]map[string]any{
-		"n zero":                  {with("n", 0)},
-		"n a string":              {with("n", "1")},
-		"url ftp":                 {with("url", "ftp://a.example/x")},
-		"url javascript":          {with("url", "javascript:alert(1)")},
-		"url with a space":        {with("url", "https://a.example/a b")},
-		"sha256 upper case":       {with("sha256", strings.Repeat("A", 64))},
-		"sha256 short":            {with("sha256", "abc")},
-		"fetchedAt not a time":    {with("fetchedAt", "yesterday")},
-		"title too long":          {with("title", strings.Repeat("x", 301))},
-		"cited missing":           {{"n": 1, "title": "t", "url": "https://a.example/x"}},
-		"unknown field (excerpt)": {with("excerpt", "page text")},
+		"n zero":                       {with("n", 0)},
+		"n a string":                   {with("n", "1")},
+		"url ftp":                      {with("url", "ftp://a.example/x")},
+		"url javascript":               {with("url", "javascript:alert(1)")},
+		"url with a space":             {with("url", "https://a.example/a b")},
+		"sha256 upper case":            {with("sha256", strings.Repeat("A", 64))},
+		"sha256 short":                 {with("sha256", "abc")},
+		"fetchedAt not a time":         {with("fetchedAt", "yesterday")},
+		"title too long":               {with("title", strings.Repeat("x", 301))},
+		"cited missing":                {{"n": 1, "title": "t", "url": "https://a.example/x"}},
+		"web without an address":       {{"n": 1, "title": "t", "cited": false}},
+		"web by kind without one":      {{"n": 1, "kind": "web", "title": "t", "cited": false}},
+		"knowledge without a document": {{"n": 1, "kind": "knowledge", "title": "t", "cited": false}},
+		"unknown kind":                 {with("kind", "video")},
+		"unknown field (excerpt)":      {with("excerpt", "page text")},
 	}
 	for name, srcs := range cases {
 		if err := k.validate("AgentRun", base(srcs...)); err == nil {

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"idp-host/internal/agui"
+	"idp-host/internal/run"
 )
 
 // Client calls one CMI.
@@ -189,11 +190,17 @@ func ContextFrom(items []Item, first int) ([]agui.Context, int) {
 			num = fmt.Sprintf("[%d] ", next)
 			next++
 		}
-		desc := fmt.Sprintf("CMI %s%s from %s (%s, observed %s, ref %s)", num, it.Kind, it.Source, it.Trust, it.ObservedAt.UTC().Format(time.RFC3339), it.Ref)
+		desc := fmt.Sprintf("%s from %s (%s, observed %s, ref %s)", it.Kind, it.Source, it.Trust, it.ObservedAt.UTC().Format(time.RFC3339), it.Ref)
 		if it.Title != "" {
 			desc += " — " + it.Title
 		}
-		out = append(out, agui.Context{Description: desc, Value: it.Excerpt})
+		value := it.Excerpt
+		if num != "" {
+			// D70: a bracketed number in a document's own text must not read as a citation number beside the HOST's
+			desc, _ = run.Neutralise(desc)
+			value, _ = run.Neutralise(value)
+		}
+		out = append(out, agui.Context{Description: "CMI " + num + desc, Value: value})
 	}
 	return out, next
 }

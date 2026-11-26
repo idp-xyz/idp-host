@@ -76,6 +76,9 @@ type Token struct {
 	AccessToken  string
 	ExpiresAt    time.Time
 	RefreshToken string // only from a session-bound exchange or a refresh
+	// Shared: the token was read from the row of another run, the root's, which holds the credential its sub-agent runs share (D76). It
+	// is never stored or sent; it tells the reader to ask the holder again before each call.
+	Shared bool
 }
 
 // ErrSessionEnded: the authorization server no longer renews the credential (the user signed out, the session idled

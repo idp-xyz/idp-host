@@ -712,7 +712,7 @@ func (a *API) createRun(r *http.Request, p authorization.Principal, ref, key str
 	}
 	out, replayed, err := a.Store.CreateRun(r.Context(), p.Tenant, postgres.CreateRunInput{ThreadID: in.ThreadID, RunID: in.RunID, AgentRef: ag.ID, Owner: p.Subject,
 		IdempotencyKey: key, Messages: in.Messages, Input: input, Credential: cred, FileTickets: tickets, TraceID: observability.TraceID(r.Context()), Traceparent: observability.Traceparent(r.Context()),
-		ReleaseID: releaseID, ExecutionRef: opts.ExecutionRef, ContextPackageID: packageID, Extra: extra, CMICredential: cmiCred, RewriteUsage: rewrote, RawHash: rawHash})
+		ReleaseID: releaseID, ExecutionRef: opts.ExecutionRef, ContextPackageID: packageID, Extra: extra, CMICredential: cmiCred, RewriteUsage: rewrote, RawHash: rawHash, CitationNext: input.CitationNext, Sources: input.CitedSources})
 	return out, replayed, err
 }
 
@@ -876,6 +876,14 @@ func (a *API) resolveContext(r *http.Request, p authorization.Principal, doc *ag
 		withheld = &s
 	}
 	input.Context = append(input.Context, entries...)
+	if numbered { // D70: the run tree's counter starts after the numbers this package gave
+		input.CitationNext = next
+		if withheld != nil {
+			input.CitedSources = cmiclient.KnowledgeSources(withheld.Kept, first)
+		} else {
+			input.CitedSources = cmiclient.KnowledgeSources(pkg.Items, first)
+		}
+	}
 	resolved := map[string]any{"packageId": pkg.PackageID, "digest": pkg.Digest, "items": len(pkg.Items), "appended": len(entries), "tokens": pkg.Tokens, "query": query}
 	if numbered {
 		resolved["firstIndex"], resolved["numbered"] = 1, next-1

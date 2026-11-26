@@ -143,7 +143,7 @@ func TestRefreshedContextIsScreenedWithTheCeilingRecordedAtCreation(t *testing.T
 	e.h.CMI, e.h.CMIKey = refreshCMI(t), "k"
 	m := newMem(d, user("please sum"), run.Input{Context: old, ContextCeiling: "internal", ContextTrigger: "external-model"})
 	m.rc.Run.ContextPackageID = "pkg_1"
-	m.rc.CitationNext = 2 // the first package numbered its entry [1] (the run has the tools in reach)
+	m.next = 2 // the first package numbered its entry [1] (the run has the tools in reach)
 	e.h.Store = m
 	if err := e.h.Run(context.Background(), claim); err != nil {
 		t.Fatal(err)
@@ -175,7 +175,7 @@ func TestRefreshedContextIsScreenedWithTheCeilingRecordedAtCreation(t *testing.T
 	// created without a screen (no external model, no external tool): the refresh gives everything, as before D44
 	e = setup(t)
 	e.h.CMI, e.h.CMIKey = refreshCMI(t), "k"
-	m = newMem(d, user("please sum"), run.Input{Context: old[:2]})
+	m = newMem(d, user("please sum"), run.Input{Context: []agui.Context{old[0], {Description: "CMI knowledge from handbook (old)", Value: "OLD-BODY"}}})
 	m.rc.Run.ContextPackageID = "pkg_1"
 	e.h.Store = m
 	if err := e.h.Run(context.Background(), claim); err != nil {

@@ -253,8 +253,8 @@ func TestARunsSourcesAreExactlyThoseOfItsOwnToolResultsWhileOtherRunsOverlap(t *
 				t.Errorf("%s: the list is not in the order of the numbers: %v", topic, ns(sourcesOf(m)))
 			}
 			prev = s.N
-			if want := w.number(map[string]string{"alpha": "member-1", "beta": "member-1", "gamma": "member-2"}[topic], s.URL); s.N != want {
-				t.Errorf("%s: %s is %d, the gateway numbered it %d", topic, s.URL, s.N, want)
+			if want := w.number(map[string]string{"alpha": "member-1", "beta": "member-1", "gamma": "member-2"}[topic], s.URL); s.WebN != want { // D70: N is the HOST's, WebN the gateway's
+				t.Errorf("%s: %s is %d, the gateway numbered it %d", topic, s.URL, s.WebN, want)
 			}
 		}
 		sort.Strings(got)
@@ -345,7 +345,7 @@ func TestInvalidCitationsAreDroppedAndCountedAndTheRunGoesOn(t *testing.T) {
 	if err := e.h.Run(context.Background(), claim); err != nil {
 		t.Fatal(err)
 	}
-	if m.status != run.StatusCompleted || fmt.Sprint(ns(sourcesOf(m))) != "[1 6]" {
+	if m.status != run.StatusCompleted || fmt.Sprint(ns(sourcesOf(m))) != "[1 2]" {
 		t.Fatalf("%s %v", m.status, sourcesOf(m))
 	}
 	if ev := finalEvent(t, m); ev["droppedInvalid"] != 6 {
@@ -396,17 +396,19 @@ func TestANumberGivenAgainWithAnotherAddressKeepsTheFirstAndCountsAConflict(t *t
 		return "results", map[string]any{"citations": []any{map[string]any{"n": 4, "title": "t", "url": fmt.Sprintf("https://a.example/v%d", n)}}}, false
 	}))
 	e.h.Gateways["edge"].ExternalTools = []string{"web_*"}
-	e.model.Script = seq(call("web_search", `{}`), call("web_search", `{}`), fakemodel.Turn{Text: "see [4]"})
+	e.model.Script = seq(call("web_search", `{}`), call("web_search", `{}`), fakemodel.Turn{Text: "see [1]"})
 	m := newWebRun(webDef(), "go", "run_1", "tok", run.Input{ExternalTools: true})
 	e.h.Store = m
 	if err := e.h.Run(context.Background(), claim); err != nil {
 		t.Fatal(err)
 	}
 	got := sourcesOf(m)
-	if len(got) != 1 || got[0].URL != "https://a.example/v1" || !got[0].Cited {
+	// D70: idp-web's number is not the identity of a source any more: another address under the same idp-web number is another source
+	// with a number of its own, and the first one keeps its address
+	if len(got) != 2 || got[0].URL != "https://a.example/v1" || !got[0].Cited || got[1].URL != "https://a.example/v2" || got[1].N != 2 || got[1].WebN != 4 {
 		t.Fatalf("%+v", got)
 	}
-	if ev := finalEvent(t, m); ev["conflicts"] != 1 {
+	if ev := finalEvent(t, m); ev["conflicts"] != 0 {
 		t.Errorf("%v", ev)
 	}
 }

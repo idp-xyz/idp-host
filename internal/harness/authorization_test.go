@@ -38,6 +38,16 @@ func (s *spyStore) AnswerToolCall(ctx context.Context, c *run.Claim, id, state, 
 	return err
 }
 
+func (s *spyStore) AnswerCited(ctx context.Context, c *run.Claim, id string, cite run.CiteFunc) error {
+	return s.memStore.AnswerCited(ctx, c, id, func(first int, tree *run.TreeNumbers) (run.Answer, error) {
+		a, err := cite(first, tree)
+		if err == nil {
+			s.answers = append(s.answers, spyAnswer{id, a.Events})
+		}
+		return a, err
+	})
+}
+
 // bridgeTool is a read-only tool that fails with the marker in structuredContent; external says whether the gateway marks it.
 func bridgeTool(name string, external bool, marker any) fakemcp.Tool {
 	t := fakemcp_tool(name, `{"type":"object"}`, true, func(string, map[string]any) (string, any, bool) {

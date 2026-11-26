@@ -32,10 +32,14 @@ type CreateRunInput struct {
 	RawHash        string            // digest of the request as sent (see FindReplayRaw); stored for the early replay check
 	RewriteUsage   *RewriteUsage     // the model call that rewrote the question (D66), counted as the run's step 0
 	CMICredential  *credential.Token // the member's CMI credential for the knowledge tools (D68), sealed before storage
-	TraceID        string
-	Traceparent    string // the W3C traceparent of the request, for the worker's turn to continue (D57)
-	ReleaseID      string // the approved release to run; "" = the agent's current release
-	ExecutionRef   string // the caller's execution reference (EER), recorded on the run
+	// CitationNext is the number the run tree's counter starts at (D70): one past the knowledge items the first package numbered, 1 when
+	// it numbered none. Sources are the records of those items. The run is the root of its tree.
+	CitationNext int
+	Sources      []run.Source
+	TraceID      string
+	Traceparent  string // the W3C traceparent of the request, for the worker's turn to continue (D57)
+	ReleaseID    string // the approved release to run; "" = the agent's current release
+	ExecutionRef string // the caller's execution reference (EER), recorded on the run
 	// D32: the CMI package the run's context came from, and the events that record how it was
 	// resolved (or why it was skipped), appended right after RUN_STARTED
 	ContextPackageID string
@@ -277,8 +281,8 @@ func (s *Store) CreateRun(ctx context.Context, tenant string, in CreateRunInput)
 				ctxPkg = in.ContextPackageID
 			}
 			if _, err := tx.Exec(ctx, `INSERT INTO runs (tenant_id, id, thread_id, agent_id, release_id, release_digest, owner, status, idempotency_key, request_sha256, input,
-			credential, credential_expires_at, trace_id, deadline_at, execution_ref, context_package_id, file_tickets, credential_refresh, traceparent, cmi_credential, request_raw_sha256, tokens_used) VALUES ($1, $2, $3, $4, $5, $6, $7, 'QUEUED', $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, nullif($21, ''), $22)`,
-				tenant, runID, threadID, a.ID, releaseID, env.Digest, in.Owner, in.IdempotencyKey, hash, inputRaw, cred, credExp, trace, deadline, execRef, ctxPkg, tickets, credRefresh, traceparent, cmiCred, in.RawHash, rewriteTokens(in.RewriteUsage)); err != nil {
+			credential, credential_expires_at, trace_id, deadline_at, execution_ref, context_package_id, file_tickets, credential_refresh, traceparent, cmi_credential, request_raw_sha256, tokens_used, citation_next) VALUES ($1, $2, $3, $4, $5, $6, $7, 'QUEUED', $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, nullif($21, ''), $22, $23)`,
+				tenant, runID, threadID, a.ID, releaseID, env.Digest, in.Owner, in.IdempotencyKey, hash, inputRaw, cred, credExp, trace, deadline, execRef, ctxPkg, tickets, credRefresh, traceparent, cmiCred, in.RawHash, rewriteTokens(in.RewriteUsage), max(in.CitationNext, 1)); err != nil {
 				if isUniqueViolation(err) {
 					if strings.Contains(constraintOf(err), "idempotency") {
 						return errRetry // the same request raced; the retry replays it
@@ -286,6 +290,11 @@ func (s *Store) CreateRun(ctx context.Context, tenant string, in CreateRunInput)
 					return fail("CONFLICT", "run %s exists", runID)
 				}
 				return err
+			}
+			if len(in.Sources) > 0 { // D70: the knowledge items of the first package that were numbered
+				if err := saveSources(ctx, tx, tenant, runID, &run.SourceSet{Items: in.Sources}); err != nil {
+					return err
+				}
 			}
 			if u := in.RewriteUsage; u != nil {
 				// D66: the question rewrite was a model call made for this run before it existed; its tokens are the run's, as step 0, so
@@ -549,7 +558,7 @@ func (s *Store) cancelResting(ctx context.Context, tx pgx.Tx, tenant string, r *
 	if _, err := tx.Exec(ctx, `UPDATE tool_calls SET state = 'REJECTED', decided_by = $2, decided_at = now() WHERE run_id = $1 AND state = 'PENDING_CONFIRMATION'`, r.ID, "cancel"); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE runs SET status = 'CANCELED', failure_code = 'CANCELED', failure_message = $2, finished_at = now(), lease_owner = NULL, lease_until = NULL, credential = NULL, credential_refresh = NULL, cmi_credential = NULL, cmi_credential_ref = NULL, file_tickets = NULL WHERE id = $1`, r.ID, reason); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE runs SET status = 'CANCELED', failure_code = 'CANCELED', failure_message = $2, finished_at = now(), lease_owner = NULL, lease_until = NULL, credential = NULL, credential_refresh = NULL, credential_ref = NULL, cmi_credential = NULL, cmi_credential_ref = NULL, file_tickets = NULL WHERE id = $1`, r.ID, reason); err != nil {
 		return err
 	}
 	if err := appendEvents(ctx, tx, tenant, r.ID, []agui.Event{agui.RunError(reason, "CANCELED")}); err != nil {
@@ -727,10 +736,6 @@ func (s *Store) Context(ctx context.Context, c *run.Claim) (*run.Context, error)
 			return err
 		}
 		out.BlockedPatterns = policy.BlockedPatterns
-		// D67: the run's citation counter is what its events say, so it survives a hand-over and a resume
-		if out.CitationNext, err = citationNext(ctx, tx, c.TenantID, c.RunID); err != nil {
-			return err
-		}
 		out.ToolCalls, err = runCalls(ctx, tx, c.RunID, []string{run.CallPendingConfirmation, run.CallConfirmed, run.CallRejected, run.CallExpired, run.CallExecuting, run.CallDelegated, run.CallDenied}, true)
 		if err != nil {
 			return err
@@ -1045,7 +1050,7 @@ func (s *Store) Finish(ctx context.Context, c *run.Claim, status, failureCode, f
 			return err
 		}
 		if finished {
-			if _, err := tx.Exec(ctx, `UPDATE runs SET credential = NULL, credential_refresh = NULL, cmi_credential = NULL, cmi_credential_ref = NULL, file_tickets = NULL WHERE id = $1`, c.RunID); err != nil {
+			if _, err := tx.Exec(ctx, `UPDATE runs SET credential = NULL, credential_refresh = NULL, credential_ref = NULL, cmi_credential = NULL, cmi_credential_ref = NULL, file_tickets = NULL WHERE id = $1`, c.RunID); err != nil {
 				return err
 			}
 		}
@@ -1137,11 +1142,16 @@ func (s *Store) CreateChildRun(ctx context.Context, c *run.Claim, in run.ChildRu
 			if _, err := tx.Exec(ctx, `INSERT INTO threads (tenant_id, id, owner, agent_id) VALUES ($1, $2, $3, $4)`, c.TenantID, childID, parent.Owner, ag.ID); err != nil {
 				return err
 			}
-			var cred, credRefresh []byte
-			var credExp *time.Time
+			// D76: a child that uses the parent's gateway does not hold a copy of the credential (two holders of one refresh token kill it
+			// at the first rotation); it points at the run that holds it, the root's, as the CMI credential's does (D69)
+			var credRef any
 			if eff := doc.Effective(); in.Gateway != "" && eff.Tools.Gateway == in.Gateway && len(eff.Tools.Allow) > 0 {
-				if err := tx.QueryRow(ctx, `SELECT credential, credential_expires_at, credential_refresh FROM runs WHERE id = $1`, parent.ID).Scan(&cred, &credExp, &credRefresh); err != nil {
+				var holder *string
+				if err := tx.QueryRow(ctx, `SELECT CASE WHEN credential IS NOT NULL THEN id ELSE credential_ref END FROM runs WHERE id = $1`, parent.ID).Scan(&holder); err != nil {
 					return err
+				}
+				if holder != nil && *holder != "" {
+					credRef = *holder
 				}
 			}
 			input := run.Input{Tools: []agui.Tool{}, Context: parent.Input.Context, MaxOutputTokens: parent.Input.MaxOutputTokens,
@@ -1167,7 +1177,7 @@ func (s *Store) CreateChildRun(ctx context.Context, c *run.Claim, in run.ChildRu
 			}
 			inputRaw, _ := json.Marshal(input)
 			deadline := s.now().Add(time.Duration(doc.Definition.Limits.RunTimeoutSeconds) * time.Second)
-			var trace, execRef, exp, traceparent any
+			var trace, execRef, traceparent any
 			if parent.TraceID != "" {
 				trace = parent.TraceID
 			}
@@ -1181,12 +1191,9 @@ func (s *Store) CreateChildRun(ctx context.Context, c *run.Claim, in run.ChildRu
 			if parent.ExecutionRef != "" {
 				execRef = parent.ExecutionRef
 			}
-			if credExp != nil {
-				exp = *credExp
-			}
 			if _, err := tx.Exec(ctx, `INSERT INTO runs (tenant_id, id, thread_id, agent_id, release_id, release_digest, owner, status, idempotency_key, request_sha256, input,
-			credential, credential_expires_at, trace_id, deadline_at, execution_ref, parent_run_id, depth, credential_refresh, traceparent) VALUES ($1, $2, $2, $3, $4, $5, $6, 'QUEUED', $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`,
-				c.TenantID, childID, ag.ID, releaseID, env.Digest, parent.Owner, "sub:"+in.ToolCallID, hash, inputRaw, cred, exp, trace, deadline, execRef, parent.ID, parent.Depth+1, credRefresh, traceparent); err != nil {
+			trace_id, deadline_at, execution_ref, parent_run_id, depth, traceparent, credential_ref) VALUES ($1, $2, $2, $3, $4, $5, $6, 'QUEUED', $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+				c.TenantID, childID, ag.ID, releaseID, env.Digest, parent.Owner, "sub:"+in.ToolCallID, hash, inputRaw, trace, deadline, execRef, parent.ID, parent.Depth+1, traceparent, credRef); err != nil {
 				return err
 			}
 			{ // D68: whoever holds or references the member's credential, its child references it too; the child's own release decides whether it has the tools
@@ -1289,94 +1296,72 @@ func (s *Store) ListChildRuns(ctx context.Context, tenant, owner, parentID strin
 	return out, err
 }
 
+// gatewayCredential reads the gateway credential the claimed run uses (D76): its own, or the one of the run its credential_ref names
+// (the root's), under the claim's fence. The holder's row is read without a lock: the renewal replaces the value as a whole.
+func (s *Store) gatewayCredential(ctx context.Context, c *run.Claim) (*credential.Token, bool, error) {
+	var out *credential.Token
+	var shared bool
+	err := s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
+		if _, err := s.owned(ctx, tx, c); err != nil {
+			return err
+		}
+		holder, err := holderOf(ctx, tx, gatewayKind, c.RunID)
+		if err != nil {
+			return err
+		}
+		shared = holder != c.RunID
+		var snap credSnap
+		if err := tx.QueryRow(ctx, `SELECT `+gatewayKind.cols+` FROM runs WHERE id = $1`, holder).Scan(gatewayKind.dests(&snap)...); err != nil {
+			return err
+		}
+		if len(snap.sealed) == 0 {
+			return gatewayKind.gone()
+		}
+		out, err = gatewayKind.open(s, snap)
+		return err
+	})
+	return out, shared, err
+}
+
 // Credential returns the run's decrypted gateway token.
 func (s *Store) Credential(ctx context.Context, c *run.Claim) (string, error) {
-	var tok string
-	err := s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
-		r, err := s.owned(ctx, tx, c)
-		if err != nil {
-			return err
-		}
-		var sealed []byte
-		if err := tx.QueryRow(ctx, `SELECT credential FROM runs WHERE id = $1`, c.RunID).Scan(&sealed); err != nil {
-			return err
-		}
-		if sealed == nil {
-			return &run.Failure{Code: run.FailCredential, Message: "the run carries no gateway credential"}
-		}
-		if !r.CredentialExpiresAt.IsZero() && !s.now().Before(r.CredentialExpiresAt) {
-			return &run.Failure{Code: run.FailCredential, Message: "the delegated credential expired at " + r.CredentialExpiresAt.UTC().Format(time.RFC3339)}
-		}
-		if s.Box == nil {
-			return errors.New("credential key not configured")
-		}
-		plain, err := s.Box.Open(sealed)
-		if err != nil {
-			return &run.Failure{Code: run.FailCredential, Message: "the credential cannot be decrypted"}
-		}
-		tok = string(plain)
-		return nil
-	})
-	return tok, err
+	tok, _, err := s.gatewayCredential(ctx, c)
+	if err != nil {
+		return "", err
+	}
+	if !tok.ExpiresAt.IsZero() && !s.now().Before(tok.ExpiresAt) {
+		return "", &run.Failure{Code: run.FailCredential, Message: "the delegated credential expired at " + tok.ExpiresAt.UTC().Format(time.RFC3339)}
+	}
+	return tok.AccessToken, nil
 }
 
 // RunCredential returns the run's delegated gateway credential with its expiry and, when it is session-bound, its
-// refresh token (D38). Unlike Credential it does not refuse an expired token: the caller may renew it.
+// refresh token (D38). Unlike Credential it does not refuse an expired token: the caller may renew it. A sub-agent run's
+// credential is the root's (D76); Shared on the token says so.
 func (s *Store) RunCredential(ctx context.Context, c *run.Claim) (*credential.Token, error) {
-	var out *credential.Token
-	err := s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
-		r, err := s.owned(ctx, tx, c)
-		if err != nil {
-			return err
-		}
-		var sealed, sealedRefresh []byte
-		if err := tx.QueryRow(ctx, `SELECT credential, credential_refresh FROM runs WHERE id = $1`, c.RunID).Scan(&sealed, &sealedRefresh); err != nil {
-			return err
-		}
-		if sealed == nil {
-			return &run.Failure{Code: run.FailCredential, Message: "the run carries no gateway credential"}
-		}
-		if s.Box == nil {
-			return errors.New("credential key not configured")
-		}
-		plain, err := s.Box.Open(sealed)
-		if err != nil {
-			return &run.Failure{Code: run.FailCredential, Message: "the credential cannot be decrypted"}
-		}
-		out = &credential.Token{AccessToken: string(plain), ExpiresAt: r.CredentialExpiresAt}
-		if sealedRefresh != nil {
-			rt, err := s.Box.Open(sealedRefresh)
-			if err != nil {
-				return &run.Failure{Code: run.FailCredential, Message: "the credential cannot be decrypted"}
-			}
-			out.RefreshToken = string(rt)
-		}
-		return nil
-	})
-	return out, err
+	tok, shared, err := s.gatewayCredential(ctx, c)
+	if tok != nil {
+		tok.Shared = shared
+	}
+	return tok, err
 }
 
-// SaveCredential replaces the run's credential with a renewed one (D38); fenced by the claim.
+// SaveCredential replaces the credential the run uses with a renewed one (D38); fenced by the claim. A renewal that the runs of a tree
+// share goes through RenewRunCredential instead, which does not let two runs renew one refresh token; this writes unconditionally.
 func (s *Store) SaveCredential(ctx context.Context, c *run.Claim, tok *credential.Token) error {
-	if s.Box == nil {
-		return errors.New("credential key not configured")
-	}
-	sealed, err := s.Box.Seal([]byte(tok.AccessToken))
+	set, args, err := gatewayKind.write(s, tok)
 	if err != nil {
 		return err
-	}
-	var sealedRefresh []byte
-	if tok.RefreshToken != "" {
-		if sealedRefresh, err = s.Box.Seal([]byte(tok.RefreshToken)); err != nil {
-			return err
-		}
 	}
 	return s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
 		if _, err := s.owned(ctx, tx, c); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, `UPDATE runs SET credential = $2, credential_expires_at = $3, credential_refresh = coalesce($4, credential_refresh) WHERE id = $1`,
-			c.RunID, sealed, tok.ExpiresAt, sealedRefresh)
+		holder, err := holderOf(ctx, tx, gatewayKind, c.RunID)
+		if err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, `UPDATE runs SET `+set+` WHERE id = $1`, append([]any{holder}, args...)...)
 		return err
 	})
 }
@@ -1482,33 +1467,10 @@ func contextItems(events []agui.Event) int {
 	return 0
 }
 
-// citationNext is the number the next knowledge item of a run gets (D67): one past the last number the events of its packages
-// gave, 0 when none did. The initial package (idp.host/context.resolved), a knowledge tool's package (context.package) and a
-// refreshed one (context.stale) each say firstIndex and how many items they numbered (itemCount, or numbered).
-func citationNext(ctx context.Context, tx pgx.Tx, tenant, runID string) (int, error) {
-	var next int
-	err := tx.QueryRow(ctx, `SELECT coalesce(max((payload->'value'->>'firstIndex')::int + coalesce((payload->'value'->>'itemCount')::int, (payload->'value'->>'numbered')::int, 0)), 0)
-		FROM run_events WHERE tenant_id = $1 AND run_id = $2 AND type = 'CUSTOM'
-		AND payload->>'name' IN ('idp.host/context.resolved', 'idp.host/context.package', 'idp.host/context.stale')`, tenant, runID).Scan(&next)
-	return next, err
-}
-
 // sealToken seals a delegated token with its expiry and refresh token as one document (D68).
 func sealToken(box *credential.Box, t *credential.Token) ([]byte, error) {
 	plain, _ := json.Marshal(map[string]any{"a": t.AccessToken, "r": t.RefreshToken, "e": t.ExpiresAt.Unix()})
 	return box.Seal(plain)
-}
-
-// credentialHolder is the run whose row holds the credential of run id: itself, or the run its cmi_credential_ref names (D68).
-func credentialHolder(ctx context.Context, tx pgx.Tx, id string) (string, error) {
-	var ref *string
-	if err := tx.QueryRow(ctx, `SELECT cmi_credential_ref FROM runs WHERE id = $1`, id).Scan(&ref); err != nil {
-		return "", err
-	}
-	if ref != nil && *ref != "" {
-		return *ref, nil
-	}
-	return id, nil
 }
 
 // openToken reads the sealed token document; run.ErrCMICredentialUnusable when it cannot be opened (a rotated key, damage).

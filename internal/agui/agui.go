@@ -381,6 +381,14 @@ const (
 	// so (D61): {toolCallId, tool, connection}. connection is an id; no address is ever carried. Written with the call's answer.
 	CustomAuthorizationRequired = "idp.host/authorization.required"
 
+	// CustomCitationsNumbered: the HOST numbered the sources of a result of an outward tool (D71): {toolCallId, tool, mode (rewritten |
+	// indexed | neutralised), numbers: [{n, webN}] (the HOST's number and idp-web's for each source numbered, a source numbered before
+	// keeps its number), taken (new numbers), notShown (sources the cut result does not hold), invalid}. It is the audit of the map
+	// from idp-web's numbers, which the model never reads, to the HOST's.
+	CustomCitationsNumbered = "idp.host/citations.numbered"
+	// CustomCitationsUnnumbered: a successful result of an outward tool carried no structured citations, so its text went to the model
+	// as it was and has no number (D71): {toolCallId, tool, reason: no_structured_citations}.
+	CustomCitationsUnnumbered = "idp.host/citations.unnumbered"
 	// CustomRunSources is written once when a run that has sources, or that was dropping entries, completes: the full list
 	// of the run's web sources with the counts of what was not recorded (D49).
 	CustomRunSources = "idp.host/run.sources"

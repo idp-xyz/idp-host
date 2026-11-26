@@ -25,15 +25,38 @@ const (
 	maxScanned    = 100       // entries read from one tool result; the rest are counted as over the limit
 )
 
-// Source is one web source a run was given: what the member checks an answer against. Cited says whether the final answer
-// carries its number. Only titles and addresses are kept, never page text or excerpts (D49, provider terms).
+// Kinds of source (D70). A source recorded before D70 has no kind and is a web source.
+const (
+	KindWeb       = "web"
+	KindKnowledge = "knowledge"
+)
+
+// Source is one source a run's tree was given: what the member checks an answer against. N is the number the HOST gave it (D70):
+// the [n] the model read and the answer cites, unique in the whole run tree. Cited says whether the final answer carries its
+// number. Only titles and addresses are kept, never page text or excerpts (D49, provider terms).
+//
+// A web source has an address and, for audit, WebN: the number idp-web gave the address, which the model never reads. A knowledge
+// source (D65) has the document's id and where in it the passage is, and no address.
 type Source struct {
-	N         int    `json:"n"`
-	Title     string `json:"title"`
-	URL       string `json:"url"`
-	FetchedAt string `json:"fetchedAt,omitempty"`
-	SHA256    string `json:"sha256,omitempty"`
-	Cited     bool   `json:"cited"`
+	N          int    `json:"n"`
+	Kind       string `json:"kind,omitempty"`
+	Title      string `json:"title"`
+	URL        string `json:"url,omitempty"`
+	FetchedAt  string `json:"fetchedAt,omitempty"`
+	SHA256     string `json:"sha256,omitempty"`
+	WebN       int    `json:"webN,omitempty"`
+	DocumentID string `json:"documentId,omitempty"`
+	Where      string `json:"where,omitempty"`
+	Origin     string `json:"source,omitempty"` // a knowledge source: the CMI source the document comes from
+	Cited      bool   `json:"cited"`
+}
+
+// identity is what two records of one number must agree on to be the same source.
+func (s Source) identity() string {
+	if s.Kind == KindKnowledge {
+		return "k\x00" + s.DocumentID + "\x00" + s.Where
+	}
+	return "w\x00" + s.URL
 }
 
 // SourceBatch is what one tool result (or one finished sub-agent run) adds to a run's sources: the valid entries, and how
@@ -42,11 +65,13 @@ type SourceBatch struct {
 	Items   []Source `json:"items"`
 	Invalid int      `json:"invalid,omitempty"`
 	Excess  int      `json:"excess,omitempty"`
+	// Unnumbered counts results of an outward tool that carried no structured citations (D71).
+	Unnumbered int `json:"unnumbered,omitempty"`
 }
 
 // Empty reports whether the batch changes nothing.
 func (b *SourceBatch) Empty() bool {
-	return b == nil || len(b.Items) == 0 && b.Invalid == 0 && b.Excess == 0
+	return b == nil || len(b.Items) == 0 && b.Invalid == 0 && b.Excess == 0 && b.Unnumbered == 0
 }
 
 // SourceSet is a run's sources and the counts of what was not recorded, as stored with the run.
@@ -57,6 +82,9 @@ type SourceSet struct {
 	Conflicts        int      `json:"conflicts,omitempty"` // a number given again with another address; the first address was kept
 	Checked          bool     `json:"checked,omitempty"`   // the citation check ran when the run completed
 	Unverified       []int    `json:"unverified,omitempty"`
+	// Unnumbered counts the successful results of the run's outward tools that carried no structured citations, whose text went to
+	// the model as it was, with no number (D71).
+	Unnumbered int `json:"unnumbered,omitempty"`
 }
 
 // ParseCitations reads structuredContent.citations of a tool result (platform ADR-0003 D9). An entry that does not have the
@@ -208,12 +236,16 @@ func (s *SourceSet) Merge(b *SourceBatch) {
 	}
 	s.DroppedInvalid += b.Invalid
 	s.DroppedOverLimit += b.Excess
+	s.Unnumbered += b.Unnumbered
 	for _, in := range b.Items {
 		in.Cited = false
+		if in.Kind == "" {
+			in.Kind = KindWeb
+		}
 		i := sort.Search(len(s.Items), func(i int) bool { return s.Items[i].N >= in.N })
 		if i < len(s.Items) && s.Items[i].N == in.N {
 			have := &s.Items[i]
-			if have.URL != in.URL {
+			if have.identity() != in.identity() {
 				s.Conflicts++
 				continue
 			}
@@ -225,6 +257,9 @@ func (s *SourceSet) Merge(b *SourceBatch) {
 			}
 			if have.SHA256 == "" {
 				have.SHA256 = in.SHA256
+			}
+			if have.WebN == 0 {
+				have.WebN = in.WebN
 			}
 			continue
 		}
@@ -258,15 +293,17 @@ func (s *SourceSet) Batch() *SourceBatch {
 // number that does not exist, not a source that exists and does not support the sentence.
 func (s *SourceSet) Check(answer string) { s.checkKnowing(answer, 0) }
 
-// checkKnowing is Check for a run that also numbered knowledge items 1..knowledge (D67): those numbers exist, so they are not
-// reported as unverified. They are not web sources and are never marked cited here.
-func (s *SourceSet) checkKnowing(answer string, knowledge int) {
+// checkKnowing is Check for a run tree whose sources were numbered 1..given (D70): every number up to given was given to some
+// source of the tree (the counter is gapless), so none of them is reported as unverified, whether or not this run's own list holds
+// the source (a source of the parent, of a sibling, one dropped for the limit of MaxSources). A number that is in the list is marked
+// cited when the answer carries it.
+func (s *SourceSet) checkKnowing(answer string, given int) {
 	known := map[int]int{}
 	for i := range s.Items {
 		s.Items[i].Cited = false
 		known[s.Items[i].N] = i
 	}
-	cited, unknown := CitationMarks(answer, func(n int) bool { _, ok := known[n]; return ok || (n >= 1 && n <= knowledge) })
+	cited, unknown := CitationMarks(answer, func(n int) bool { _, ok := known[n]; return ok || (n >= 1 && n <= given) })
 	for _, n := range cited {
 		if i, ok := known[n]; ok {
 			s.Items[i].Cited = true
@@ -372,21 +409,36 @@ func keys(m map[int]bool) []int {
 // Event is the payload of idp.host/run.sources, the record at the end of a run (D49): the full list and what was not
 // recorded.
 func (s *SourceSet) Event() map[string]any {
-	items := s.Items
-	if items == nil {
-		items = []Source{}
-	}
+	items := s.Normalised()
 	unverified := s.Unverified
 	if unverified == nil {
 		unverified = []int{}
 	}
-	return map[string]any{"sources": items, "unverifiedCitations": unverified, "droppedInvalid": s.DroppedInvalid, "droppedOverLimit": s.DroppedOverLimit, "conflicts": s.Conflicts, "checked": s.Checked}
+	return map[string]any{"sources": items, "unverifiedCitations": unverified, "droppedInvalid": s.DroppedInvalid, "droppedOverLimit": s.DroppedOverLimit, "conflicts": s.Conflicts, "checked": s.Checked, "unnumberedResults": s.Unnumbered}
+}
+
+// Normalised is the list as it is shown: never nil, and every source has its kind (one stored before D70 has none and is a web
+// source).
+func (s *SourceSet) Normalised() []Source {
+	return NormaliseSources(s.Items)
+}
+
+// NormaliseSources returns a copy of items in which every source has its kind.
+func NormaliseSources(items []Source) []Source {
+	out := make([]Source, len(items))
+	copy(out, items)
+	for i := range out {
+		if out[i].Kind == "" {
+			out[i].Kind = KindWeb
+		}
+	}
+	return out
 }
 
 // Worth reports whether the end of the run has something to record: sources, an unverified number, or entries that were
 // dropped.
 func (s *SourceSet) Worth() bool {
-	return len(s.Items) > 0 || len(s.Unverified) > 0 || s.DroppedInvalid > 0 || s.DroppedOverLimit > 0 || s.Conflicts > 0
+	return len(s.Items) > 0 || len(s.Unverified) > 0 || s.DroppedInvalid > 0 || s.DroppedOverLimit > 0 || s.Conflicts > 0 || s.Unnumbered > 0
 }
 
 // CheckAtEnd is the check a completing run makes (D49). A run without sources whose release has no outward tool skips it
@@ -396,11 +448,12 @@ func (s *SourceSet) CheckAtEnd(answer string, outward bool) bool {
 	return s.CheckAtEndKnowing(answer, outward, 0)
 }
 
-// CheckAtEndKnowing is CheckAtEnd for a run whose knowledge items were numbered 1..knowledge (D67).
-func (s *SourceSet) CheckAtEndKnowing(answer string, outward bool, knowledge int) bool {
-	if len(s.Items) == 0 && !outward {
+// CheckAtEndKnowing is CheckAtEnd for a run tree whose sources were numbered 1..given (D70): given is the root's counter less one.
+// A tree that gave no number, with a run that has no sources and no outward tool, skips the check as before.
+func (s *SourceSet) CheckAtEndKnowing(answer string, outward bool, given int) bool {
+	if len(s.Items) == 0 && !outward && given == 0 {
 		return s.Worth()
 	}
-	s.checkKnowing(answer, knowledge)
+	s.checkKnowing(answer, given)
 	return s.Worth()
 }

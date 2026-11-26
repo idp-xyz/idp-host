@@ -55,6 +55,14 @@ type Store interface {
 	// D49: src, when not nil, is what the call's result adds to the run's sources. It is written in the same transaction, so
 	// that a call is answered once and its sources are recorded once, however often a worker stops and the run is resumed.
 	AnswerToolCall(ctx context.Context, c *run.Claim, id, state, result string, isError bool, msg agui.Message, src *run.SourceBatch, events []agui.Event) error
+	// AnswerCited is AnswerToolCall for a result the HOST numbers (D70): the store takes the run tree's counter (the root's row, locked
+	// first), calls cite with the number the next source gets, writes the answer cite made and moves the counter by the numbers it
+	// used, all in one transaction. A call is answered once and numbered once; the counter has no gap, and the lock is held only for
+	// that transaction, which waits for nothing outside the database.
+	AnswerCited(ctx context.Context, c *run.Claim, id string, cite run.CiteFunc) error
+	// CiteContext takes count numbers of the tree's counter for context entries a refresh brings in (D70) and records the sources
+	// that sources(first) makes for them, in one transaction. It returns the first number.
+	CiteContext(ctx context.Context, c *run.Claim, count int, sources func(first int) []run.Source) (int, error)
 	// CheckSources compares the citation marks of the final answer with the run's sources, stores the result with the run and
 	// appends idp.host/run.sources, in one transaction (D49). It does nothing, and writes no event, when the run has no
 	// sources and nothing was dropped and the check found no unverified number.
@@ -256,7 +264,6 @@ type turn struct {
 	viewRaw    float64                              // the raw estimate of the request now being sent
 	viewFixed  float64                              // ... and corrected
 	hint       string                               // what the budget note adds about the context this step
-	citeNext   int                                  // the number the next knowledge item of the run gets (D67)
 	cmiCred    *credential.Token                    // the member's credential for the CMI, as last loaded or renewed (D68)
 	cmiLoaded  bool                                 // cmiCred was asked of the store
 	cmiFailed  bool                                 // the member's CMI credential could not be renewed: no more calls this turn (D68)
@@ -322,7 +329,6 @@ func (h *Harness) Run(ctx context.Context, c *run.Claim) (err error) {
 	}
 	t.flagged = map[string]bool{}
 	t.limits = h.limitsFor(t.def)
-	t.startCitations() // D67
 	defer t.watch()()
 	out, err := guard.NewOutput(rc.BlockedPatterns, t.def.Guards.Output.Patterns, t.def.Guards.Output.Redact)
 	if err != nil {
@@ -803,6 +809,12 @@ func delivered(tc run.ToolCall, res *mcpclient.CallResult) (agui.Event, bool) {
 	return agui.Custom(agui.CustomFileDelivered, map[string]any{"toolCallId": tc.ID, "ref": f.Ref, "name": f.Name, "mediaType": f.MediaType, "size": f.Size, "sha256": f.SHA256}), true
 }
 
+// credentialRenewer is what a store adds to Store to renew the credential that the runs of a tree share (D76); a store without it keeps
+// the older way, where each run renews and saves its own.
+type credentialRenewer interface {
+	RenewRunCredential(ctx context.Context, c *run.Claim, seen *credential.Token, force bool, renew func(ctx context.Context, refreshToken string) (*credential.Token, error)) (*credential.Token, error)
+}
+
 // gatewayBearer returns the bearer for the gateway (D38): the static one, or the run's delegated credential, renewed with
 // its refresh token when it expires within credentialLeeway. A credential that has expired and cannot be renewed, or a
 // session that has ended, is a *run.Failure: the run ends with it.
@@ -824,9 +836,16 @@ func (t *turn) bearerFor(force bool, refused string) (string, error) {
 	if t.credErr != nil {
 		return "", t.credErr
 	}
-	if t.cred == nil {
+	renewer, hasRenewer := h.Store.(credentialRenewer)
+	if t.cred == nil || (hasRenewer && t.cred.Shared) {
+		// a credential that is the root's (D76) is read again before every call: a root that ended or was canceled has cleared it, and a
+		// sub-agent must not go on with the token it read earlier; one renewed by another run of the tree is taken
 		tok, err := h.Store.RunCredential(t.ctx, t.claim)
 		if err != nil {
+			var f *run.Failure
+			if errors.As(err, &f) && t.cred != nil {
+				t.credErr = f // the holder's credential is gone: the same answer for every later call of the turn
+			}
 			return "", err
 		}
 		t.cred = tok
@@ -848,10 +867,25 @@ func (t *turn) bearerFor(force bool, refused string) (string, error) {
 		return "", t.credErr
 	}
 	rctx, cancel := context.WithTimeout(t.callCtx, 15*time.Second)
-	tok, err := gw.Refresh(rctx, t.cred.RefreshToken)
+	var tok *credential.Token
+	var err error
+	if hasRenewer {
+		// D76: one run of the tree renews at a time, under a lease on the holder's row, with nothing locked across the call to the
+		// authorization server; the others use what it stored
+		tok, err = renewer.RenewRunCredential(rctx, t.claim, t.cred, force, gw.Refresh)
+	} else {
+		tok, err = gw.Refresh(rctx, t.cred.RefreshToken)
+	}
 	cancel()
 	if err != nil && t.callCtx.Err() != nil {
 		return "", errInterrupted
+	}
+	if errors.Is(err, run.ErrFenced) {
+		return "", err
+	}
+	if f := new(run.Failure); errors.As(err, &f) {
+		t.credErr = f
+		return "", f
 	}
 	if err != nil {
 		if errors.Is(err, credential.ErrSessionEnded) {
@@ -866,9 +900,12 @@ func (t *turn) bearerFor(force bool, refused string) (string, error) {
 		t.credErr = &run.Failure{Code: run.FailCredential, Message: "the delegated credential could not be renewed: " + err.Error()}
 		return "", t.credErr
 	}
-	if err := h.Store.SaveCredential(t.ctx, t.claim, tok); err != nil {
-		return "", err
+	if !hasRenewer {
+		if err := h.Store.SaveCredential(t.ctx, t.claim, tok); err != nil {
+			return "", err
+		}
 	}
+	tok.Shared = t.cred.Shared
 	t.cred = tok
 	return tok.AccessToken, nil
 }
@@ -1116,13 +1153,60 @@ func (t *turn) answerSourced(tc run.ToolCall, state, result, errText string, src
 	return nil
 }
 
+// buildAnswer is the answer of a call as the store writes it (see answerSourced).
+func (t *turn) buildAnswer(tc run.ToolCall, state, result, errText string, src *run.SourceBatch, used int, events ...agui.Event) run.Answer {
+	msg := agui.Message{ID: "tool_" + tc.ID, Role: agui.RoleTool, ToolCallID: tc.ID, Content: result, Error: errText}
+	content := result
+	if errText != "" && content == "" {
+		content = "error: " + errText
+	}
+	return run.Answer{State: state, Result: content, IsError: errText != "", Msg: msg, Src: src, Used: used,
+		Events: append(append([]agui.Event(nil), events...), agui.ToolCallResult(msg.ID, tc.ID, content))}
+}
+
+// answerCited answers a call whose result the HOST numbers (D70): build is called with the tree's next number once the store holds the
+// counter, and the answer it returns is written with the counter moved by the numbers it took.
+func (t *turn) answerCited(tc run.ToolCall, build func(first int, tree *run.TreeNumbers) run.Answer) error {
+	var msg agui.Message
+	if err := t.h.Store.AnswerCited(t.ctx, t.claim, tc.ID, func(first int, tree *run.TreeNumbers) (run.Answer, error) {
+		a := build(first, tree)
+		msg = a.Msg
+		return a, nil
+	}); err != nil {
+		return err
+	}
+	t.messages = append(t.messages, msg)
+	return nil
+}
+
+// answerWeb answers the successful call of an outward tool (D71). With no structured citations the text goes to the model as it was
+// and the result is recorded as having no numbers; otherwise the text is made by run.RenderWeb with the HOST's numbers.
+func (t *turn) answerWeb(tc run.ToolCall, o callOutcome, events []agui.Event) error {
+	wc := *o.web
+	if wc.Declared == 0 {
+		ev := agui.Custom(agui.CustomCitationsUnnumbered, map[string]any{"toolCallId": tc.ID, "tool": tc.Tool, "reason": "no_structured_citations"})
+		return t.answerSourced(tc, o.state, o.result, o.errText, &run.SourceBatch{Unnumbered: 1}, append(append([]agui.Event(nil), events...), ev)...)
+	}
+	limit := t.limits.ToolResultBytes
+	return t.answerCited(tc, func(first int, tree *run.TreeNumbers) run.Answer {
+		r := run.RenderWeb(o.result, wc, first, tree.KnownWeb, limit)
+		nums := make([]map[string]any, 0, len(r.Sources))
+		for _, s := range r.Sources {
+			nums = append(nums, map[string]any{"n": s.N, "webN": s.WebN})
+		}
+		ev := agui.Custom(agui.CustomCitationsNumbered, map[string]any{"toolCallId": tc.ID, "tool": tc.Tool, "mode": r.Mode, "numbers": nums, "taken": r.Used, "notShown": r.NotShown, "invalid": wc.Invalid})
+		src := &run.SourceBatch{Items: r.Sources, Invalid: wc.Invalid, Excess: wc.Excess + r.NotShown}
+		return t.buildAnswer(tc, o.state, r.Text, o.errText, src, r.Used, append(append([]agui.Event(nil), events...), ev)...)
+	})
+}
+
 // callOutcome is what a gateway call came to (D53), before anything of it is written: the one-at-a-time path and a
 // group's committer write it the same way.
 type callOutcome struct {
 	state, result, errText string
-	src                    *run.SourceBatch // D49
-	authConn               string           // D61: the connection the member has not authorized, when the result says so
-	deliver                *agui.Event      // the file.delivered event of a delivering call
+	web                    *run.WebCitations // D71: the structured citations of a result of an outward tool, which the HOST numbers
+	authConn               string            // D61: the connection the member has not authorized, when the result says so
+	deliver                *agui.Event       // the file.delivered event of a delivering call
 	res                    *mcpclient.CallResult
 	ok                     bool  // the call went through and the tool did not report an error
 	interrupted            bool  // the deadline or a cancel reached the call (D46)
@@ -1193,7 +1277,13 @@ func (t *turn) settleOutcome(tc run.ToolCall, o callOutcome) (bool, error) {
 	if o.authConn != "" {
 		events = append(events, agui.Custom(agui.CustomAuthorizationRequired, map[string]any{"toolCallId": tc.ID, "tool": tc.Tool, "connection": o.authConn}))
 	}
-	if err := t.answerSourced(tc, o.state, o.result, o.errText, o.src, events...); err != nil {
+	var err error
+	if o.web != nil && o.ok {
+		err = t.answerWeb(tc, o, events)
+	} else {
+		err = t.answerSourced(tc, o.state, o.result, o.errText, nil, events...)
+	}
+	if err != nil {
 		return o.ok, err
 	}
 	if o.authConn != "" {
@@ -1280,12 +1370,11 @@ func (t *turn) invoke(ctx context.Context, tc run.ToolCall, args json.RawMessage
 			o.deliver = &ev
 		}
 	}
-	// D49: the citations of a tool that sends content outside the enterprise become sources of this run. The text the model
-	// reads is the result's text, as before; what is recorded here is never given to a model.
+	// D49, D70, D71: the citations of a tool that sends content outside the enterprise become sources of this run, numbered by the HOST
+	// when the result is written (settleOutcome); the text the model reads has the HOST's numbers, never idp-web's.
 	if t.external[tc.Tool] {
-		if b := run.ParseCitations(res.StructuredContent); !b.Empty() {
-			o.src = &b
-		}
+		wc := run.ParseWebCitations(res.StructuredContent)
+		o.web = &wc
 	}
 	return o
 }
@@ -2555,28 +2644,42 @@ func (t *turn) verifyContext() (bool, error) {
 						kept = append(kept, c)
 					}
 				}
-				// D67: the refreshed entries are numbered on from where the run's counter is, so that no number means two things
-				// (only a run that numbered its first package, or has the tools, numbers: a release without them sees the old text). The
-				// numbers the replaced entries had stay with the thread's earlier results; the new ones are not given again.
-				first := 0
-				if len(t.kTools) > 0 || t.rc.CitationNext > 0 {
-					first = t.citeNext
-				}
-				entries, next := cmiclient.ContextFrom(pkg.Items, first)
+				// D70: the refreshed entries are numbered from the run tree's counter, so that no number means two things (only a run that
+				// numbered its first package, or has the tools, numbers: a release without them sees the old text). The numbers the
+				// replaced entries had stay with the thread's earlier results; the new ones are not given again.
+				items := pkg.Items
+				var screen *cmiclient.Screening
 				// D44: the refresh applies the screen the run was created under, with the ceiling recorded then
 				if ceiling := t.rc.Run.Input.ContextCeiling; ceiling != "" {
 					s := cmiclient.Screen(pkg.Items, ceiling)
-					entries, next = s.ContextFrom(first)
-					if s.Withheld > 0 {
-						event["refreshedWithheld"] = s.Withheld
-						refreshEvents = append(refreshEvents, s.Event(t.rc.Run.Input.ContextTrigger, t.rc.Run.Input.ContextVia))
+					screen, items = &s, s.Kept
+				}
+				first := 0
+				if len(t.kTools) > 0 || t.contextNumbered() {
+					_, after := cmiclient.ContextFrom(items, 1)
+					if count := after - 1; count > 0 {
+						f, err := t.h.Store.CiteContext(t.ctx, t.claim, count, func(first int) []run.Source { return cmiclient.KnowledgeSources(items, first) })
+						if err != nil {
+							return true, err
+						}
+						first = f
 					}
+				}
+				var entries []agui.Context
+				var next int
+				if screen != nil {
+					entries, next = screen.ContextFrom(first)
+					if screen.Withheld > 0 {
+						event["refreshedWithheld"] = screen.Withheld
+						refreshEvents = append(refreshEvents, screen.Event(t.rc.Run.Input.ContextTrigger, t.rc.Run.Input.ContextVia))
+					}
+				} else {
+					entries, next = cmiclient.ContextFrom(items, first)
 				}
 				t.rc.Run.Input.Context = append(kept, entries...)
 				event["refreshedPackageId"], event["refreshedItems"] = pkg.PackageID, len(pkg.Items)
 				if first > 0 {
 					event["firstIndex"], event["numbered"] = first, next-first
-					t.citeNext = next
 				}
 			} else {
 				event["refreshError"] = sanitize(err)

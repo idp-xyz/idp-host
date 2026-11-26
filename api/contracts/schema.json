@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:idp:telos:host:1.12.0",
-  "title": "idp.telos.host 1.12.0",
-  "description": "idp-host（Agent Hosting & Coordination）对外发布的契约：AgentRelease（agent 行为的不可变发布件，ADR-0001 D2；1.1.0 起可嵌入 Skill，D17）、SkillRelease（skill 的不可变发布件）、Envelope（发布件加内容摘要）、AgentRun（一次运行的记录，API 返回的形态；1.3.0 起可为子 agent 运行，D22）和 RunOptions（1.2.0 起：创建运行时的调用方选项，D19）。1.3.0 新增：Definition 的 subagents 与 skillMerge（D22、D24）、Limits 的 maxSubagentDepth、SkillDefinition 的 resources（D23）、AgentRelease 的 subagents、AgentRun 的 parentRunId / depth 与状态 AWAITING_SUBAGENT。1.4.0 新增：Definition 的 guards（输入护栏与输出过滤，D27、D28）与 evaluation（评估集，D26），AgentRun 的 purpose。1.5.0 新增：ModelProfile 的 routing（模型路由，D29）、SubagentRef / EmbeddedSubagent 的 a2a（远端 A2A agent，D30）。1.8.0 新增：RunOptions 的 idp.host/attachments 与 idp.host/delivery（成员文件进出运行，D37；定义 FileAttachment、FileDelivery）。1.9.0 新增：FileAttachment 的 sensitivity（敏感级别，D43：高于租户上限的附件不交给可能使用外部模型的发布件）。1.10.0 只改描述（D44）：说明 HOST 对 CMI 条目按敏感级别筛选；没有改动任何形状，新的事件名与事件字段不属于 schema。1.11.0 新增：AgentRun 的 sources 与 unverifiedCitations（运行的网页来源和回答中无法核对的引用编号，D49；定义 RunSource），都是可选字段。1.12.0 新增：ContextPolicy 的 tools 与 rewrite（HOST 自己的知识检索工具 knowledge__search / knowledge__read / knowledge__find，D65；运行开头对有前文的问题的改写，D66），都是可选字段；事件 idp.host/context.package、idp.host/context.rewrite 与 context.resolved 的新字段不属于 schema。生产者是 idp-host，权威副本在 idp-host/api/contracts/，由 go test ./internal/run -run TestContract 保证与实现一致；idp-contracts 中的副本只能与之逐字节相同。JSON Schema 只描述形状与可本地判定的规则；摘要是否匹配由 agent.Open / agent.OpenSkill 判定，运行时不变量由 HOST 的状态机判定。",
+  "$id": "urn:idp:telos:host:1.13.0",
+  "title": "idp.telos.host 1.13.0",
+  "description": "idp-host（Agent Hosting & Coordination）对外发布的契约：AgentRelease（agent 行为的不可变发布件，ADR-0001 D2；1.1.0 起可嵌入 Skill，D17）、SkillRelease（skill 的不可变发布件）、Envelope（发布件加内容摘要）、AgentRun（一次运行的记录，API 返回的形态；1.3.0 起可为子 agent 运行，D22）和 RunOptions（1.2.0 起：创建运行时的调用方选项，D19）。1.3.0 新增：Definition 的 subagents 与 skillMerge（D22、D24）、Limits 的 maxSubagentDepth、SkillDefinition 的 resources（D23）、AgentRelease 的 subagents、AgentRun 的 parentRunId / depth 与状态 AWAITING_SUBAGENT。1.4.0 新增：Definition 的 guards（输入护栏与输出过滤，D27、D28）与 evaluation（评估集，D26），AgentRun 的 purpose。1.5.0 新增：ModelProfile 的 routing（模型路由，D29）、SubagentRef / EmbeddedSubagent 的 a2a（远端 A2A agent，D30）。1.8.0 新增：RunOptions 的 idp.host/attachments 与 idp.host/delivery（成员文件进出运行，D37；定义 FileAttachment、FileDelivery）。1.9.0 新增：FileAttachment 的 sensitivity（敏感级别，D43：高于租户上限的附件不交给可能使用外部模型的发布件）。1.10.0 只改描述（D44）：说明 HOST 对 CMI 条目按敏感级别筛选；没有改动任何形状，新的事件名与事件字段不属于 schema。1.11.0 新增：AgentRun 的 sources 与 unverifiedCitations（运行的网页来源和回答中无法核对的引用编号，D49；定义 RunSource），都是可选字段。1.12.0 新增：ContextPolicy 的 tools 与 rewrite（HOST 自己的知识检索工具 knowledge__search / knowledge__read / knowledge__find，D65；运行开头对有前文的问题的改写，D66），都是可选字段；事件 idp.host/context.package、idp.host/context.rewrite 与 context.resolved 的新字段不属于 schema。1.13.0 新增（只增不改）：RunSource 的 kind（web | knowledge，缺省 web）、webN、documentId、where、source，RunSource 的 url 只在 kind 为 web 时必需；sources 的 n 现在是 HOST 给的引用编号（整个运行树里唯一，回答里的 [n] 指向它），同一次运行里的网页来源与知识来源在同一张表里（D70–D76）。生产者是 idp-host，权威副本在 idp-host/api/contracts/，由 go test ./internal/run -run TestContract 保证与实现一致；idp-contracts 中的副本只能与之逐字节相同。JSON Schema 只描述形状与可本地判定的规则；摘要是否匹配由 agent.Open / agent.OpenSkill 判定，运行时不变量由 HOST 的状态机判定。",
   "oneOf": [
     {"$ref": "#/$defs/AgentRelease"},
     {"$ref": "#/$defs/SkillRelease"},
@@ -413,7 +413,7 @@
         "depth": {"type": "integer", "minimum": 0, "description": "委派深度：调用方的运行为 0（缺省），子运行为父运行 + 1"},
         "purpose": {"enum": ["evaluation"], "description": "HOST 为评估集创建的运行（D26）；调用方自己的运行没有"},
         "contextPackageId": {"type": "string", "minLength": 1, "description": "运行的 context 来自哪个 CMI ContextPackage（D32）；发布件未要求 CMI 上下文或解析被跳过时没有"},
-        "sources": {"type": "array", "maxItems": 100, "items": {"$ref": "#/$defs/RunSource"}, "description": "1.11.0（D49）：运行的工具返回过的网页来源，按 n 升序，至多 100 条。只有发布件的对外工具（HOST 配置 gateways[].externalTools）返回的引用才会记入；本地子 agent 运行找到的来源也记入父运行（编号相同）。没有来源时没有这个字段。标题来自网页，是不可信的文字：只能当纯文本显示，HOST 从不把它交给任何模型"},
+        "sources": {"type": "array", "maxItems": 100, "items": {"$ref": "#/$defs/RunSource"}, "description": "1.11.0（D49）：运行的工具返回过的网页来源，按 n 升序，至多 100 条；1.13.0（D70）起也含知识来源（知识工具与运行开头那个包给的条目），一张表，编号是 HOST 的。只有发布件的对外工具（HOST 配置 gateways[].externalTools）返回的引用才会记入；本地子 agent 运行找到的来源也记入父运行（编号相同）。没有来源时没有这个字段。标题来自网页，是不可信的文字：只能当纯文本显示，HOST 从不把它交给任何模型"},
         "unverifiedCitations": {"type": "array", "uniqueItems": true, "items": {"type": "integer", "minimum": 1, "maximum": 999}, "description": "1.11.0（D49）：运行完成时，最终回答里写了、但不在 sources 里的引用编号（[n] 形式，语法见 D49），升序。只作标记，回答不被拦截或修改。只发现编号不存在，发现不了来源存在却不支持那句话。没有则没有这个字段；运行没有来源、发布件也没有对外工具时不做这项检查"},
         "traceId": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
         "deadlineAt": {"type": "string", "format": "date-time"},
@@ -440,17 +440,25 @@
     },
     "RunSource": {
       "title": "RunSource",
-      "description": "1.11.0：运行的一个网页来源（D49）。n 是 idp-web 给的引用编号：按调用者递增，同一次运行里唯一但不一定连续，回答里的 [n] 指向它。只保存标题和地址，不保存页面正文和搜索摘要。",
+      "description": "1.11.0：运行的一个来源（D49）。1.13.0（D70）：n 是 HOST 给的引用编号，在整个运行树（根运行与它的子 agent）里唯一、按分配顺序递增，模型读到的和回答里写的 [n] 就是它；网页来源（kind 缺省或为 web）的 webN 是 idp-web 给该地址的编号，模型从不读到，只供核对；知识来源（kind 为 knowledge）有 documentId 与 where，没有 url。只保存标题与地址或文档位置，不保存页面正文和摘录。1.13.0 之前记下的来源没有 kind，都是网页来源，它们的 n 是当时 idp-web 的编号。",
       "x-idp-telos-owner": "idp.telos.host",
       "type": "object",
       "additionalProperties": false,
-      "required": ["n", "title", "url", "cited"],
+      "required": ["n", "title", "cited"],
+      "allOf": [
+        {"if": {"properties": {"kind": {"const": "knowledge"}}, "required": ["kind"]}, "then": {"required": ["documentId"]}, "else": {"required": ["url"]}}
+      ],
       "properties": {
         "n": {"type": "integer", "minimum": 1, "maximum": 1000000},
-        "title": {"type": "string", "maxLength": 300, "description": "网页的标题：已去掉控制字符，超过 300 个字符的截断并以省略号结尾。不可信的文字，只能当纯文本显示"},
-        "url": {"type": "string", "maxLength": 2048, "pattern": "^[Hh][Tt][Tt][Pp][Ss]?://[^\\s]+$", "description": "http 或 https 地址，不含用户信息。同一编号再次出现时保留第一次的地址"},
-        "fetchedAt": {"type": "string", "format": "date-time", "description": "读取的时间（UTC）；同一编号读了多次时取最早的。只搜索没有读取的来源没有这个字段"},
-        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "第一次读取时交给模型的那一段正文的 SHA-256（不是整页的摘要：一页分几段读时，每段一个摘要，这里只保留最先记录的）。只搜索没有读取的来源没有这个字段"},
+        "kind": {"enum": ["web", "knowledge"], "description": "1.13.0：来源的种类，缺省为 web。HOST 总是写出它"},
+        "title": {"type": "string", "maxLength": 300, "description": "网页的标题或文档的标题：已去掉控制字符，超过 300 个字符的截断并以省略号结尾。不可信的文字，只能当纯文本显示"},
+        "url": {"type": "string", "maxLength": 2048, "pattern": "^[Hh][Tt][Tt][Pp][Ss]?://[^\\s]+$", "description": "网页来源的 http 或 https 地址，不含用户信息；知识来源没有"},
+        "fetchedAt": {"type": "string", "format": "date-time", "description": "读取的时间（UTC）；同一地址读了多次时取最早的。只搜索没有读取的来源没有这个字段"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "第一次读取时交给模型的那一段正文的 SHA-256（不是整页的摘要），只保留最先记录的。只搜索没有读取的来源没有这个字段"},
+        "webN": {"type": "integer", "minimum": 1, "maximum": 1000000, "description": "1.13.0：idp-web 给这个地址的编号（按调用者递增、不连续）。模型从不读到它；只供核对 HOST 的编号与 idp-web 的对应"},
+        "documentId": {"type": "string", "maxLength": 128, "description": "1.13.0：知识来源的文档 id（knowledge__read、knowledge__find 用的那个）"},
+        "where": {"type": "string", "maxLength": 1000, "description": "1.13.0：知识来源在文档里的位置（页、幻灯片、标题路径、工作表范围），可能为空"},
+        "source": {"type": "string", "maxLength": 64, "description": "1.13.0：知识来源所属的 CMI 来源名"},
         "cited": {"type": "boolean", "description": "最终回答是否写了这个编号。运行完成前一律为 false"}
       }
     },

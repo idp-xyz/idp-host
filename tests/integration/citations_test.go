@@ -1,0 +1,603 @@
+package integration
+
+// D70-D76 against real PostgreSQL: one citation counter for a run tree, allocated under the root's row lock; the web numbers idp-web
+// gives never reach the model; a child and its parent cite each other's numbers; the counter survives the migration of runs in flight;
+// and the gateway credential of a sub-agent is the root's, renewed once.
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+
+	"idp-host/internal/agent"
+	"idp-host/internal/agui"
+	"idp-host/internal/credential"
+	"idp-host/internal/run"
+	"idp-host/tests/fixtures/fakemodel"
+)
+
+func (e *env) query(sql string, args ...any) pgx.Rows {
+	e.t.Helper()
+	conn, err := pgx.Connect(context.Background(), e.ownerURL)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	e.t.Cleanup(func() { conn.Close(context.Background()) })
+	rows, err := conn.Query(context.Background(), sql, args...)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return rows
+}
+
+func (e *env) scalar(sql string, args ...any) (v string) {
+	e.t.Helper()
+	rows := e.query(sql, args...)
+	defer rows.Close()
+	if rows.Next() {
+		var x *string
+		if err := rows.Scan(&x); err != nil {
+			e.t.Fatal(err)
+		}
+		if x != nil {
+			v = *x
+		}
+	}
+	return v
+}
+
+func (e *env) counterOf(root string) int {
+	var n int
+	fmt.Sscan(e.scalar(`SELECT citation_next::text FROM runs WHERE id = $1`, root), &n)
+	return n
+}
+
+// sourceNumbers returns the numbers of the sources of each run of a tree, by run id.
+func (e *env) sourceNumbers(runs ...string) map[string][]int {
+	e.t.Helper()
+	out := map[string][]int{}
+	for _, id := range runs {
+		rows := e.query(`SELECT (i->>'n')::int FROM run_sources s, jsonb_array_elements(s.doc->'items') i WHERE s.run_id = $1 ORDER BY 1`, id)
+		for rows.Next() {
+			var n int
+			if err := rows.Scan(&n); err != nil {
+				e.t.Fatal(err)
+			}
+			out[id] = append(out[id], n)
+		}
+		rows.Close()
+	}
+	return out
+}
+
+// citationTree publishes a lead that delegates to `kids` researchers (knowledge and web tools) and starts a run of it. The lead's own
+// release has no tools, so its first package (if any) is numbered because a sub-agent has the knowledge tools.
+func citationTree(t *testing.T, e *env, kids int, leadContext bool) (root string, web *itWeb) {
+	t.Helper()
+	e.mcpDeleg.RequireBearer = ""
+	web = &itWeb{pages: map[string][]string{"alpha": {"https://x.example/1", "https://x.example/2"}, "beta": {"https://x.example/2", "https://x.example/3"}, "gamma": {"https://x.example/1", "https://x.example/9"}}}
+	web.install(e.mcpDeleg)
+	e.harness.Gateways["delegated"].ExternalTools = []string{"web_*"}
+	e.host.Files.ExternalTools = map[string][]string{"delegated": {"web_*"}}
+	researcher := knowledgeAgent(agent.KnowledgeTools, "")
+	researcher.Tools = definition("delegated", []string{"web_search"}, nil).Tools
+	e.publish("researcher-c", researcher)
+	lead := definition("delegated", []string{"web_search"}, nil)
+	if leadContext {
+		lead.Context = agent.ContextPolicy{CMI: true, Purpose: "assistant"}
+	}
+	lead.Subagents = []agent.SubagentRef{{Name: "researcher-c", Description: "Looks things up."}}
+	e.publish("lead-c", lead)
+	topics := []string{"alpha", "beta", "gamma"}
+	e.model.Script = func(msgs []fakemodel.Message, tools []string) fakemodel.Turn {
+		has := func(n string) bool {
+			for _, t := range tools {
+				if t == n {
+					return true
+				}
+			}
+			return false
+		}
+		topic, assistants, lastTool := "", 0, ""
+		for _, m := range msgs {
+			switch m.Role {
+			case "user":
+				if topic == "" {
+					topic = strings.Fields(m.Content)[0]
+				}
+			case "assistant":
+				assistants++
+			case "tool":
+				lastTool = m.Content
+			}
+		}
+		if has("agent__researcher-c") { // the lead
+			if assistants == 0 {
+				var calls []fakemodel.Call
+				for i := 0; i < kids; i++ {
+					calls = append(calls, fakemodel.Call{Name: "agent__researcher-c", Args: `{"input":"` + topics[i] + ` please"}`})
+				}
+				return fakemodel.Turn{ToolCalls: calls}
+			}
+			return fakemodel.Turn{Text: "the researchers said: " + lastTool + " also [999] [1]"}
+		}
+		mark := firstMarkRE.FindString(lastTool)
+		switch assistants {
+		case 0:
+			return fakemodel.Turn{ToolCalls: []fakemodel.Call{{Name: "knowledge__search", Args: `{"query":"returns"}`}}}
+		case 1:
+			return fakemodel.Turn{ToolCalls: []fakemodel.Call{{Name: "web_search", Args: `{"query":"` + topic + `"}`}}}
+		case 2:
+			return fakemodel.Turn{ToolCalls: []fakemodel.Call{{Name: "knowledge__find", Args: `{"documentId":"doc-1","text":"fuel"}`}}}
+		}
+		return fakemodel.Turn{Text: "found " + mark + " and the parent's [1]"}
+	}
+	r := e.must(202, "POST", "/v1/agents/lead-c/runs", "erin", runBody(fmt.Sprintf("cite-%d-%v", kids, leadContext), "returns policy"), "Idempotency-Key", fmt.Sprintf("cite-%d-%v", kids, leadContext))
+	return r["runId"].(string), web
+}
+
+func TestSeveralChildrenNumberFromOneCounterAndCiteEachOthersAndTheirParentsNumbersOnPostgres(t *testing.T) {
+	e, _ := knowledgeEnv(t, handbookDoc())
+	root, web := citationTree(t, e, 3, true)
+	// the lead's own first package is numbered 1..n from the tree's counter, because a sub-agent has the tools
+	first := e.counterOf(root)
+	if first < 2 {
+		t.Fatalf("the first package numbered nothing: the counter is %d", first)
+	}
+	if ok, err := e.worker.Once(context.Background()); err != nil || !ok { // the lead delegates
+		t.Fatal(ok, err)
+	}
+	web.arrived, web.gather = make(chan struct{}, 3), make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if ok, err := e.worker.Once(context.Background()); err != nil || !ok {
+				t.Errorf("%v %v", ok, err)
+			}
+		}()
+	}
+	for i := 0; i < 3; i++ {
+		select {
+		case <-web.arrived: // all three searches are in the gateway at once
+		case <-time.After(20 * time.Second):
+			t.Fatalf("the children did not overlap: %v", e.must(200, "GET", "/v1/runs/"+root+"/subruns", "erin", nil))
+		}
+	}
+	close(web.gather)
+	wg.Wait()
+	web.arrived, web.gather = nil, nil
+	e.drive() // the lead collects its children and answers
+	got := e.must(200, "GET", "/v1/runs/"+root, "erin", nil)
+	if got["status"] != run.StatusCompleted {
+		t.Fatalf("%v", got)
+	}
+	kids := e.must(200, "GET", "/v1/runs/"+root+"/subruns", "erin", nil)["runs"].([]any)
+	if len(kids) != 3 {
+		t.Fatalf("%d children", len(kids))
+	}
+	var ids []string
+	for _, k := range kids {
+		ids = append(ids, k.(map[string]any)["runId"].(string))
+	}
+	// no number was given twice and none was skipped: what the children gave, with the first package's, is 1..counter-1
+	nums := e.sourceNumbers(ids...)
+	seen := map[int]string{}
+	var all []int
+	for id, ns := range nums {
+		for _, n := range ns {
+			// a web address two children read has one number, which is in both lists (checked by address below)
+			seen[n] = id
+			all = append(all, n)
+		}
+	}
+	sort.Ints(all)
+	last := e.counterOf(root) - 1
+	for i := first; i <= last; i++ {
+		if _, ok := seen[i]; !ok {
+			// a web address read by two children has one number: the second child's list does not hold it twice but the number was given
+			if e.scalar(`SELECT count(*)::text FROM run_sources s, jsonb_array_elements(s.doc->'items') it WHERE s.run_id = $1 AND (it->>'n')::int = $2`, root, i) == "0" {
+				t.Errorf("the counter gave %d to nobody (the tree gave %d..%d)", i, first, last)
+			}
+		}
+	}
+	// one address, one number, in the whole tree
+	byURL := map[string]int{}
+	rows := e.query(`SELECT it->>'url', (it->>'n')::int FROM run_sources s, jsonb_array_elements(s.doc->'items') it WHERE s.run_id = ANY($1) AND it->>'kind' = 'web'`, ids)
+	for rows.Next() {
+		var u string
+		var n int
+		if err := rows.Scan(&u, &n); err != nil {
+			t.Fatal(err)
+		}
+		if prev, ok := byURL[u]; ok && prev != n {
+			t.Errorf("%s has two numbers: %d and %d", u, prev, n)
+		}
+		byURL[u] = n
+	}
+	rows.Close()
+	if len(byURL) != 4 { // x/1, x/2, x/3, x/9
+		t.Errorf("%v", byURL)
+	}
+	// a child cites its parent's [1] and its own; the parent cites a child's and one nobody gave: only the last is unverified, in the parent
+	for _, id := range ids {
+		if u := e.must(200, "GET", "/v1/runs/"+id, "erin", nil)["unverifiedCitations"]; u != nil {
+			t.Errorf("child %s: %v (its parent's number is valid in it)", id, u)
+		}
+	}
+	srcs, unverified := sourcesOfRun(e, "erin", root)
+	if fmt.Sprint(unverified) != "[999]" {
+		t.Errorf("the lead's unverified: %v", unverified)
+	}
+	kinds := map[string]int{}
+	for _, s := range srcs {
+		kinds[s["kind"].(string)]++
+	}
+	if kinds["knowledge"] == 0 || kinds["web"] != 4 {
+		t.Errorf("one list for both kinds, in HOST numbers: %v", srcs)
+	}
+	// the model never read idp-web's own number: the pages of the web fixture are numbered 1..4 by idp-web, HOST numbers are above the knowledge ones
+	for _, s := range srcs {
+		if s["kind"] == "web" && s["n"].(float64) < float64(first) {
+			t.Errorf("a web source took a number below the counter's start: %v", s)
+		}
+	}
+}
+
+// the counter is taken under the root's row lock, root first, and a store call from many children at once never gives a number twice.
+func TestTheCounterIsTakenRootFirstAndNeverGivenTwiceOnPostgres(t *testing.T) {
+	e, _ := knowledgeEnv(t, handbookDoc())
+	root, _ := citationTree(t, e, 3, false)
+	if ok, err := e.worker.Once(context.Background()); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	var claims []*run.Claim
+	for i := 0; i < 3; i++ {
+		cl, err := e.store.Claim(context.Background(), fmt.Sprintf("w-%d", i), time.Minute)
+		if err != nil || cl == nil {
+			t.Fatal(err, cl)
+		}
+		claims = append(claims, cl)
+	}
+	answer := func(used int) run.CiteFunc {
+		return func(first int, _ *run.TreeNumbers) (run.Answer, error) {
+			return run.Answer{State: run.CallDone, Msg: agui.Message{ID: fmt.Sprintf("m-%d-%d", first, used), Role: agui.RoleTool, ToolCallID: "x", Content: "r"}, Used: used,
+				Src: &run.SourceBatch{Items: []run.Source{{N: first, Kind: run.KindWeb, Title: "t", URL: fmt.Sprintf("https://n.example/%d", first)}}}}, nil
+		}
+	}
+	type taken struct{ first, used int }
+	var mu sync.Mutex
+	var all []taken
+	var wg sync.WaitGroup
+	start := e.counterOf(root)
+	for ci, cl := range claims {
+		for k := 0; k < 12; k++ {
+			wg.Add(1)
+			go func() { // parallel tool calls of one child and the calls of the other children, all at once
+				defer wg.Done()
+				used := (ci+k)%3 + 1
+				var firstSeen int
+				err := e.store.AnswerCited(context.Background(), cl, "x", func(first int, tree *run.TreeNumbers) (run.Answer, error) {
+					firstSeen = first
+					return answer(used)(first, tree)
+				})
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				mu.Lock()
+				all = append(all, taken{firstSeen, used})
+				mu.Unlock()
+			}()
+		}
+	}
+	wg.Wait()
+	sort.Slice(all, func(i, j int) bool { return all[i].first < all[j].first })
+	next := start
+	for _, a := range all {
+		if a.first != next {
+			t.Fatalf("the numbers are not contiguous: %d taken at %d, expected %d (%v)", a.used, a.first, next, all)
+		}
+		next += a.used
+	}
+	if got := e.counterOf(root); got != next {
+		t.Errorf("the counter is %d, the numbers taken end at %d", got, next)
+	}
+	// root first: while another transaction holds the root's row, an allocation from a child waits for the root and has not locked its own row
+	conn, err := pgx.Connect(context.Background(), e.ownerURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	tx, err := conn.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(context.Background(), `SELECT 1 FROM runs WHERE id = $1 FOR UPDATE`, root); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- e.store.AnswerCited(context.Background(), claims[0], "x", answer(1))
+	}()
+	time.Sleep(500 * time.Millisecond)
+	conn2, _ := pgx.Connect(context.Background(), e.ownerURL)
+	defer conn2.Close(context.Background())
+	tx2, _ := conn2.Begin(context.Background())
+	if _, err := tx2.Exec(context.Background(), `SELECT 1 FROM runs WHERE id = $1 FOR UPDATE NOWAIT`, claims[0].RunID); err != nil {
+		t.Errorf("the child's own row was locked while the allocation waited for the root's: %v", err)
+	}
+	_ = tx2.Rollback(context.Background())
+	select {
+	case err := <-done:
+		t.Fatalf("the allocation did not wait for the root's row: %v", err)
+	default:
+	}
+	_ = tx.Rollback(context.Background())
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// the counter and the sources are written with the answer: an answer that fails writes neither
+func TestAnAnswerThatFailsTakesNoNumberOnPostgres(t *testing.T) {
+	e, _ := knowledgeEnv(t, handbookDoc())
+	root, _ := citationTree(t, e, 1, false)
+	if ok, err := e.worker.Once(context.Background()); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	cl, err := e.store.Claim(context.Background(), "w", time.Minute)
+	if err != nil || cl == nil {
+		t.Fatal(err, cl)
+	}
+	before := e.counterOf(root)
+	err = e.store.AnswerCited(context.Background(), cl, "x", func(first int, _ *run.TreeNumbers) (run.Answer, error) {
+		return run.Answer{}, errors.New("refused")
+	})
+	if err == nil || e.counterOf(root) != before {
+		t.Errorf("%v: counter %d, was %d", err, e.counterOf(root), before)
+	}
+	// a fenced claim takes none
+	e.exec(`UPDATE runs SET fencing_epoch = fencing_epoch + 1 WHERE id = $1`, cl.RunID)
+	err = e.store.AnswerCited(context.Background(), cl, "x", func(first int, _ *run.TreeNumbers) (run.Answer, error) {
+		return run.Answer{State: run.CallDone, Msg: agui.Message{ID: "m", Role: agui.RoleTool, ToolCallID: "x"}, Used: 5}, nil
+	})
+	if !errors.Is(err, run.ErrFenced) || e.counterOf(root) != before {
+		t.Errorf("%v: counter %d, was %d", err, e.counterOf(root), before)
+	}
+}
+
+// Runs in flight when the schema is migrated continue from their current maximum.
+func TestMigrationContinuesRunsInFlightFromTheirMaximumOnPostgres(t *testing.T) {
+	e, _ := knowledgeEnv(t, handbookDoc())
+	e.publish("plain-c", definition("", nil, nil))
+	mk := func(thread string) string {
+		return e.must(202, "POST", "/v1/agents/plain-c/runs", "erin", runBody(thread, "hi"), "Idempotency-Key", thread)["runId"].(string)
+	}
+	events := mk("mig-1") // knowledge numbers in the events: 2 from the first package, 4 from a tool, so the next is 7
+	web := mk("mig-2")    // an idp-web number 40 in the sources
+	both := mk("mig-3")   // a child that numbered from 1 and a parent with web number 12
+	none := mk("mig-4")
+	e.exec(`UPDATE runs SET status = 'COMPLETED' WHERE id = $1`, both)
+	e.exec(`INSERT INTO runs (tenant_id, id, thread_id, agent_id, release_id, release_digest, owner, status, idempotency_key, request_sha256, input, deadline_at, parent_run_id, depth)
+		SELECT tenant_id, 'child-of-mig-3', thread_id, agent_id, release_id, release_digest, owner, 'COMPLETED', 'child-key', 'x', input, deadline_at, id, 1 FROM runs WHERE id = $1`, both)
+	ev := func(id, name string, first, count int) {
+		e.exec(`INSERT INTO run_events (tenant_id, run_id, seq, type, payload) SELECT tenant_id, id, (SELECT coalesce(max(seq), 0) + 1 FROM run_events WHERE run_id = $1), 'CUSTOM',
+			jsonb_build_object('name', $2::text, 'value', jsonb_build_object('firstIndex', $3::int, 'itemCount', $4::int)) FROM runs WHERE id = $1`, id, name, first, count)
+	}
+	ev(events, "idp.host/context.resolved", 1, 2)
+	ev(events, "idp.host/context.package", 3, 4)
+	ev("child-of-mig-3", "idp.host/context.package", 1, 9)
+	src := func(id string, n int) {
+		e.exec(`INSERT INTO run_sources (tenant_id, run_id, doc) SELECT tenant_id, id, jsonb_build_object('items', jsonb_build_array(jsonb_build_object('n', $2::int, 'title', 't', 'url', 'https://a.example/', 'cited', false))) FROM runs WHERE id = $1`, id, n)
+	}
+	src(web, 40)
+	src(both, 12)
+	e.exec(`UPDATE runs SET citation_next = 1`)
+	sql, err := os.ReadFile("../../migrations/0017_citation_counter.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	do := string(sql)[strings.Index(string(sql), "DO $$"):]
+	e.exec(do)
+	for id, want := range map[string]int{events: 7, web: 41, both: 13, none: 1} {
+		if got := e.counterOf(id); got != want {
+			t.Errorf("%s: %d, want %d", id, got, want)
+		}
+	}
+	if e.counterOf("child-of-mig-3") != 1 {
+		t.Error("only the root's row carries the counter of a tree")
+	}
+	// the tree of `both`: the child's own maximum (10) is below the parent's web number (12), the larger wins
+	ev("child-of-mig-3", "idp.host/context.package", 20, 5)
+	e.exec(`UPDATE runs SET citation_next = 1`)
+	e.exec(do)
+	if got := e.counterOf(both); got != 25 {
+		t.Errorf("the largest number of any run of the tree decides: %d", got)
+	}
+}
+
+// ---- the gateway credential (D76) ----
+
+func gatewayTree(t *testing.T, e *env, kids int) (root string, children []string) {
+	t.Helper()
+	e.publish("kid-g", definition("session", []string{"sum"}, nil))
+	lead := definition("session", []string{"sum"}, nil)
+	lead.Subagents = []agent.SubagentRef{{Name: "kid-g", Description: "Sums."}}
+	e.publish("lead-g", lead)
+	e.model.Script = func(msgs []fakemodel.Message, tools []string) fakemodel.Turn {
+		for _, tl := range tools {
+			if tl == "agent__kid-g" {
+				if msgs[len(msgs)-1].Role == "tool" {
+					return fakemodel.Turn{Text: "done"}
+				}
+				var calls []fakemodel.Call
+				for i := 0; i < kids; i++ {
+					calls = append(calls, fakemodel.Call{Name: "agent__kid-g", Args: fmt.Sprintf(`{"input":"sum %d"}`, i)})
+				}
+				return fakemodel.Turn{ToolCalls: calls}
+			}
+		}
+		return fakemodel.Turn{Text: "ok"}
+	}
+	root = e.must(202, "POST", "/v1/agents/lead-g/runs", "carol", runBody(fmt.Sprintf("gw-%d-%d", kids, time.Now().UnixNano()), "go"), "Idempotency-Key", fmt.Sprint("gw", time.Now().UnixNano()))["runId"].(string)
+	if ok, err := e.worker.Once(context.Background()); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	for _, k := range e.must(200, "GET", "/v1/runs/"+root+"/subruns", "carol", nil)["runs"].([]any) {
+		children = append(children, k.(map[string]any)["runId"].(string))
+	}
+	return root, children
+}
+
+func (e *env) gwLease(id string) bool {
+	return e.scalar(`SELECT (credential_renewing_until IS NOT NULL AND credential_renewing_until > now())::text FROM runs WHERE id = $1`, id) == "true"
+}
+
+func TestAChildReferencesTheRootsGatewayCredentialAndTheTreeRenewsItOnceOnPostgres(t *testing.T) {
+	e := newEnv(t)
+	root, kids := gatewayTree(t, e, 2)
+	if len(kids) != 2 {
+		t.Fatalf("%v", kids)
+	}
+	for _, k := range kids {
+		if e.scalar(`SELECT (credential IS NULL AND credential_refresh IS NULL)::text FROM runs WHERE id = $1`, k) != "true" || e.scalar(`SELECT credential_ref FROM runs WHERE id = $1`, k) != root {
+			t.Fatalf("child %s holds a copy of the credential or points elsewhere", k)
+		}
+	}
+	if e.scalar(`SELECT (credential IS NOT NULL AND credential_refresh IS NOT NULL)::text FROM runs WHERE id = $1`, root) != "true" {
+		t.Fatal("the root keeps the credential")
+	}
+	cl, err := e.store.Claim(context.Background(), "w-gw", time.Minute)
+	if err != nil || cl == nil {
+		t.Fatal(err, cl)
+	}
+	seen, err := e.store.RunCredential(context.Background(), cl)
+	if err != nil || seen.RefreshToken != "rt-session" || !seen.Shared { // (the root listed the gateway tools: the stale credential was already renewed once, by the root)
+		t.Fatalf("%+v %v", seen, err)
+	}
+	t.Run("four renewals at once make one call to the authorization server and none holds a lock across it", func(t *testing.T) {
+		var calls atomic.Int32
+		inCall, unblock := make(chan struct{}), make(chan struct{})
+		var once sync.Once
+		renew := func(ctx context.Context, refresh string) (*credential.Token, error) {
+			calls.Add(1)
+			once.Do(func() { close(inCall) })
+			<-unblock
+			return &credential.Token{AccessToken: "renewed-1", RefreshToken: "rt-2", ExpiresAt: time.Now().Add(time.Hour)}, nil
+		}
+		var wg sync.WaitGroup
+		got := make([]string, 4)
+		for i := range got {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				tok, err := e.store.RenewRunCredential(context.Background(), cl, seen, true, renew)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				got[i] = tok.AccessToken
+			}()
+		}
+		<-inCall
+		time.Sleep(300 * time.Millisecond)
+		// nothing is locked across the call: the root's and the child's rows can be taken, and the child's heartbeat is not kept waiting
+		conn, _ := pgx.Connect(context.Background(), e.ownerURL)
+		defer conn.Close(context.Background())
+		tx, _ := conn.Begin(context.Background())
+		if _, err := tx.Exec(context.Background(), `SELECT 1 FROM runs WHERE id = ANY($1) FOR UPDATE NOWAIT`, []string{root, cl.RunID}); err != nil {
+			t.Errorf("a row lock is held across the call to the authorization server: %v", err)
+		}
+		_ = tx.Rollback(context.Background())
+		if err := e.store.Heartbeat(context.Background(), cl, time.Minute); err != nil {
+			t.Error(err)
+		}
+		if !e.gwLease(root) {
+			t.Error("the lease is not on the root's row")
+		}
+		close(unblock)
+		wg.Wait()
+		if calls.Load() != 1 {
+			t.Errorf("%d calls to the authorization server", calls.Load())
+		}
+		for _, g := range got {
+			if g != "renewed-1" {
+				t.Errorf("%v", got)
+			}
+		}
+		if e.gwLease(root) || e.scalar(`SELECT credential_renewing_until::text FROM runs WHERE id = $1`, root) != "" {
+			t.Error("the lease was not given back")
+		}
+		now, _ := e.store.RunCredential(context.Background(), cl)
+		if now.AccessToken != "renewed-1" || now.RefreshToken != "rt-2" {
+			t.Errorf("the root's row holds %+v", now)
+		}
+		if e.scalar(`SELECT (credential IS NULL)::text FROM runs WHERE id = $1`, cl.RunID) != "true" {
+			t.Error("the child kept no copy")
+		}
+	})
+
+	t.Run("a cancel while the renewal is in the call gives the lease back and leaves the credential as it was", func(t *testing.T) {
+		cur, _ := e.store.RunCredential(context.Background(), cl)
+		ctx, cancel := context.WithCancel(context.Background())
+		inCall := make(chan struct{})
+		done := make(chan error, 1)
+		go func() {
+			_, err := e.store.RenewRunCredential(ctx, cl, cur, true, func(ctx context.Context, _ string) (*credential.Token, error) {
+				close(inCall)
+				<-ctx.Done()
+				return nil, ctx.Err()
+			})
+			done <- err
+		}()
+		<-inCall
+		cancel()
+		if err := <-done; err == nil {
+			t.Error("a canceled renewal returned a token")
+		}
+		after, _ := e.store.RunCredential(context.Background(), cl)
+		if e.gwLease(root) || after.AccessToken != cur.AccessToken {
+			t.Errorf("lease held %v, token %s -> %s", e.gwLease(root), cur.AccessToken, after.AccessToken)
+		}
+	})
+
+	t.Run("the root ending while a child renews does not bring the credential back", func(t *testing.T) {
+		cur, _ := e.store.RunCredential(context.Background(), cl)
+		inCall, unblock, done := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+		go func() {
+			_, err := e.store.RenewRunCredential(context.Background(), cl, cur, true, func(context.Context, string) (*credential.Token, error) {
+				close(inCall)
+				<-unblock
+				return &credential.Token{AccessToken: "renewed-late", RefreshToken: "rt-3", ExpiresAt: time.Now().Add(time.Hour)}, nil
+			})
+			done <- err
+		}()
+		<-inCall
+		e.must(200, "POST", "/v1/runs/"+root+"/cancel", "carol", nil) // the root ends: its credential is cleared
+		close(unblock)
+		var f *run.Failure
+		if err := <-done; !errors.As(err, &f) || f.Code != run.FailCredential {
+			t.Errorf("the renewal of a credential that was cleared meanwhile: %v", err)
+		}
+		if e.scalar(`SELECT (credential IS NULL)::text FROM runs WHERE id = $1`, root) != "true" {
+			t.Error("the renewed credential was written back after the root ended")
+		}
+		if _, err := e.store.RunCredential(context.Background(), cl); !errors.As(err, &f) || f.Code != run.FailCredential {
+			t.Errorf("a child whose root has ended has no gateway credential: %v", err)
+		}
+		if e.gwLease(root) {
+			t.Errorf("lease held: %s now %s", e.scalar(`SELECT credential_renewing_until::text FROM runs WHERE id = $1`, root), e.scalar(`SELECT now()::text`))
+		}
+	})
+}

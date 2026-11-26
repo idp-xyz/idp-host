@@ -21,6 +21,10 @@ func loadSources(ctx context.Context, tx pgx.Tx, tenant, runID string) (*run.Sou
 	if err != nil {
 		return nil, err
 	}
+	return decodeSources(raw)
+}
+
+func decodeSources(raw []byte) (*run.SourceSet, error) {
 	var set run.SourceSet
 	if err := json.Unmarshal(raw, &set); err != nil {
 		return nil, err
@@ -66,11 +70,12 @@ func (s *Store) CheckSources(ctx context.Context, c *run.Claim, answer string) e
 		if err != nil {
 			return err
 		}
-		next, err := citationNext(ctx, tx, c.TenantID, c.RunID)
+		// D74: the numbers of the whole run tree are valid, whichever run of it was given them
+		given, err := citationsGiven(ctx, tx, c.RunID)
 		if err != nil {
 			return err
 		}
-		if !set.CheckAtEndKnowing(answer, r.Input.ExternalTools, max(next-1, 0)) {
+		if !set.CheckAtEndKnowing(answer, r.Input.ExternalTools, given) {
 			return nil
 		}
 		if err := saveSources(ctx, tx, c.TenantID, c.RunID, set); err != nil {
@@ -106,7 +111,10 @@ func attachSources(ctx context.Context, tx pgx.Tx, runs ...*run.Run) error {
 		if err := json.Unmarshal(raw, &set); err != nil {
 			return err
 		}
-		byID[id].Sources, byID[id].UnverifiedCitations = set.Items, set.Unverified
+		byID[id].Sources, byID[id].UnverifiedCitations = run.NormaliseSources(set.Items), set.Unverified
+		if len(set.Items) == 0 {
+			byID[id].Sources = nil
+		}
 	}
 	return rows.Err()
 }

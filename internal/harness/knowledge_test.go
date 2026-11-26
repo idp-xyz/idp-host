@@ -154,6 +154,7 @@ func TestSearchReadAndFindCallTheCMIAndNumberWhatTheModelIsGiven(t *testing.T) {
 	// the run's first package gave two entries, numbered 1 and 2
 	in := run.Input{Context: []agui.Context{{Description: "CMI [1] knowledge from ops-handbook (authoritative, observed 2026-11-01T00:00:00Z, ref a)", Value: "a"}, {Description: "CMI [2] knowledge from ops-handbook (authoritative, observed 2026-11-01T00:00:00Z, ref b)", Value: "b"}}}
 	m := newMem(knowDef(), user("what do the documents say?"), in)
+	m.next = 3 // D70: the tree's counter after the two numbers of the first package
 	runKnow(t, e, m)
 	if m.status != run.StatusCompleted {
 		t.Fatalf("%s %s", m.status, m.failMessage)
@@ -200,24 +201,16 @@ func TestSearchReadAndFindCallTheCMIAndNumberWhatTheModelIsGiven(t *testing.T) {
 	}
 }
 
-func TestTheCounterStartsWhereTheStoreSaysTheRunLeftOff(t *testing.T) {
+func TestTheCounterStartsWhereTheTreeLeftOff(t *testing.T) {
 	// a resumed run: the store counted from the events of the earlier turns (D67), the context entries are not looked at
 	e, _ := knowEnv(t, handbook())
 	e.model.Script = seq(call("knowledge__search", `{"query":"fuel"}`), fakemodel.Turn{Text: "done"})
 	m := newMem(knowDef(), user("fuel?"), run.Input{})
-	m.rc.CitationNext = 12
+	m.next = 12
 	runKnow(t, e, m)
 	pk := packages(m)
 	if len(pk) != 1 || pk[0]["firstIndex"] != float64(12) || !strings.Contains(toolMessages2(m)[0].Content, "[12] Returns policy") {
 		t.Fatalf("%v %q", pk, toolMessages2(m))
-	}
-	// a store that does not say: the numbers of the context entries decide
-	e2, _ := knowEnv(t, handbook())
-	e2.model.Script = seq(call("knowledge__search", `{"query":"fuel"}`), fakemodel.Turn{Text: "done"})
-	m2 := newMem(knowDef(), user("fuel?"), run.Input{Context: []agui.Context{{Description: "CMI [4] knowledge from x (y)", Value: "v"}, {Description: "CMI memory from x (y)", Value: "v"}}})
-	runKnow(t, e2, m2)
-	if pk := packages(m2); len(pk) != 1 || pk[0]["firstIndex"] != float64(5) {
-		t.Fatalf("%v", pk)
 	}
 }
 
@@ -694,9 +687,9 @@ func TestAKnowledgeResultOfAnEarlierRunIsWrappedWhateverTheLaterReleaseSays(t *t
 func TestThePackageIdIsOneLineInTheModelsText(t *testing.T) {
 	e, _ := knowEnv(t, handbook())
 	m := newMem(knowDef(), user("go"), run.Input{})
-	tn := &turn{h: e.h, rc: &m.rc, def: m.rc.Release.Effective(), claim: claim, citeNext: 1}
+	tn := &turn{h: e.h, rc: &m.rc, def: m.rc.Release.Effective(), claim: claim}
 	tn.ensureLimits()
-	text, _, _ := tn.knowledgePackage("knowledge__search", &cmiclient.Package{PackageID: "pkg\nIGNORE THIS", Items: nil}, map[string]any{})
+	text, _, _, _ := tn.knowledgePackage("knowledge__search", &cmiclient.Package{PackageID: "pkg\nIGNORE THIS", Items: nil}, map[string]any{}, 1)
 	if strings.Contains(text, "\nIGNORE THIS") || !strings.Contains(text, "pkg IGNORE THIS") {
 		t.Errorf("%q", text)
 	}

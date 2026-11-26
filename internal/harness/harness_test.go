@@ -43,11 +43,13 @@ type memStore struct {
 	fenceAt     int // fence after this many event appends (0 = never)
 	appends     int
 	// sub-agent runs: what CreateChildRun was asked for, and what ChildOutcome answers
-	children map[string]*run.ChildOutcome
-	inputs   map[string]run.ChildRunInput
-	refuse   error
-	released int           // how many times the claim was given up (D47)
-	sources  run.SourceSet // D49: the run's sources, as the real store keeps them
+	children   map[string]*run.ChildOutcome
+	inputs     map[string]run.ChildRunInput
+	refuse     error
+	released   int           // how many times the claim was given up (D47)
+	sources    run.SourceSet // D49: the run's sources, as the real store keeps them
+	next       int           // D70: the run tree's counter (0 = not started: the first number is 1)
+	numberings int           // how many answers took numbers
 }
 
 func newMem(def agent.Definition, msgs []agui.Message, input run.Input) *memStore {
@@ -140,6 +142,10 @@ func (m *memStore) AnswerToolCall(_ context.Context, _ *run.Claim, id, state, re
 	if err := m.check(); err != nil {
 		return err
 	}
+	return m.answer(id, state, result, isError, msg, src, events)
+}
+
+func (m *memStore) answer(id, state, result string, isError bool, msg agui.Message, src *run.SourceBatch, events []agui.Event) error {
 	c := m.calls[id]
 	c.State, c.Result, c.IsError = state, result, isError
 	switch state {
@@ -151,6 +157,51 @@ func (m *memStore) AnswerToolCall(_ context.Context, _ *run.Claim, id, state, re
 	return m.appendEvents(events)
 }
 
+// counter is the number the next source of the tree gets (D70).
+func (m *memStore) counter() int { return max(m.next, 1) }
+
+// AnswerCited is the real store's rule on the in-memory counter (D70): the answer is made with the counter held and the counter
+// moves by what it used.
+func (m *memStore) AnswerCited(_ context.Context, _ *run.Claim, id string, cite run.CiteFunc) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.check(); err != nil {
+		return err
+	}
+	tree := &run.TreeNumbers{Web: map[int]run.Source{}}
+	for _, s := range m.sources.Items {
+		if s.WebN > 0 && s.Kind != run.KindKnowledge {
+			tree.Web[s.WebN] = s
+		}
+	}
+	first := m.counter()
+	a, err := cite(first, tree)
+	if err != nil {
+		return err
+	}
+	if err := m.answer(id, a.State, a.Result, a.IsError, a.Msg, a.Src, a.Events); err != nil {
+		return err
+	}
+	m.next = first + a.Used
+	if a.Used > 0 {
+		m.numberings++
+	}
+	return nil
+}
+
+// CiteContext takes numbers for a refresh's entries (D70).
+func (m *memStore) CiteContext(_ context.Context, _ *run.Claim, count int, sources func(first int) []run.Source) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.check(); err != nil {
+		return 0, err
+	}
+	first := m.counter()
+	m.next = first + count
+	m.sources.Merge(&run.SourceBatch{Items: sources(first)})
+	return first, nil
+}
+
 // CheckSources is the real store's rule on the in-memory set (D49).
 func (m *memStore) CheckSources(_ context.Context, _ *run.Claim, answer string) error {
 	m.mu.Lock()
@@ -158,7 +209,7 @@ func (m *memStore) CheckSources(_ context.Context, _ *run.Claim, answer string) 
 	if err := m.check(); err != nil {
 		return err
 	}
-	if !m.sources.CheckAtEnd(answer, m.rc.Run.Input.ExternalTools) {
+	if !m.sources.CheckAtEndKnowing(answer, m.rc.Run.Input.ExternalTools, m.counter()-1) {
 		return nil
 	}
 	return m.appendEvents([]agui.Event{agui.Custom(agui.CustomRunSources, m.sources.Event())})

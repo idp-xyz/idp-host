@@ -246,8 +246,13 @@ func TestKnowledgeNumbersAreKnownToTheCitationCheck(t *testing.T) {
 	if !s.CheckAtEndKnowing("per [2], not [9]", true, 3) || fmt.Sprint(s.Unverified) != "[9]" {
 		t.Fatalf("%v", s.Unverified)
 	}
+	// D70: a tree that gave numbers has its answers checked even for a run with no list of its own (a sub-agent that cites its parent's [2])
+	var sub run.SourceSet
+	if sub.CheckAtEndKnowing("per [2]", false, 3) || !sub.Checked || len(sub.Unverified) != 0 {
+		t.Errorf("a number the tree gave is valid in every run of it: %+v", sub)
+	}
 	var none run.SourceSet
-	if none.CheckAtEndKnowing("per [2]", false, 3) || none.Checked {
-		t.Error("a run without outward tools and without web sources is not checked")
+	if none.CheckAtEndKnowing("per [2]", false, 0) || none.Checked {
+		t.Error("a tree that gave no number, with no outward tool and no sources, is not checked")
 	}
 }

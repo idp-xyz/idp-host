@@ -1,5 +1,5 @@
 {
-  "description": "idp.telos.host 1.12.0 的示例：每一个都是 idp-host 实际产出或原样接受的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录，RunOptions 经 run.ParseOptions 解析后原样往返）。",
+  "description": "idp.telos.host 1.13.0 的示例：每一个都是 idp-host 实际产出或原样接受的文档（AgentRelease 经 agent.Seal 密封，AgentRun 是 API 返回的运行记录，RunOptions 经 run.ParseOptions 解析后原样往返）。",
   "generatedBy": "go test ./internal/run -run TestContract -update",
   "examples": [
     {
@@ -661,25 +661,40 @@
         "sources": [
           {
             "cited": true,
+            "documentId": "doc-handbook-12",
+            "kind": "knowledge",
+            "n": 1,
+            "source": "ops-handbook",
+            "title": "Customs handbook",
+            "where": "page 3; Clearance \u003e Times"
+          },
+          {
+            "cited": true,
             "fetchedAt": "2026-11-03T13:41:07Z",
+            "kind": "web",
             "n": 2,
             "sha256": "5d41402abc4b2a76b9719d911017c592a1b2c3d4e5f60718293a4b5c6d7e8f90",
             "title": "Port of Rotterdam: customs clearance times",
-            "url": "https://www.portofrotterdam.example/en/customs"
+            "url": "https://www.portofrotterdam.example/en/customs",
+            "webN": 7
           },
           {
             "cited": false,
+            "kind": "web",
             "n": 3,
             "title": "Duty rates, chapter 84",
-            "url": "https://tariff.example/hs/84"
+            "url": "https://tariff.example/hs/84",
+            "webN": 9
           },
           {
             "cited": false,
             "fetchedAt": "2026-11-03T13:41:30Z",
-            "n": 5,
+            "kind": "web",
+            "n": 4,
             "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
             "title": "报关单填写规范",
-            "url": "https://customs.example.cn/guide?id=5"
+            "url": "https://customs.example.cn/guide?id=5",
+            "webN": 12
           }
         ],
         "startedAt": "2026-11-03T13:40:01Z",
@@ -687,7 +702,7 @@
         "stepCount": 4,
         "threadId": "thr-ops-45",
         "unverifiedCitations": [
-          7
+          8
         ]
       }
     },

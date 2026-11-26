@@ -7,10 +7,8 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
-	"unicode"
 
 	"idp-host/internal/agent"
 	"idp-host/internal/agui"
@@ -127,21 +125,15 @@ func (t *turn) hasKnowledgeTools() bool { return len(t.knowledgeEnabled()) > 0 }
 
 var numberedEntryRE = regexp.MustCompile(`^CMI \[([0-9]+)\] `)
 
-// startCitations sets the run's citation counter (D67) from what the store says (the run's own events), or, when it does not
-// say, from the numbers the run's context entries carry. The counter is one past the last number given.
-func (t *turn) startCitations() {
-	next := t.rc.CitationNext
+// contextNumbered reports whether the run's context entries carry citation numbers: the first package of the run was numbered (D69-15),
+// so a refresh of it numbers the entries it brings in (D70).
+func (t *turn) contextNumbered() bool {
 	for _, c := range t.rc.Run.Input.Context {
-		if m := numberedEntryRE.FindStringSubmatch(c.Description); m != nil {
-			if n, err := strconv.Atoi(m[1]); err == nil && n+1 > next {
-				next = n + 1
-			}
+		if numberedEntryRE.MatchString(c.Description) {
+			return true
 		}
 	}
-	if next < 1 {
-		next = 1
-	}
-	t.citeNext = next
+	return false
 }
 
 // errNoMemberCredential: the run has no credential to call the CMI with, or it cannot be used.
@@ -326,17 +318,19 @@ func (t *turn) knowledgeCall(tc run.ToolCall) (bool, error) {
 		}
 		pkg.Items = kept
 	}
-	text, pkgEvents, given := t.knowledgePackage(tc.Tool, pkg, detail)
-	if err := t.answerWith(tc, run.CallDone, text, "", pkgEvents...); err != nil {
-		return true, err
-	}
-	t.citeNext += given
-	return true, nil
+	// the numbers come from the run tree's counter, which the store holds while the package is written (D70): the same call, however
+	// many workers or sub-agents number at once, gets its numbers once and nobody gets the same number
+	err = t.answerCited(tc, func(first int, _ *run.TreeNumbers) run.Answer {
+		text, pkgEvents, given, srcs := t.knowledgePackage(tc.Tool, pkg, detail, first)
+		return t.buildAnswer(tc, run.CallDone, text, "", &run.SourceBatch{Items: srcs}, given, pkgEvents...)
+	})
+	return true, err
 }
 
 // knowledgePackage turns a package into what the model reads and what the stream records: the screening of D44, the numbers of
-// D67 and the size limit of D40. given is how many items were numbered, which is how far the run's counter moves.
-func (t *turn) knowledgePackage(tool string, pkg *cmiclient.Package, detail map[string]any) (text string, events []agui.Event, given int) {
+// D70 and the size limit of D40. The items shown are numbered first, first+1, ...; given is how many, which is how far the tree's counter
+// moves, and sources are their records.
+func (t *turn) knowledgePackage(tool string, pkg *cmiclient.Package, detail map[string]any, first int) (text string, events []agui.Event, given int, sources []run.Source) {
 	items := make([]cmiclient.Item, 0, len(pkg.Items))
 	for _, it := range pkg.Items {
 		if it.Kind == "knowledge" { // these tools ask for knowledge; a memory the CMI added is not a document and has no number
@@ -353,7 +347,6 @@ func (t *turn) knowledgePackage(tool string, pkg *cmiclient.Package, detail map[
 		}
 		items, screened = s.Kept, &s
 	}
-	first := t.citeNext
 	limit := t.limits.ToolResultBytes
 	var b strings.Builder
 	var shown int
@@ -372,6 +365,7 @@ func (t *turn) knowledgePackage(tool string, pkg *cmiclient.Package, detail map[
 			block = cutBlock(block, max(limit-b.Len()-reserve, 200)) // one passage that alone is too long is shown cut, not left out
 		}
 		b.WriteString(block)
+		sources = append(sources, cmiclient.KnowledgeSource(first+shown, it))
 		shown++
 	}
 	given = shown
@@ -404,7 +398,7 @@ func (t *turn) knowledgePackage(tool string, pkg *cmiclient.Package, detail map[
 		h := t.h
 		h.Log.Info("knowledge tool results withheld from a run that may send content outside the enterprise", "run", t.claim.RunID, "tool", tool, "count", screened.Withheld, "ceiling", screened.Ceiling)
 	}
-	return b.String(), events, given
+	return b.String(), events, given, sources
 }
 
 // omittedNote says what matched but was not packed, so that the model does not read the package as everything there is.
@@ -428,7 +422,7 @@ func formatItem(n int, it cmiclient.Item) string {
 	if title == "" {
 		title = oneLine(it.Ref, 200)
 	}
-	fmt.Fprintf(&b, "\n[%d] %s\n", n, title)
+	fmt.Fprintf(&b, "%s\n", title)
 	fmt.Fprintf(&b, "document: %s; source: %s (%s); observed %s", oneLine(it.ID, 128), oneLine(it.Source, 64), oneLine(it.Trust, 32), it.ObservedAt.UTC().Format("2006-01-02"))
 	if !it.ValidUntil.IsZero() {
 		fmt.Fprintf(&b, "; valid until %s", it.ValidUntil.UTC().Format("2006-01-02"))
@@ -450,52 +444,18 @@ func formatItem(n int, it cmiclient.Item) string {
 	}
 	b.WriteString(it.Excerpt)
 	b.WriteString("\n")
-	return b.String()
+	// D70: the only number in brackets at the head of a passage is the HOST's; one inside the document's own text (a reference, a
+	// list of clauses) is shown as ⟦n⟧ so that it cannot be read as the number of another passage
+	body, _ := run.Neutralise(b.String())
+	return fmt.Sprintf("\n[%d] %s", n, body)
 }
 
 // whereOf describes a locator in words.
-func whereOf(l *cmiclient.Locator) string {
-	if l == nil {
-		return ""
-	}
-	var parts []string
-	if l.Page > 0 {
-		parts = append(parts, "page "+strconv.Itoa(l.Page))
-	}
-	if l.Slide > 0 {
-		parts = append(parts, "slide "+strconv.Itoa(l.Slide))
-	}
-	if l.Sheet != "" {
-		s := "sheet " + oneLine(l.Sheet, 128)
-		if l.Range != "" {
-			s += " " + oneLine(l.Range, 32)
-		}
-		parts = append(parts, s)
-	}
-	if l.Table != "" {
-		parts = append(parts, "table "+oneLine(l.Table, 128))
-	}
-	if len(l.Headings) > 0 {
-		hs := make([]string, 0, len(l.Headings))
-		for _, h := range l.Headings {
-			hs = append(hs, oneLine(h, 200))
-		}
-		parts = append(parts, strings.Join(hs, " > "))
-	}
-	return strings.Join(parts, "; ")
-}
+func whereOf(l *cmiclient.Locator) string { return cmiclient.Where(l) }
 
 // oneLine makes a label of the CMI's (a title, a heading) safe to put in a line of the result: no control characters, no line
 // breaks, at most n characters.
-func oneLine(s string, n int) string {
-	s = strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
-			return ' '
-		}
-		return r
-	}, s)
-	return clip(strings.Join(strings.Fields(s), " "), n)
-}
+func oneLine(s string, n int) string { return cmiclient.OneLine(s, n) }
 
 // cutBlock cuts a passage to at most n bytes at a character boundary and says so.
 func cutBlock(block string, n int) string {
