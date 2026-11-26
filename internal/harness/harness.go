@@ -931,6 +931,9 @@ func (t *turn) credentialFailure(tc *run.ToolCall, err error) error {
 }
 
 func sanitize(err error) string {
+	if err == nil {
+		return ""
+	}
 	var rpc *mcpclient.RPCError
 	var he *mcpclient.HTTPError
 	switch {
@@ -2639,6 +2642,10 @@ func (t *turn) resumeExecuting(tc run.ToolCall) error {
 	}
 	if m, ok := t.h.Metrics.(interruptionMetrics); ok {
 		m.ToolInterrupted(false, "worker_stopped")
+	}
+	if strings.HasPrefix(tc.Tool, agent.KnowledgeToolPrefix) {
+		// a knowledge tool only reads: there is nothing to check, it may simply be called again
+		return t.answerWith(tc, run.CallFailed, "", "interrupted: the turn that was running this call ended while it was running; this tool only reads, so call it again if you still need it", ev)
 	}
 	return t.answerWith(tc, run.CallFailed, "", "interrupted: the turn that was running this call ended while it was running (its worker stopped, died or lost the database); the tool may or may not have completed it, "+
 		"so its outcome is unknown. Check whether it was done before doing it again", ev)

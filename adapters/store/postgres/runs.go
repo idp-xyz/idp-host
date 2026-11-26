@@ -1010,6 +1010,14 @@ func (s *Store) Release(ctx context.Context, c *run.Claim) error {
 // the final events are appended in the same transaction.
 func (s *Store) Finish(ctx context.Context, c *run.Claim, status, failureCode, failureMessage string, events []agui.Event) error {
 	return s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
+		// a sub-agent run's parent is locked first, as a cancel of the parent locks it before its children (childEnded takes it later
+		// anyway); the parent id never changes, so reading it unlocked is safe
+		var parent *string
+		if err := tx.QueryRow(ctx, `SELECT parent_run_id FROM runs WHERE id = $1`, c.RunID).Scan(&parent); err == nil && parent != nil && *parent != "" {
+			if _, err := tx.Exec(ctx, `SELECT 1 FROM runs WHERE id = $1 FOR UPDATE`, *parent); err != nil {
+				return err
+			}
+		}
 		r, err := s.owned(ctx, tx, c)
 		if err != nil {
 			return err

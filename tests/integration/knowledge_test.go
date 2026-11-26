@@ -626,6 +626,32 @@ func (e *env) tokensUsed(id string) int64 {
 	return n
 }
 
+func (e *env) exec(sql string, args ...any) {
+	e.t.Helper()
+	conn, err := pgx.Connect(context.Background(), e.ownerURL)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	if _, err := conn.Exec(context.Background(), sql, args...); err != nil {
+		e.t.Fatal(err)
+	}
+}
+
+func (e *env) leaseHeld(id string) bool {
+	e.t.Helper()
+	conn, err := pgx.Connect(context.Background(), e.ownerURL)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	var held bool
+	if err := conn.QueryRow(context.Background(), `SELECT cmi_renewing_until IS NOT NULL AND cmi_renewing_until > now() FROM runs WHERE id = $1`, id).Scan(&held); err != nil {
+		e.t.Fatal(err)
+	}
+	return held
+}
+
 func (e *env) credentialRow(id string) (own bool, ref string) {
 	e.t.Helper()
 	conn, err := pgx.Connect(context.Background(), e.ownerURL)
@@ -881,7 +907,7 @@ func TestTheMemberCredentialOfARunOnPostgres(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				tok, err := e.store.RenewCMICredential(context.Background(), cl, seen, func(_ context.Context, refresh string) (*credential.Token, error) {
+				tok, err := e.store.RenewCMICredential(context.Background(), cl, seen, false, func(_ context.Context, refresh string) (*credential.Token, error) {
 					renewals.Add(1)
 					time.Sleep(200 * time.Millisecond)
 					return &credential.Token{AccessToken: "member:erin-renewed", RefreshToken: refresh, ExpiresAt: time.Now().Add(time.Hour)}, nil
@@ -909,7 +935,7 @@ func TestTheMemberCredentialOfARunOnPostgres(t *testing.T) {
 		inCall, unblock := make(chan struct{}), make(chan struct{})
 		done := make(chan error, 1)
 		go func() {
-			_, err := e.store.RenewCMICredential(context.Background(), cl, cur, func(_ context.Context, refresh string) (*credential.Token, error) {
+			_, err := e.store.RenewCMICredential(context.Background(), cl, cur, false, func(_ context.Context, refresh string) (*credential.Token, error) {
 				close(inCall)
 				<-unblock
 				return &credential.Token{AccessToken: "member:erin-late", RefreshToken: refresh, ExpiresAt: time.Now().Add(time.Hour)}, nil
@@ -963,6 +989,194 @@ func TestAReplayIsFoundBeforeAnythingIsListedOrExchangedOnPostgres(t *testing.T)
 	e.must(409, "POST", "/v1/agents/replayer/runs", "erin", other, "Idempotency-Key", "rp1")
 	if len(e.mcp.Bearers()) != listed || cmiExchanges.Load() != exchanged {
 		t.Error("a conflicting request listed the gateway or exchanged a token")
+	}
+	e.drive()
+}
+
+// D69: a replay of a run created before the raw digest was kept, and still in flight, is a replay and not "busy".
+func TestAReplayOfARunWithoutARawDigestIsStillAReplayOnPostgres(t *testing.T) {
+	e, _ := knowledgeEnv(t, handbookDoc())
+	e.publish("old-timer", knowledgeAgent(nil, ""))
+	body := runBody("old-1", "returns policy")
+	r := e.must(202, "POST", "/v1/agents/old-timer/runs", "carol", body, "Idempotency-Key", "old1") // queued: in flight
+	e.exec(`UPDATE runs SET request_raw_sha256 = NULL WHERE id = $1`, r["runId"])
+	again := e.must(200, "POST", "/v1/agents/old-timer/runs", "carol", body, "Idempotency-Key", "old1")
+	if again["runId"] != r["runId"] {
+		t.Fatal("replay returned another run")
+	}
+	// another key on the same thread is still busy
+	e.must(409, "POST", "/v1/agents/old-timer/runs", "carol", runBody("old-1", "another"), "Idempotency-Key", "old2")
+	e.drive()
+}
+
+// D69: the renewal lease and what is done around it, against the real store.
+func TestTheRenewalLeaseOnPostgres(t *testing.T) {
+	e, _ := knowledgeEnv(t, handbookDoc())
+	e.publish("librarian", knowledgeAgent(agent.KnowledgeTools, ""))
+	newClaim := func(thread, key string) (*run.Claim, string, *credential.Token) {
+		r := e.must(202, "POST", "/v1/agents/librarian/runs", "erin", runBody(thread, "returns policy"), "Idempotency-Key", key)
+		cl, err := e.store.Claim(context.Background(), "w-"+key, time.Minute)
+		if err != nil || cl == nil || cl.RunID != r["runId"] {
+			t.Fatal(err, cl)
+		}
+		tok, err := e.store.CMICredential(context.Background(), cl)
+		if err != nil || tok == nil {
+			t.Fatal(err, tok)
+		}
+		return cl, r["runId"].(string), tok
+	}
+	renewed := func(access string) func(context.Context, string) (*credential.Token, error) {
+		return func(_ context.Context, refresh string) (*credential.Token, error) {
+			return &credential.Token{AccessToken: access, RefreshToken: refresh, ExpiresAt: time.Now().Add(time.Hour)}, nil
+		}
+	}
+
+	t.Run("a forced renewal does not take the stored token again while another run renews", func(t *testing.T) {
+		cl, id, seen := newClaim("rl-1", "rl1")
+		inCall, unblock, done := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+		go func() {
+			_, err := e.store.RenewCMICredential(context.Background(), cl, seen, false, func(_ context.Context, refresh string) (*credential.Token, error) {
+				close(inCall)
+				<-unblock
+				return renewed("member:erin-r1")(context.Background(), refresh)
+			})
+			done <- err
+		}()
+		<-inCall
+		ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+		defer cancel()
+		if tok, err := e.store.RenewCMICredential(ctx, cl, seen, true, renewed("member:never")); err == nil {
+			t.Errorf("a forced renewal was handed %q while the holder was renewing", tok.AccessToken)
+		}
+		close(unblock)
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		if e.leaseHeld(id) {
+			t.Error("the lease was not given back")
+		}
+	})
+
+	t.Run("a renewal the identity provider completed is stored even if the claim was lost, and the lease is given back", func(t *testing.T) {
+		cl, id, seen := newClaim("rl-2", "rl2")
+		tok, err := e.store.RenewCMICredential(context.Background(), cl, seen, false, func(_ context.Context, refresh string) (*credential.Token, error) {
+			e.exec(`UPDATE runs SET fencing_epoch = fencing_epoch + 1 WHERE id = $1`, id) // the claim is lost while the provider answers
+			return renewed("member:erin-r2")(context.Background(), refresh)
+		})
+		if err != nil || tok.AccessToken != "member:erin-r2" {
+			t.Fatalf("%v %v", tok, err)
+		}
+		own, _ := e.credentialRow(id)
+		if !own || e.leaseHeld(id) {
+			t.Errorf("stored %v, lease still held %v", own, e.leaseHeld(id))
+		}
+		var stored string
+		conn, _ := pgx.Connect(context.Background(), e.ownerURL)
+		defer conn.Close(context.Background())
+		_ = conn.QueryRow(context.Background(), `SELECT length(cmi_credential)::text FROM runs WHERE id = $1`, id).Scan(&stored)
+		if stored == "" {
+			t.Error("nothing stored")
+		}
+	})
+
+	t.Run("a lease taken on a credential that cannot be opened is given back", func(t *testing.T) {
+		cl, id, seen := newClaim("rl-3", "rl3")
+		e.exec(`UPDATE runs SET cmi_credential = '\x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20'::bytea WHERE id = $1`, id)
+		if _, err := e.store.RenewCMICredential(context.Background(), cl, seen, false, renewed("member:x")); !errors.Is(err, run.ErrCMICredentialUnusable) {
+			t.Fatalf("%v", err)
+		}
+		if e.leaseHeld(id) {
+			t.Error("the lease outlived a credential nobody can open")
+		}
+	})
+
+	t.Run("a failed renewal gives the lease back even when the claim was lost", func(t *testing.T) {
+		cl, id, seen := newClaim("rl-5", "rl5")
+		_, err := e.store.RenewCMICredential(context.Background(), cl, seen, false, func(context.Context, string) (*credential.Token, error) {
+			e.exec(`UPDATE runs SET fencing_epoch = fencing_epoch + 1 WHERE id = $1`, id)
+			return nil, errors.New("the authorization server refused")
+		})
+		if err == nil || e.leaseHeld(id) {
+			t.Errorf("%v, lease held %v", err, e.leaseHeld(id))
+		}
+	})
+
+	t.Run("a lease that ran out is taken over, by the database's clock", func(t *testing.T) {
+		cl, id, seen := newClaim("rl-4", "rl4")
+		e.exec(`UPDATE runs SET cmi_renewing_until = now() - interval '1 second' WHERE id = $1`, id)
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if tok, err := e.store.RenewCMICredential(ctx, cl, seen, false, renewed("member:erin-r4")); err != nil || tok.AccessToken != "member:erin-r4" {
+			t.Fatalf("%v %v", tok, err)
+		}
+	})
+}
+
+// D69: a sub-agent run that ends locks its parent before itself, as a cancel of the parent locks it before its children. Held here by
+// a transaction on the parent's row (a cancel in progress): Finish must be waiting for the parent without holding the child.
+func TestAChildThatEndsLocksItsParentFirstOnPostgres(t *testing.T) {
+	e, _ := knowledgeEnv(t, handbookDoc())
+	e.publish("helper-k", knowledgeAgent(agent.KnowledgeTools, ""))
+	lead := definition("", nil, nil)
+	lead.Subagents = []agent.SubagentRef{{Name: "helper-k", Description: "Looks things up."}}
+	e.publish("lead-k", lead)
+	e.model.Script = func(msgs []fakemodel.Message, tools []string) fakemodel.Turn {
+		for _, t := range tools {
+			if t == "agent__helper-k" && msgs[len(msgs)-1].Role == "user" {
+				return fakemodel.Turn{ToolCalls: []fakemodel.Call{{Name: "agent__helper-k", Args: `{"input":"go"}`}}}
+			}
+		}
+		return fakemodel.Turn{Text: "done"}
+	}
+	r := e.must(202, "POST", "/v1/agents/lead-k/runs", "erin", runBody("lo-1", "go"), "Idempotency-Key", "lo1")
+	root := r["runId"].(string)
+	if ok, err := e.worker.Once(context.Background()); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	child := e.must(200, "GET", "/v1/runs/"+root+"/subruns", "erin", nil)["runs"].([]any)[0].(map[string]any)["runId"].(string)
+	cl, err := e.store.Claim(context.Background(), "w-order", time.Minute)
+	if err != nil || cl == nil || cl.RunID != child {
+		t.Fatal(err, cl)
+	}
+	ctx := context.Background()
+	holder, err := pgx.Connect(ctx, e.ownerURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close(ctx)
+	tx, err := holder.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM runs WHERE id = $1 FOR UPDATE`, root); err != nil { // a cancel of the parent holds its row
+		t.Fatal(err)
+	}
+	finished := make(chan error, 1)
+	go func() { finished <- e.store.Finish(ctx, cl, run.StatusCompleted, "", "", nil) }()
+	time.Sleep(400 * time.Millisecond)
+	probe, err := pgx.Connect(ctx, e.ownerURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer probe.Close(ctx)
+	ptx, err := probe.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ptx.Exec(ctx, `SELECT 1 FROM runs WHERE id = $1 FOR UPDATE NOWAIT`, child); err != nil {
+		t.Errorf("Finish holds the child's row while it waits for the parent's: %v", err)
+	}
+	_ = ptx.Rollback(ctx)
+	select {
+	case err := <-finished:
+		t.Fatalf("Finish did not wait for the parent: %v", err)
+	default:
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-finished; err != nil {
+		t.Fatal(err)
 	}
 	e.drive()
 }

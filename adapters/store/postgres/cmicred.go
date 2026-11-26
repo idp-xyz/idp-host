@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -22,7 +23,7 @@ import (
 // locks the root before its children), and each transaction is short, so a heartbeat is never kept waiting.
 
 // renewLease is how long a renewal may take before another run may take over.
-const renewLease = 30 * time.Second
+const renewLease = 16 * time.Second // just above the longest renewal (the harness gives the call 15 s), so a waiter can take over from a crashed holder in its own budget
 
 // renewPoll is how long a run waits before it looks again for a renewal that another run is making.
 const renewPoll = 100 * time.Millisecond
@@ -31,10 +32,17 @@ const renewPoll = 100 * time.Millisecond
 // the renewed one, or - when another run renewed it meanwhile, or is renewing it and the caller's token is still valid - that
 // one. run.ErrCMICredentialUnusable when the credential is gone (cleared, or not openable) or cannot be renewed in time. Fenced by the
 // claim.
-func (s *Store) RenewCMICredential(ctx context.Context, c *run.Claim, seen *credential.Token, renew func(ctx context.Context, refreshToken string) (*credential.Token, error)) (*credential.Token, error) {
+func (s *Store) RenewCMICredential(ctx context.Context, c *run.Claim, seen *credential.Token, force bool, renew func(ctx context.Context, refreshToken string) (*credential.Token, error)) (*credential.Token, error) {
 	for {
-		sealed, cur, lease, holder, err := s.takeRenewal(ctx, c)
+		sealed, lease, holder, err := s.takeRenewal(ctx, c)
 		if err != nil {
+			return nil, err
+		}
+		cur, err := s.openToken(sealed)
+		if err != nil {
+			if lease {
+				_ = s.dropRenewal(context.WithoutCancel(ctx), c, holder) // a lease taken must not outlive a credential nobody can open
+			}
 			return nil, err
 		}
 		switch {
@@ -46,9 +54,10 @@ func (s *Store) RenewCMICredential(ctx context.Context, c *run.Claim, seen *cred
 			}
 			return cur, nil // renewed meanwhile by a run that shares it
 		case !lease:
-			if cur.ExpiresAt.IsZero() || s.now().Before(cur.ExpiresAt) {
+			if !force && (cur.ExpiresAt.IsZero() || s.now().Before(cur.ExpiresAt)) {
 				return cur, nil // another run is renewing and this token still works: use it meanwhile
 			}
+			// (a forced renewal is one the CMI refused the stored token for: it waits for the holder's result, it does not take that token again)
 			// another run is renewing and this token has expired: look again shortly
 			select {
 			case <-ctx.Done():
@@ -67,7 +76,7 @@ func (s *Store) RenewCMICredential(ctx context.Context, c *run.Claim, seen *cred
 		if next.RefreshToken == "" {
 			next.RefreshToken = cur.RefreshToken
 		}
-		if err := s.storeRenewed(ctx, c, holder, sealed, next); err != nil {
+		if err := s.storeRenewed(context.WithoutCancel(ctx), c, holder, sealed, next); err != nil {
 			return nil, err
 		}
 		return next, nil
@@ -76,14 +85,15 @@ func (s *Store) RenewCMICredential(ctx context.Context, c *run.Claim, seen *cred
 
 // takeRenewal reads the credential and tries to take the renewal lease on the holder's row, in one short transaction. lease says whether
 // it was taken (and then cur is the credential to renew); without it cur is what is stored now, nil when nothing is.
-func (s *Store) takeRenewal(ctx context.Context, c *run.Claim) (sealed []byte, cur *credential.Token, lease bool, holder string, err error) {
+func (s *Store) takeRenewal(ctx context.Context, c *run.Claim) (sealed []byte, lease bool, holder string, err error) {
 	err = s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
 		if holder, err = credentialHolder(ctx, tx, c.RunID); err != nil {
 			return err
 		}
 		// the holder's row first, then our own (owned): the order a cancel locks them in
-		tag := tx.QueryRow(ctx, `UPDATE runs SET cmi_renewing_until = $2 WHERE id = $1 AND cmi_credential IS NOT NULL AND (cmi_renewing_until IS NULL OR cmi_renewing_until < $3) RETURNING cmi_credential`,
-			holder, s.now().Add(renewLease), s.now())
+		// the database's clock decides (the lease is shared by processes whose clocks differ)
+		tag := tx.QueryRow(ctx, `UPDATE runs SET cmi_renewing_until = now() + $2::interval WHERE id = $1 AND cmi_credential IS NOT NULL AND (cmi_renewing_until IS NULL OR cmi_renewing_until < now()) RETURNING cmi_credential`,
+			holder, fmt.Sprintf("%d seconds", int(renewLease/time.Second)))
 		switch e := tag.Scan(&sealed); {
 		case e == nil:
 			lease = true
@@ -102,20 +112,14 @@ func (s *Store) takeRenewal(ctx context.Context, c *run.Claim) (sealed []byte, c
 		}
 		return nil
 	})
-	if err != nil {
-		return nil, nil, false, "", err
-	}
-	cur, err = s.openToken(sealed)
-	return sealed, cur, lease, holder, err
+	return sealed, lease, holder, err
 }
 
-// dropRenewal gives the lease back without a result.
+// dropRenewal gives the lease back without a result. It is not subject to the claim's fence: the lease is the caller's own, and a
+// claim lost meanwhile must not leave it held for a full lease.
 func (s *Store) dropRenewal(ctx context.Context, c *run.Claim, holder string) error {
 	return s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `UPDATE runs SET cmi_renewing_until = NULL WHERE id = $1`, holder); err != nil {
-			return err
-		}
-		_, err := s.owned(ctx, tx, c)
+		_, err := tx.Exec(ctx, `UPDATE runs SET cmi_renewing_until = NULL WHERE id = $1`, holder)
 		return err
 	})
 }
@@ -132,9 +136,9 @@ func (s *Store) storeRenewed(ctx context.Context, c *run.Claim, holder string, w
 		if err != nil {
 			return err
 		}
-		if _, err := s.owned(ctx, tx, c); err != nil {
-			return err
-		}
+		// no fence check: a renewal the authorization server has completed is stored even if the claim was lost meanwhile (with a rotating
+		// refresh token the old one is dead, and not storing the new one would kill the credential the runs share); the compare and swap
+		// already stops a stale write
 		if tag.RowsAffected() == 0 {
 			return run.ErrCMICredentialUnusable
 		}

@@ -602,7 +602,7 @@ func (a *API) createRun(r *http.Request, p authorization.Principal, ref, key str
 	} else if replay != nil {
 		return replay, true, nil
 	}
-	if err := a.Store.Preflight(r.Context(), p.Tenant, in.ThreadID, p.Subject, ag.ID); err != nil {
+	if err := a.Store.Preflight(r.Context(), p.Tenant, in.ThreadID, p.Subject, ag.ID, key); err != nil {
 		return nil, false, err
 	}
 	env, err := a.Store.GetEnvelope(r.Context(), p.Tenant, releaseID)

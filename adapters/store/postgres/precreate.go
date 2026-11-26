@@ -175,7 +175,7 @@ func (s *Store) FindReplayRaw(ctx context.Context, tenant, threadID, owner, key,
 
 // Preflight refuses what CreateRun would refuse for the thread, before anything is paid for (D69): a thread that is another user's
 // (FORBIDDEN), one bound to another agent (CONFLICT) and one with a run still in flight (CONFLICT). It writes nothing.
-func (s *Store) Preflight(ctx context.Context, tenant, threadID, owner, agentRef string) error {
+func (s *Store) Preflight(ctx context.Context, tenant, threadID, owner, agentRef, key string) error {
 	if threadID == "" {
 		return nil
 	}
@@ -203,7 +203,15 @@ func (s *Store) Preflight(ctx context.Context, tenant, threadID, owner, agentRef
 			return err
 		}
 		if active > 0 {
-			return fail("CONFLICT", "a run is still in progress on this thread")
+			// a run of this thread, owner and key is a replay, not a second run: it is not refused as busy here, it falls through to the
+			// replay check by the digest of the whole request (a run created before the raw digest was kept has none)
+			var same int
+			if err := tx.QueryRow(ctx, `SELECT count(*) FROM runs WHERE thread_id = $1 AND owner = $2 AND idempotency_key = $3`, threadID, owner, key).Scan(&same); err != nil {
+				return err
+			}
+			if same == 0 {
+				return fail("CONFLICT", "a run is still in progress on this thread")
+			}
 		}
 		return nil
 	})

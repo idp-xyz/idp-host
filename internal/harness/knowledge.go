@@ -30,7 +30,7 @@ type cmiCredentials interface {
 	CMICredential(ctx context.Context, c *run.Claim) (*credential.Token, error)
 	// RenewCMICredential renews the credential under the lock of the run that holds it, so that the runs sharing it (a root run
 	// and its sub-agents) renew a refresh token once; seen is the token the caller has.
-	RenewCMICredential(ctx context.Context, c *run.Claim, seen *credential.Token, renew func(ctx context.Context, refreshToken string) (*credential.Token, error)) (*credential.Token, error)
+	RenewCMICredential(ctx context.Context, c *run.Claim, seen *credential.Token, force bool, renew func(ctx context.Context, refreshToken string) (*credential.Token, error)) (*credential.Token, error)
 }
 
 // Schemas of the tools, as the model reads them. The HOST checks the arguments itself (knowledge_args.go); the schema only
@@ -198,7 +198,7 @@ func (t *turn) cmiBearer(force bool, refused string) (string, error) {
 		return fail("not renewable", errNoMemberCredential)
 	}
 	rctx, cancel := context.WithTimeout(t.callCtx, 15*time.Second)
-	next, err := st.RenewCMICredential(rctx, t.claim, tok, h.CMIRefresh)
+	next, err := st.RenewCMICredential(rctx, t.claim, tok, force, h.CMIRefresh)
 	cancel()
 	switch {
 	case err != nil && errors.Is(err, run.ErrFenced):
@@ -393,7 +393,11 @@ func (t *turn) knowledgePackage(tool string, pkg *cmiclient.Package, detail map[
 	events = append(events, agui.Custom(agui.CustomContextPackage, ev))
 	if screened != nil && screened.Withheld > 0 {
 		b.WriteString("\n" + screened.Note() + "\n")
-		we := screened.Event(t.rc.Run.Input.ContextTrigger, t.rc.Run.Input.ContextVia)
+		trigger := t.rc.Run.Input.ContextTrigger
+		if trigger == "" {
+			trigger = agui.ScreenExternalTools // screened for its outward tools, with no ceiling recorded (D69)
+		}
+		we := screened.Event(trigger, t.rc.Run.Input.ContextVia)
 		v, _ := we["value"].(map[string]any)
 		v["source"], v["tool"], v["packageId"] = "knowledge_tool", tool, pkg.PackageID
 		events = append(events, we)

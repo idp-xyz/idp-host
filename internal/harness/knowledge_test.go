@@ -435,7 +435,7 @@ func (c *credStore) CMICredential(context.Context, *run.Claim) (*credential.Toke
 	return c.tok, nil
 }
 
-func (c *credStore) RenewCMICredential(ctx context.Context, _ *run.Claim, seen *credential.Token, renew func(context.Context, string) (*credential.Token, error)) (*credential.Token, error) {
+func (c *credStore) RenewCMICredential(ctx context.Context, _ *run.Claim, seen *credential.Token, _ bool, renew func(context.Context, string) (*credential.Token, error)) (*credential.Token, error) {
 	c.renewals++
 	if seen != nil && c.tok.AccessToken != seen.AccessToken {
 		return c.tok, nil // renewed meanwhile by a run that shares it
@@ -618,7 +618,7 @@ func TestARunThatIsScreenedButHasNoCeilingFailsClosed(t *testing.T) {
 		t.Fatalf("nothing passes without a ceiling: %q", got)
 	}
 	w := eventsNamed(m, agui.CustomContextWithheld)
-	if len(w) != 1 || w[0]["count"] != float64(2) || w[0]["source"] != "knowledge_tool" || w[0]["noCeiling"] != true || w[0]["ceiling"] != "" {
+	if len(w) != 1 || w[0]["count"] != float64(2) || w[0]["source"] != "knowledge_tool" || w[0]["noCeiling"] != true || w[0]["ceiling"] != "" || w[0]["trigger"] != "external-tools" {
 		t.Fatalf("%v", w)
 	}
 	if !strings.Contains(got, "limit that applies to it is not known") || strings.Contains(got, "above") || strings.Contains(got, "public") || strings.Contains(got, "limit is none") {
@@ -814,5 +814,29 @@ func TestAClearedCredentialStopsTheChildsCallsAtOnce(t *testing.T) {
 	msgs := toolMessages2(cs.memStore)
 	if len(msgs) != 2 || msgs[0].Error != "" || !strings.Contains(msgs[1].Error, "not available") || len(fc.Requests()) != 1 {
 		t.Fatalf("%+v %d", msgs, len(fc.Requests()))
+	}
+}
+
+// D69: an interrupted knowledge call that this turn does not serve is not "outcome unknown, check whether it was done": the tool only
+// reads, and the model may call it again.
+func TestAnInterruptedKnowledgeCallIsSaidToBeSafeToCallAgain(t *testing.T) {
+	e, fc := knowEnv(t, handbook())
+	e.model.Script = seq(fakemodel.Turn{Text: "done"})
+	m := newMem(knowDef(), []agui.Message{{ID: "u0", Role: agui.RoleUser, Content: "go"},
+		{ID: "a0", Role: agui.RoleAssistant, ToolCalls: []agui.ToolCall{{ID: "c0", Type: "function", Function: agui.FunctionCall{Name: "knowledge__search", Arguments: `{"query":"x"}`}}}}}, run.Input{})
+	m.calls["c0"] = &run.ToolCall{RunID: "run_1", ID: "c0", Tool: "knowledge__search", Arguments: `{"query":"x"}`, State: run.CallExecuting, MessageID: "a0"}
+	e.h.Store = &credStore{memStore: m, tok: nil}
+	if err := e.h.Run(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	msgs := toolMessages2(m)
+	if len(msgs) != 1 || !strings.Contains(msgs[0].Error, "interrupted") || !strings.Contains(msgs[0].Error, "call it again") || strings.Contains(msgs[0].Error, "unknown") || len(fc.Requests()) != 0 {
+		t.Fatalf("%+v", msgs)
+	}
+}
+
+func TestSanitizeTakesNil(t *testing.T) {
+	if sanitize(nil) != "" {
+		t.Error("nil")
 	}
 }
