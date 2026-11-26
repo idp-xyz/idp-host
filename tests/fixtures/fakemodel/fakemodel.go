@@ -127,6 +127,25 @@ const InventedCitation = 987
 // entry. hostNumber is 1 for a result without one (a fresh thread's first source, and what the flows said before the HOST numbered).
 var blockHeaderRE = regexp.MustCompile(`(?m)^\[(\d+)\] [^\n]*\naddress:`)
 
+// resultHeadRE is the head the HOST writes before the text of a fetched page (D71): "[n] title" (with the position in the page),
+// "address: <the page's own address>" and, for web_fetch, "ref: <ref>", then a blank line.
+var resultHeadRE = regexp.MustCompile(`(?s)^(?:<untrusted[^>]*>\n)?\[\d+\] [^\n]*\naddress: (\S+)\n(?:ref: [^\n]*\n)?`)
+
+// pageLinkOf is the first address in the BODY of a fetched page: the head's own lines are skipped, and so is any address equal to the
+// page's own, so that the obeying flow follows what the page tells it to and not the page itself.
+func pageLinkOf(content string) string {
+	body, own := content, ""
+	if m := resultHeadRE.FindStringSubmatch(content); m != nil {
+		body, own = content[len(m[0]):], m[1]
+	}
+	for _, u := range pageURLRE.FindAllString(body, -1) {
+		if strings.TrimRight(u, ".,;:") != own {
+			return u
+		}
+	}
+	return ""
+}
+
 func hostNumber(result string) int {
 	if m := blockHeaderRE.FindStringSubmatch(result); m != nil {
 		n, _ := strconv.Atoi(m[1])
@@ -210,7 +229,7 @@ func webFlow(messages []Message, has func(string) bool, toolName func(string) st
 		e := first()
 		if fetches == 1 {
 			// obey the page: fetch the first URL in it, with the ref of the search result
-			u := pageURLRE.FindString(last.Content)
+			u := pageLinkOf(last.Content)
 			if u == "" || e == nil {
 				return Turn{Text: fmt.Sprintf("Result [%d]: ", hostNumber(last.Content)) + firstRunes(last.Content, 300)}, true
 			}
