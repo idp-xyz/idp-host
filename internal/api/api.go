@@ -19,6 +19,7 @@ import (
 	"idp-host/internal/agent"
 	"idp-host/internal/agui"
 	"idp-host/internal/authorization"
+	"idp-host/internal/canonical"
 	"idp-host/internal/cmiclient"
 	"idp-host/internal/credential"
 	"idp-host/internal/mcpclient"
@@ -589,6 +590,21 @@ func (a *API) createRun(r *http.Request, p authorization.Principal, ref, key str
 	} else {
 		return nil, false, transport.Fail(http.StatusConflict, "CONFLICT", "agent has no published release")
 	}
+	// An idempotent replay is answered, and a request the thread would refuse is refused, before anything is exchanged, listed,
+	// rewritten or retrieved (D69): the digest is of the request as the caller sent it, which the gateway's catalogue and the CMI do not
+	// change.
+	rawHash, err := rawRequestHash(ag.ID, releaseID, in, opts)
+	if err != nil {
+		return nil, false, transport.Fail(http.StatusUnprocessableEntity, "INVALID", err.Error())
+	}
+	if replay, err := a.Store.FindReplayRaw(r.Context(), p.Tenant, in.ThreadID, p.Subject, key, rawHash); err != nil {
+		return nil, false, err
+	} else if replay != nil {
+		return replay, true, nil
+	}
+	if err := a.Store.Preflight(r.Context(), p.Tenant, in.ThreadID, p.Subject, ag.ID); err != nil {
+		return nil, false, err
+	}
 	env, err := a.Store.GetEnvelope(r.Context(), p.Tenant, releaseID)
 	if err != nil {
 		return nil, false, err
@@ -683,7 +699,7 @@ func (a *API) createRun(r *http.Request, p authorization.Principal, ref, key str
 		cmiCred, credErr = a.delegate(r.Context(), a.CMIAuth, tok)
 	}
 	// D32: context from the CMI, resolved for the caller before the run is queued
-	packageID, extra, rewrote, err := a.resolveContext(r, p, doc, in, &input, cmiCred, credErr, knowledge)
+	packageID, extra, rewrote, err := a.resolveContext(r, p, doc, in, &input, cmiCred, credErr, keepCred && cmiCred != nil && credErr == nil)
 	if err != nil {
 		return nil, false, err
 	}
@@ -696,7 +712,7 @@ func (a *API) createRun(r *http.Request, p authorization.Principal, ref, key str
 	}
 	out, replayed, err := a.Store.CreateRun(r.Context(), p.Tenant, postgres.CreateRunInput{ThreadID: in.ThreadID, RunID: in.RunID, AgentRef: ag.ID, Owner: p.Subject,
 		IdempotencyKey: key, Messages: in.Messages, Input: input, Credential: cred, FileTickets: tickets, TraceID: observability.TraceID(r.Context()), Traceparent: observability.Traceparent(r.Context()),
-		ReleaseID: releaseID, ExecutionRef: opts.ExecutionRef, ContextPackageID: packageID, Extra: extra, CMICredential: cmiCred, RewriteUsage: rewrote})
+		ReleaseID: releaseID, ExecutionRef: opts.ExecutionRef, ContextPackageID: packageID, Extra: extra, CMICredential: cmiCred, RewriteUsage: rewrote, RawHash: rawHash})
 	return out, replayed, err
 }
 
@@ -809,17 +825,20 @@ func (a *API) resolveContext(r *http.Request, p authorization.Principal, doc *ag
 			if err := a.Store.CheckQuota(r.Context(), p.Tenant); err != nil {
 				return "", nil, nil, err
 			}
-			if policy, err := a.Store.GetPolicy(r.Context(), p.Tenant); err == nil {
+			if policy, err := a.Store.GetPolicy(r.Context(), p.Tenant); err != nil {
+				// the tenant's patterns cannot be read: no rewrite, the raw message is the query (fail closed)
+				a.Log.Warn("the tenant's policy could not be read; the question is not rewritten", "error", err)
+			} else {
 				pi.BlockedPatterns = policy.BlockedPatterns // D28
-			}
-			out := a.Rewriter.RewriteQuestion(r.Context(), doc.Effective(), pi)
-			if out.Query != query {
-				input.ContextQuery = out.Query // a refresh asks the same question again
-			}
-			query = out.Query
-			events = append(events, out.Event)
-			if u := out.Usage; u != nil {
-				usage = &postgres.RewriteUsage{Provider: u.Provider, Model: u.Model, PromptTokens: u.PromptTokens, CompletionTokens: u.CompletionTokens, LatencyMs: u.LatencyMs}
+				out := a.Rewriter.RewriteQuestion(r.Context(), doc.Effective(), pi)
+				if out.Query != query {
+					input.ContextQuery = out.Query // a refresh asks the same question again
+				}
+				query = out.Query
+				events = append(events, out.Event)
+				if u := out.Usage; u != nil {
+					usage = &postgres.RewriteUsage{Provider: u.Provider, Model: u.Model, PromptTokens: u.PromptTokens, CompletionTokens: u.CompletionTokens, LatencyMs: u.LatencyMs}
+				}
 			}
 		}
 	}
@@ -874,6 +893,9 @@ func (a *API) resolveContext(r *http.Request, p authorization.Principal, doc *ag
 // follow-up on a contextId) get the same earlier turns.
 func (a *API) rewriteHistory(ctx context.Context, p authorization.Principal, in agui.RunAgentInput) []agui.Message {
 	stored, err := a.Store.ThreadMessages(ctx, p.Tenant, p.Subject, in.ThreadID)
+	if errors.Is(err, postgres.ErrThreadNotOwned) {
+		return nil // never the request's messages as the history of a thread that is not the caller's
+	}
 	if err != nil || len(stored) == 0 {
 		return in.Messages
 	}
@@ -977,3 +999,17 @@ func (a *API) stream(w http.ResponseWriter, r *http.Request, tenant, owner, runI
 }
 
 func newUUID() string { return postgres.NewUUID() }
+
+// rawRequestHash is the digest of the request as the caller sent it (D69): the messages, tools, context, options and the release the
+// run is for, without the tickets of attachments (they are signed afresh for each request). What the HOST derives from the gateway's
+// catalogue and the CMI is not in it.
+func rawRequestHash(agentID, releaseID string, in agui.RunAgentInput, opts run.Options) (string, error) {
+	atts := make([]run.Attachment, 0, len(opts.Attachments))
+	for _, at := range opts.Attachments {
+		at.Ticket = ""
+		atts = append(atts, at)
+	}
+	return canonical.Digest(map[string]any{"agent": agentID, "release": releaseID, "messages": in.Messages, "tools": in.Tools, "context": in.Context,
+		"props": run.WithoutFileOptions(in.ForwardedProps), "attachments": atts, "delivery": opts.Delivery != nil, "toolExecution": opts.ToolExecution,
+		"maxOutputTokens": opts.MaxOutputTokens, "executionRef": opts.ExecutionRef})
+}

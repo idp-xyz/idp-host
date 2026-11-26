@@ -244,3 +244,22 @@ func TestACanceledRewriteIsNotATimeoutAndNoProviderIsNoCandidate(t *testing.T) {
 		t.Errorf("%v", v)
 	}
 }
+
+// failsWithUsage reports what it used and then fails: the run is still charged for it (D69).
+type failsWithUsage struct{}
+
+func (failsWithUsage) Name() string { return "fails" }
+func (failsWithUsage) Complete(context.Context, model.Request, func(model.Delta)) (*model.Response, error) {
+	return &model.Response{Usage: model.Usage{PromptTokens: 40, CompletionTokens: 5}}, &model.Error{Code: "server_error"}
+}
+
+func TestACandidateThatFailedAfterReportingUsageIsStillChargedFor(t *testing.T) {
+	e := setup(t)
+	e.h.Providers = model.NewRegistry(failsWithUsage{})
+	d := def()
+	d.Model.Provider = "fails"
+	out := e.h.RewriteQuestion(context.Background(), d, followUp())
+	if out.Usage == nil || out.Usage.PromptTokens != 40 || out.Usage.CompletionTokens != 5 || eventValue(out.Event)["outcome"] != cmiclient.RewriteFallback {
+		t.Fatalf("%+v %v", out.Usage, out.Event)
+	}
+}

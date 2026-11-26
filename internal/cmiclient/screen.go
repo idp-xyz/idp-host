@@ -23,6 +23,15 @@ type Screening struct {
 	Withheld int
 	ByLevel  map[string]int
 	Ceiling  string
+	// NoCeiling: the run is screened but no ceiling was recorded for it (D69): nothing can be judged, so everything is withheld, and
+	// the note and the event say that the limit is not known - never that an entry is above it.
+	NoCeiling bool
+}
+
+// ScreenAll withholds every item of a run that is screened but has no ceiling (D69), as InheritedEvent does for entries whose level
+// cannot be judged: they all count as unknown.
+func ScreenAll(items []Item) Screening {
+	return Screening{Withheld: len(items), ByLevel: map[string]int{LevelUnknown: len(items)}, NoCeiling: true}
 }
 
 // Screen splits the items of a package into those at or below the ceiling and those above it (D44; platform ADR-0003
@@ -69,6 +78,9 @@ func (s Screening) ContextFrom(first int) ([]agui.Context, int) {
 
 // Note is what the model is told: counts and levels, and nothing of the entries.
 func (s Screening) Note() string {
+	if s.NoCeiling {
+		return fmt.Sprintf("%d context entries that were found for this request were NOT given to you, because this run may send content outside the enterprise and the limit that applies to it is not known, so none of them could be judged. Do not guess their content. If the answer needs them, tell the user that some information could not be used.", s.Withheld)
+	}
 	levels := make([]string, 0, len(s.ByLevel))
 	for l := range s.ByLevel {
 		levels = append(levels, l)
@@ -87,6 +99,9 @@ func (s Screening) Note() string {
 // reasons, never what was withheld.
 func (s Screening) Event(trigger string, via []string) agui.Event {
 	payload := map[string]any{"count": s.Withheld, "byLevel": s.ByLevel, "ceiling": s.Ceiling, "trigger": trigger}
+	if s.NoCeiling {
+		payload["noCeiling"] = true
+	}
 	if len(via) > 0 {
 		payload["via"] = via
 	}

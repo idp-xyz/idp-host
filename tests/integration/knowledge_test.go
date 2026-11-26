@@ -7,7 +7,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"idp-host/adapters/store/postgres"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -57,6 +59,7 @@ func knowledgeEnv(t *testing.T, docs ...fakecmi.Doc) (*env, *fakecmi.Server) {
 				http.Error(w, `{"error":"invalid_target"}`, 400)
 				return
 			}
+			cmiExchanges.Add(1)
 			parts := strings.Split(r.PostForm.Get("subject_token"), ".")
 			raw, _ := base64.RawURLEncoding.DecodeString(parts[1])
 			var claims struct {
@@ -102,6 +105,9 @@ func knowledgeEnv(t *testing.T, docs ...fakecmi.Doc) (*env, *fakecmi.Server) {
 	e.host.Files = api.FilePolicy{Local: map[string]bool{"fake": true}} // the model is the enterprise's own: nothing is screened unless a test says so
 	return e, fc
 }
+
+// cmiExchanges counts the token exchanges for the CMI's audience.
+var cmiExchanges atomic.Int32
 
 func knowledgeAgent(tools []string, rewrite string) agent.Definition {
 	d := definition("", nil, nil)
@@ -420,6 +426,9 @@ func TestTheQuestionRewriteOnPostgres(t *testing.T) {
 		if q := lastResolve()["query"]; q != "What does the Returns policy say about the second rule?" || rewrites() != 1 {
 			t.Fatalf("the CMI was asked %q (%d rewrites)", q, rewrites())
 		}
+		if used, rewriteTokens := e.tokensUsed(id), e.stepTokens(id); used <= 0 || used != int64(rewriteTokens) {
+			t.Errorf("the run's own cap counts the rewrite: tokens_used %d, step 0 %d", used, rewriteTokens)
+		}
 		if got := e.model.Efforts(); got[len(got)-1] != "low" && got[0] != "low" {
 			t.Errorf("efforts %v", got)
 		}
@@ -443,9 +452,12 @@ func TestTheQuestionRewriteOnPostgres(t *testing.T) {
 		}
 		// the same request replays the same run (the rewrite and the first retrieval are made again before the store finds the replay,
 		// as the retrieval always was: D32)
-		calls, resolves := rewrites(), len(fc.RequestsTo("/v1/context/resolve"))
+		calls, resolves, exchanges := rewrites(), len(fc.RequestsTo("/v1/context/resolve")), cmiExchanges.Load()
 		if again := e.must(200, "POST", "/v1/agents/rewriter/runs", "carol", first, "Idempotency-Key", "rw1"); again["runId"] != id {
 			t.Fatal("replay returned another run")
+		}
+		if cmiExchanges.Load() != exchanges {
+			t.Error("a replay exchanged a token before it was found")
 		}
 		if rewrites() != calls || len(fc.RequestsTo("/v1/context/resolve")) != resolves {
 			t.Errorf("a replay made a model call or a retrieval: %d %d", rewrites(), len(fc.RequestsTo("/v1/context/resolve")))
@@ -473,6 +485,31 @@ func TestTheQuestionRewriteOnPostgres(t *testing.T) {
 		if rewrites() != before+1 || lastResolve()["query"] != "What is the second return rule?" {
 			t.Fatalf("%d %d %v", before, rewrites(), lastResolve()["query"])
 		}
+	})
+
+	t.Run("a request the thread would refuse makes no model call", func(t *testing.T) {
+		msg := func(thread, id, text string, earlier bool) map[string]any {
+			ms := []map[string]any{}
+			if earlier {
+				ms = append(ms, map[string]any{"id": id + "e", "role": "user", "content": "what are the return rules"}, map[string]any{"id": id + "f", "role": "assistant", "content": "two rules"})
+			}
+			ms = append(ms, map[string]any{"id": id, "role": "user", "content": text})
+			return map[string]any{"threadId": thread, "messages": ms, "tools": []any{}, "context": []any{}}
+		}
+		// a busy thread: the first run is queued and not driven
+		e.must(202, "POST", "/v1/agents/rewriter/runs", "carol", msg("pf-busy", "b1", "first", false), "Idempotency-Key", "pf1")
+		before, resolves := rewrites(), len(fc.RequestsTo("/v1/context/resolve"))
+		e.must(409, "POST", "/v1/agents/rewriter/runs", "carol", msg("pf-busy", "b2", "and the second one?", true), "Idempotency-Key", "pf2")
+		// another user posts to Carol's thread, with earlier turns of his own making
+		e.must(403, "POST", "/v1/agents/rewriter/runs", "erin", msg("pf-busy", "b3", "and the third one?", true), "Idempotency-Key", "pf3")
+		if rewrites() != before || len(fc.RequestsTo("/v1/context/resolve")) != resolves {
+			t.Errorf("a refused request made a model call or a retrieval: %d -> %d", before, rewrites())
+		}
+		// and the history of a thread that is not the caller's is never the request's messages
+		if _, err := e.store.ThreadMessages(context.Background(), e.tenantA, "erin", "pf-busy"); !errors.Is(err, postgres.ErrThreadNotOwned) {
+			t.Errorf("another user's thread: %v", err)
+		}
+		e.drive()
 	})
 
 	t.Run("no earlier turns: no model call, the message is the query", func(t *testing.T) {
@@ -575,6 +612,20 @@ func (e *env) stepTokens(id string) int {
 	return n
 }
 
+func (e *env) tokensUsed(id string) int64 {
+	e.t.Helper()
+	conn, err := pgx.Connect(context.Background(), e.ownerURL)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	var n int64
+	if err := conn.QueryRow(context.Background(), `SELECT tokens_used FROM runs WHERE id = $1`, id).Scan(&n); err != nil {
+		e.t.Fatal(err)
+	}
+	return n
+}
+
 func (e *env) credentialRow(id string) (own bool, ref string) {
 	e.t.Helper()
 	conn, err := pgx.Connect(context.Background(), e.ownerURL)
@@ -619,13 +670,23 @@ func TestOnlyMembersGetTheKnowledgeToolsOnPostgres(t *testing.T) {
 		t.Error("a member is offered the tools")
 	}
 	// a principal that holds host-user and is not a member (carol; a service account that is a CMI writer would be the same)
-	r = e.must(202, "POST", "/v1/agents/librarian/runs", "carol", runBody("om-2", "returns?"), "Idempotency-Key", "om2")
+	r = e.must(202, "POST", "/v1/agents/librarian/runs", "carol", runBody("om-2", "returns policy"), "Idempotency-Key", "om2")
 	if own, _ := e.credentialRow(r["runId"].(string)); own {
 		t.Error("a non-member's run keeps a credential")
 	}
 	e.drive()
 	if offered(e) {
 		t.Error("a non-member is offered the tools")
+	}
+	// numbering follows the credential, not the release: a run that has no tools in reach sees the text it saw before KB8
+	var seen string
+	for _, m := range e.model.Last() {
+		if strings.HasPrefix(m.Content, "CMI ") {
+			seen += m.Content
+		}
+	}
+	if !strings.Contains(seen, "CMI knowledge from") || strings.Contains(seen, "CMI [") {
+		t.Errorf("a run without a credential numbered its first package: %q", seen)
 	}
 	// an A2A peer holding the member role: not offered either
 	msg := map[string]any{"kind": "message", "role": "user", "messageId": "om-a2a", "contextId": "om-3", "parts": []map[string]any{{"kind": "text", "text": "returns?"}}}
@@ -706,6 +767,67 @@ func TestTheMemberCredentialOfARunOnPostgres(t *testing.T) {
 		e.drive()
 	})
 
+	t.Run("a grandchild behind a child without the tools has the credential", func(t *testing.T) {
+		leaf := knowledgeAgent(agent.KnowledgeTools, "")
+		e.publish("leaf-k", leaf)
+		mid := definition("", nil, nil)
+		mid.Limits = agent.DefaultLimits
+		mid.Limits.MaxSubagentDepth = 2
+		mid.Subagents = []agent.SubagentRef{{Name: "leaf-k", Description: "Looks things up."}}
+		e.publish("mid-k", mid)
+		top := definition("", nil, nil)
+		top.Subagents = []agent.SubagentRef{{Name: "mid-k", Description: "Delegates."}}
+		e.publish("top-k", top)
+		e.model.Script = func(msgs []fakemodel.Message, tools []string) fakemodel.Turn {
+			last := msgs[len(msgs)-1]
+			has := func(n string) bool {
+				for _, t := range tools {
+					if t == n {
+						return true
+					}
+				}
+				return false
+			}
+			switch {
+			case last.Role == "tool":
+				return fakemodel.Turn{Text: "done"}
+			case has("agent__mid-k"):
+				return fakemodel.Turn{ToolCalls: []fakemodel.Call{{Name: "agent__mid-k", Args: `{"input":"go on"}`}}}
+			case has("agent__leaf-k"):
+				return fakemodel.Turn{ToolCalls: []fakemodel.Call{{Name: "agent__leaf-k", Args: `{"input":"find returns"}`}}}
+			case has("knowledge__search"):
+				return fakemodel.Turn{ToolCalls: []fakemodel.Call{{Name: "knowledge__search", Args: `{"query":"returns"}`}}}
+			}
+			return fakemodel.Turn{Text: "nothing"}
+		}
+		r := e.must(202, "POST", "/v1/agents/top-k/runs", "erin", runBody("mc-4", "go"), "Idempotency-Key", "mc4")
+		root := r["runId"].(string)
+		before := len(fc.RequestsTo("/v1/context/resolve"))
+		var ids []string
+		for i := 0; i < 2; i++ { // the root and the middle run each rest while their child runs
+			if ok, err := e.worker.Once(context.Background()); err != nil || !ok {
+				t.Fatal(ok, err)
+			}
+			parent := root
+			if i == 1 {
+				parent = ids[0]
+			}
+			kids := e.must(200, "GET", "/v1/runs/"+parent+"/subruns", "erin", nil)["runs"].([]any)
+			ids = append(ids, kids[0].(map[string]any)["runId"].(string))
+			if own, ref := e.credentialRow(ids[i]); own || ref != root {
+				t.Fatalf("level %d: holds a copy (%v) or points at %q, not the root", i+1, own, ref)
+			}
+		}
+		e.drive()
+		if got := e.must(200, "GET", "/v1/runs/"+root, "erin", nil); got["status"] != run.StatusCompleted {
+			t.Fatalf("%v", got)
+		}
+		reqs := fc.RequestsTo("/v1/context/resolve")
+		if len(reqs) != before+1 || reqs[len(reqs)-1].Bearer != "member:erin" {
+			t.Errorf("the leaf's search was not made as the member: %+v", reqs[before:])
+		}
+	})
+
 	t.Run("a sub-agent points at the root's credential and the runs that share it renew it once", func(t *testing.T) {
 		e.publish("helper-k", knowledgeAgent(agent.KnowledgeTools, ""))
 		lead := definition("", nil, nil)
@@ -743,7 +865,7 @@ func TestTheMemberCredentialOfARunOnPostgres(t *testing.T) {
 		if own, ref := e.credentialRow(child); own || ref != root {
 			t.Fatalf("the child holds a copy (%v) or points elsewhere (%q)", own, ref)
 		}
-		// the renewal is serialised under the row lock of the run that holds it: four at once, one call to the authorization server
+		// single-flight renewal (D69): four at once, one call to the authorization server, no row lock held across it
 		cl, err := e.store.Claim(context.Background(), "w-renew", time.Minute)
 		if err != nil || cl == nil {
 			t.Fatal(err, cl)
@@ -761,7 +883,7 @@ func TestTheMemberCredentialOfARunOnPostgres(t *testing.T) {
 				defer wg.Done()
 				tok, err := e.store.RenewCMICredential(context.Background(), cl, seen, func(_ context.Context, refresh string) (*credential.Token, error) {
 					renewals.Add(1)
-					time.Sleep(50 * time.Millisecond)
+					time.Sleep(200 * time.Millisecond)
 					return &credential.Token{AccessToken: "member:erin-renewed", RefreshToken: refresh, ExpiresAt: time.Now().Add(time.Hour)}, nil
 				})
 				if err == nil {
@@ -773,14 +895,74 @@ func TestTheMemberCredentialOfARunOnPostgres(t *testing.T) {
 		if renewals.Load() != 1 {
 			t.Errorf("the refresh token was renewed %d times", renewals.Load())
 		}
-		for _, got := range results {
-			if got != "member:erin-renewed" {
+		for _, got := range results { // the one that renewed has the new token; the others use the one that still worked, or the new one
+			if got != "member:erin-renewed" && got != seen.AccessToken {
 				t.Errorf("%v", results)
 			}
 		}
-		if err := e.store.Release(context.Background(), cl); err != nil {
-			t.Fatal(err)
+		if cur, err := e.store.CMICredential(context.Background(), cl); err != nil || cur.AccessToken != "member:erin-renewed" {
+			t.Errorf("the renewed credential is stored: %v %v", cur, err)
 		}
-		e.drive() // the child and then the root finish
+		// a renewal in flight holds no lock: the child's heartbeat and a cancel of the root go through meanwhile, and a credential that
+		// was cleared meanwhile is not brought back
+		cur, _ := e.store.CMICredential(context.Background(), cl)
+		inCall, unblock := make(chan struct{}), make(chan struct{})
+		done := make(chan error, 1)
+		go func() {
+			_, err := e.store.RenewCMICredential(context.Background(), cl, cur, func(_ context.Context, refresh string) (*credential.Token, error) {
+				close(inCall)
+				<-unblock
+				return &credential.Token{AccessToken: "member:erin-late", RefreshToken: refresh, ExpiresAt: time.Now().Add(time.Hour)}, nil
+			})
+			done <- err
+		}()
+		<-inCall
+		quick := func(what string, f func() error) {
+			t.Helper()
+			finished := make(chan error, 1)
+			go func() { finished <- f() }()
+			select {
+			case err := <-finished:
+				if err != nil {
+					t.Errorf("%s: %v", what, err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Errorf("%s was kept waiting by a renewal in flight", what)
+			}
+		}
+		quick("the child's heartbeat", func() error { return e.store.Heartbeat(context.Background(), cl, time.Minute) })
+		quick("the cancel of the root", func() error { _, err := e.store.CancelRun(context.Background(), e.tenantA, "erin", root); return err })
+		close(unblock)
+		if err := <-done; err == nil {
+			t.Error("a credential cleared while it was being renewed was restored")
+		}
+		if own, _ := e.credentialRow(root); own {
+			t.Error("the root's credential came back")
+		}
 	})
+}
+
+// D69: an idempotent replay is answered before the gateway's catalogue is read and before a credential is exchanged.
+func TestAReplayIsFoundBeforeAnythingIsListedOrExchangedOnPostgres(t *testing.T) {
+	e, _ := knowledgeEnv(t, handbookDoc())
+	d := definition("edge", []string{"sum"}, nil)
+	d.Context = agent.ContextPolicy{CMI: true, Tools: agent.KnowledgeTools}
+	e.publish("replayer", d)
+	body := runBody("rp-1", "returns policy")
+	r := e.must(202, "POST", "/v1/agents/replayer/runs", "erin", body, "Idempotency-Key", "rp1")
+	listed, exchanged := len(e.mcp.Bearers()), cmiExchanges.Load()
+	again := e.must(200, "POST", "/v1/agents/replayer/runs", "erin", body, "Idempotency-Key", "rp1")
+	if again["runId"] != r["runId"] {
+		t.Fatal("replay returned another run")
+	}
+	if len(e.mcp.Bearers()) != listed || cmiExchanges.Load() != exchanged {
+		t.Errorf("a replay listed the gateway (%d -> %d) or exchanged a token (%d -> %d)", listed, len(e.mcp.Bearers()), exchanged, cmiExchanges.Load())
+	}
+	// the same key with another request is a conflict, found just as early
+	other := runBody("rp-1", "another question")
+	e.must(409, "POST", "/v1/agents/replayer/runs", "erin", other, "Idempotency-Key", "rp1")
+	if len(e.mcp.Bearers()) != listed || cmiExchanges.Load() != exchanged {
+		t.Error("a conflicting request listed the gateway or exchanged a token")
+	}
+	e.drive()
 }

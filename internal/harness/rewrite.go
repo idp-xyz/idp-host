@@ -49,6 +49,7 @@ func (h *Harness) RewriteQuestion(ctx context.Context, def agent.Definition, in 
 		return fallback("no_candidate", nil)
 	}
 	asked := 0
+	var spent model.Usage                                                                                    // what the candidates that failed after reporting usage used: the run is charged for it too
 	filter, err := guard.NewOutput(in.BlockedPatterns, def.Guards.Output.Patterns, def.Guards.Output.Redact) // D28: the tenant's patterns and the release's
 	if err != nil {
 		filter = nil
@@ -70,6 +71,10 @@ func (h *Harness) RewriteQuestion(ctx context.Context, def agent.Definition, in 
 		// the router is not told how long a rewrite took or whether it failed: its numbers order the candidates for a run's steps,
 		// and a 128-token call says nothing about them
 		if err != nil {
+			if resp != nil {
+				spent.PromptTokens += resp.Usage.PromptTokens
+				spent.CompletionTokens += resp.Usage.CompletionTokens
+			}
 			endSpan("error", nil)
 			if h.Metrics != nil {
 				h.Metrics.StepFinished(ref.Provider, ref.Model, "rewrite_error", took, model.Usage{})
@@ -88,7 +93,7 @@ func (h *Harness) RewriteQuestion(ctx context.Context, def agent.Definition, in 
 		if h.Metrics != nil {
 			h.Metrics.StepFinished(ref.Provider, ref.Model, "rewrite", took, resp.Usage)
 		}
-		usage := &cmiclient.RewriteUsage{Provider: ref.Provider, Model: ref.Model, PromptTokens: resp.Usage.PromptTokens, CompletionTokens: resp.Usage.CompletionTokens, LatencyMs: took.Milliseconds()}
+		usage := &cmiclient.RewriteUsage{Provider: ref.Provider, Model: ref.Model, PromptTokens: spent.PromptTokens + resp.Usage.PromptTokens, CompletionTokens: spent.CompletionTokens + resp.Usage.CompletionTokens, LatencyMs: took.Milliseconds()}
 		extra := map[string]any{"provider": ref.Provider, "model": ref.Model, "promptTokens": resp.Usage.PromptTokens, "completionTokens": resp.Usage.CompletionTokens, "latencyMs": took.Milliseconds()}
 		withUsage := func(o cmiclient.RewriteOutcome) cmiclient.RewriteOutcome { o.Usage = usage; return o }
 		if resp.StopReason == model.StopLength {
@@ -109,5 +114,9 @@ func (h *Harness) RewriteQuestion(ctx context.Context, def agent.Definition, in 
 	if asked == 0 {
 		reason = "no_candidate" // no candidate of the profile is a provider this HOST has
 	}
-	return fallback(reason, nil)
+	out := fallback(reason, nil)
+	if spent.PromptTokens+spent.CompletionTokens > 0 {
+		out.Usage = &cmiclient.RewriteUsage{Provider: def.Model.Provider, Model: def.Model.Model, PromptTokens: spent.PromptTokens, CompletionTokens: spent.CompletionTokens}
+	}
+	return out
 }

@@ -29,6 +29,7 @@ type CreateRunInput struct {
 	Input          run.Input
 	Credential     *credential.Token // delegated gateway token, sealed before storage
 	FileTickets    *run.FileTickets  // the member's file tickets (D37), sealed before storage
+	RawHash        string            // digest of the request as sent (see FindReplayRaw); stored for the early replay check
 	RewriteUsage   *RewriteUsage     // the model call that rewrote the question (D66), counted as the run's step 0
 	CMICredential  *credential.Token // the member's CMI credential for the knowledge tools (D68), sealed before storage
 	TraceID        string
@@ -276,8 +277,8 @@ func (s *Store) CreateRun(ctx context.Context, tenant string, in CreateRunInput)
 				ctxPkg = in.ContextPackageID
 			}
 			if _, err := tx.Exec(ctx, `INSERT INTO runs (tenant_id, id, thread_id, agent_id, release_id, release_digest, owner, status, idempotency_key, request_sha256, input,
-			credential, credential_expires_at, trace_id, deadline_at, execution_ref, context_package_id, file_tickets, credential_refresh, traceparent, cmi_credential) VALUES ($1, $2, $3, $4, $5, $6, $7, 'QUEUED', $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)`,
-				tenant, runID, threadID, a.ID, releaseID, env.Digest, in.Owner, in.IdempotencyKey, hash, inputRaw, cred, credExp, trace, deadline, execRef, ctxPkg, tickets, credRefresh, traceparent, cmiCred); err != nil {
+			credential, credential_expires_at, trace_id, deadline_at, execution_ref, context_package_id, file_tickets, credential_refresh, traceparent, cmi_credential, request_raw_sha256, tokens_used) VALUES ($1, $2, $3, $4, $5, $6, $7, 'QUEUED', $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, nullif($21, ''), $22)`,
+				tenant, runID, threadID, a.ID, releaseID, env.Digest, in.Owner, in.IdempotencyKey, hash, inputRaw, cred, credExp, trace, deadline, execRef, ctxPkg, tickets, credRefresh, traceparent, cmiCred, in.RawHash, rewriteTokens(in.RewriteUsage)); err != nil {
 				if isUniqueViolation(err) {
 					if strings.Contains(constraintOf(err), "idempotency") {
 						return errRetry // the same request raced; the retry replays it
@@ -1180,7 +1181,7 @@ func (s *Store) CreateChildRun(ctx context.Context, c *run.Claim, in run.ChildRu
 				c.TenantID, childID, ag.ID, releaseID, env.Digest, parent.Owner, "sub:"+in.ToolCallID, hash, inputRaw, cred, exp, trace, deadline, execRef, parent.ID, parent.Depth+1, credRefresh, traceparent); err != nil {
 				return err
 			}
-			if doc.Definition.Context.HasKnowledgeTools() { // D68: the child's knowledge tools call the CMI as the same member
+			{ // D68: whoever holds or references the member's credential, its child references it too; the child's own release decides whether it has the tools
 				// D68: the child points at the run that holds the credential (the root's), not at a copy of it
 				if _, err := tx.Exec(ctx, `UPDATE runs SET cmi_credential_ref = (SELECT CASE WHEN cmi_credential IS NOT NULL THEN id ELSE cmi_credential_ref END FROM runs WHERE id = $2) WHERE id = $1`, childID, parent.ID); err != nil {
 					return err
@@ -1548,54 +1549,6 @@ func (s *Store) CMICredential(ctx context.Context, c *run.Claim) (*credential.To
 		}
 		out, err = s.openToken(sealed)
 		return err
-	})
-	return out, err
-}
-
-// RenewCMICredential renews the credential the claimed run uses (D68) under the row lock of the run that holds it, so that the
-// runs that share it (a root run and its sub-agents) never renew one refresh token twice: the one that gets the lock
-// finds, when the credential is no longer the one it saw, that another has renewed it and takes that; otherwise it calls renew
-// with the stored refresh token and stores the result. Fenced by the claim.
-func (s *Store) RenewCMICredential(ctx context.Context, c *run.Claim, seen *credential.Token, renew func(ctx context.Context, refreshToken string) (*credential.Token, error)) (*credential.Token, error) {
-	var out *credential.Token
-	err := s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
-		if _, err := s.owned(ctx, tx, c); err != nil {
-			return err
-		}
-		holder, err := credentialHolder(ctx, tx, c.RunID)
-		if err != nil {
-			return err
-		}
-		var sealed []byte
-		if err := tx.QueryRow(ctx, `SELECT cmi_credential FROM runs WHERE id = $1 FOR UPDATE`, holder).Scan(&sealed); err != nil {
-			return err
-		}
-		if len(sealed) == 0 {
-			return run.ErrCMICredentialUnusable
-		}
-		cur, err := s.openToken(sealed)
-		if err != nil {
-			return err
-		}
-		if seen != nil && cur.AccessToken != seen.AccessToken {
-			out = cur // renewed meanwhile by a run that shares it
-			return nil
-		}
-		tok, err := renew(ctx, cur.RefreshToken)
-		if err != nil {
-			return err
-		}
-		if tok.RefreshToken == "" {
-			tok.RefreshToken = cur.RefreshToken
-		}
-		if sealed, err = sealToken(s.Box, tok); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `UPDATE runs SET cmi_credential = $2 WHERE id = $1`, holder, sealed); err != nil {
-			return err
-		}
-		out = tok
-		return nil
 	})
 	return out, err
 }

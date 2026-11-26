@@ -18,6 +18,17 @@ type RewriteUsage struct {
 	LatencyMs                      int64
 }
 
+// rewriteTokens is what the rewrite's usage adds to the run's tokens_used, so that the run's own cap (MaxTokensPerRun) counts it.
+func rewriteTokens(u *RewriteUsage) int64 {
+	if u == nil {
+		return 0
+	}
+	return int64(u.PromptTokens + u.CompletionTokens)
+}
+
+// ErrThreadNotOwned: the thread exists and is another caller's.
+var ErrThreadNotOwned = errors.New("the thread belongs to another user")
+
 // requestHash is the digest an idempotent replay is compared by: the request without what is resolved afresh each time - the
 // CMI's items at the tail of the context (D32) and the query the rewrite made (D66).
 func requestHash(agentID string, in CreateRunInput) (string, error) {
@@ -104,7 +115,8 @@ func (s *Store) FindReplay(ctx context.Context, tenant string, in CreateRunInput
 }
 
 // ThreadMessages returns the stored messages of a thread of this owner, for the question rewrite (D66); none for a thread that does
-// not exist or is another's.
+// not exist, ErrThreadNotOwned for one that is another's: the request's messages are never taken as the history of a thread the
+// caller does not own.
 func (s *Store) ThreadMessages(ctx context.Context, tenant, owner, threadID string) ([]agui.Message, error) {
 	if threadID == "" {
 		return nil, nil
@@ -119,11 +131,80 @@ func (s *Store) ThreadMessages(ctx context.Context, tenant, owner, threadID stri
 			return err
 		}
 		if o != owner {
-			return nil
+			return ErrThreadNotOwned
 		}
 		var err error
 		out, err = threadMessages(ctx, tx, threadID)
 		return err
 	})
 	return out, err
+}
+
+// FindReplayRaw is the replay check made first of all (D69): the run of this thread, owner and key whose request, as the caller sent
+// it (rawHash), is the same, before the gateway is exchanged with or listed, a credential is exchanged, the question is rewritten or
+// anything is retrieved. A different request under the same key is a CONFLICT. A run created before the raw digest was kept has none and is
+// found later, by the digest of the whole request, as before.
+func (s *Store) FindReplayRaw(ctx context.Context, tenant, threadID, owner, key, rawHash string) (*run.Run, error) {
+	if threadID == "" || key == "" || rawHash == "" {
+		return nil, nil
+	}
+	var out *run.Run
+	err := s.InTenant(ctx, tenant, func(tx pgx.Tx) error {
+		existing, err := scanRun(tx.QueryRow(ctx, `SELECT `+runCols+` FROM runs WHERE thread_id = $1 AND owner = $2 AND idempotency_key = $3`, threadID, owner, key))
+		if err != nil {
+			if se := new(Error); errors.As(err, &se) {
+				return nil
+			}
+			return err
+		}
+		var stored *string
+		if err := tx.QueryRow(ctx, `SELECT request_raw_sha256 FROM runs WHERE id = $1`, existing.ID).Scan(&stored); err != nil {
+			return err
+		}
+		if stored == nil {
+			return nil
+		}
+		if *stored != rawHash {
+			return fail("CONFLICT", "Idempotency-Key was used for a different request")
+		}
+		out = existing
+		return attachSources(ctx, tx, out)
+	})
+	return out, err
+}
+
+// Preflight refuses what CreateRun would refuse for the thread, before anything is paid for (D69): a thread that is another user's
+// (FORBIDDEN), one bound to another agent (CONFLICT) and one with a run still in flight (CONFLICT). It writes nothing.
+func (s *Store) Preflight(ctx context.Context, tenant, threadID, owner, agentRef string) error {
+	if threadID == "" {
+		return nil
+	}
+	return s.InTenant(ctx, tenant, func(tx pgx.Tx) error {
+		a, err := getAgent(ctx, tx, agentRef, false)
+		if err != nil {
+			return err
+		}
+		var o string
+		var bound *string
+		if err := tx.QueryRow(ctx, `SELECT owner, agent_id::text FROM threads WHERE id = $1`, threadID).Scan(&o, &bound); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil
+			}
+			return err
+		}
+		if o != owner {
+			return fail("FORBIDDEN", "thread belongs to another user")
+		}
+		if bound != nil && *bound != a.ID {
+			return fail("CONFLICT", "thread is bound to another agent")
+		}
+		var active int
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM runs WHERE thread_id = $1 AND status IN `+activeStatuses, threadID).Scan(&active); err != nil {
+			return err
+		}
+		if active > 0 {
+			return fail("CONFLICT", "a run is still in progress on this thread")
+		}
+		return nil
+	})
 }

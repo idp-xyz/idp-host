@@ -1145,6 +1145,11 @@ func (t *turn) execute(tc run.ToolCall) (bool, error) {
 	if t.knowledgeOn(tc.Tool) {
 		return t.knowledgeCall(tc)
 	}
+	if strings.HasPrefix(tc.Tool, agent.KnowledgeToolPrefix) {
+		// a call of a knowledge tool this turn does not serve (it was confirmed or recorded in a turn that had the credential) is never
+		// sent anywhere: the prefix is the HOST's, and no gateway tool of that name is offered (D69)
+		return false, t.answer(tc, run.CallFailed, "", tc.Tool+" is not available to this run")
+	}
 	if t.gateway == nil {
 		return false, t.answer(tc, run.CallFailed, "", "no gateway configured")
 	}
@@ -2551,7 +2556,7 @@ func (t *turn) verifyContext() (bool, error) {
 				// (only a run that numbered its first package, or has the tools, numbers: a release without them sees the old text). The
 				// numbers the replaced entries had stay with the thread's earlier results; the new ones are not given again.
 				first := 0
-				if t.def.Context.HasKnowledgeTools() || t.rc.CitationNext > 0 {
+				if len(t.kTools) > 0 || t.rc.CitationNext > 0 {
 					first = t.citeNext
 				}
 				entries, next := cmiclient.ContextFrom(pkg.Items, first)
@@ -2599,6 +2604,9 @@ func (t *turn) mayResend(tc run.ToolCall) bool {
 	}
 	if tc.Tool == agent.ResourceReadTool && t.resources != nil {
 		return true
+	}
+	if strings.HasPrefix(tc.Tool, agent.KnowledgeToolPrefix) {
+		return t.knowledgeOn(tc.Tool) // only the HOST serves it, and only when it serves it; never a gateway tool
 	}
 	if t.knowledgeOn(tc.Tool) {
 		return true // it only reads: the CMI is asked again and the package of the call that was lost was never recorded (D65)

@@ -159,6 +159,24 @@ func (t *turn) cmiBearer(force bool, refused string) (string, error) {
 	if t.cmiFailed || tok == nil {
 		return "", errNoMemberCredential
 	}
+	// before each call the credential's holder is asked again (D69): a root run that ended or was canceled has cleared it, and a
+	// sub-agent must not go on with the token it read earlier; one renewed by another run is taken
+	if st, ok := h.Store.(cmiCredentials); ok {
+		cur, err := st.CMICredential(t.ctx, t.claim)
+		switch {
+		case errors.Is(err, run.ErrFenced):
+			return "", err
+		case err != nil || cur == nil:
+			t.cmiFailed = true
+			why := "cleared"
+			if err != nil {
+				why = sanitize(err)
+			}
+			h.Log.Warn("the member's CMI credential is gone; the knowledge tools stop for this turn", "run", t.claim.RunID, "why", why)
+			return "", errNoMemberCredential
+		}
+		t.cmiCred, tok = cur, cur
+	}
 	if force && tok.AccessToken != refused {
 		return tok.AccessToken, nil
 	}
@@ -223,8 +241,8 @@ func (t *turn) knowledgeCall(tc run.ToolCall) (bool, error) {
 		detail = map[string]any{"tool": tc.Tool}
 		call   func(bearer string) (*cmiclient.Package, error)
 	)
-	// the run's own ceiling goes to the CMI too (sensitivityCeiling); what the CMI answers is screened again below
-	ceiling := t.rc.Run.Input.ContextCeiling
+	// The ceiling is not sent to the CMI: it would filter what is above it out of the package, and the HOST could not record or say
+	// that anything was withheld (D44, D69). The HOST screens what comes back.
 	budget := &cmiclient.Budget{MaxTokens: min(max(t.limits.ToolResultBytes/4, 256), 32000)}
 	purpose := t.def.Context.Purpose
 	if purpose == "" {
@@ -234,7 +252,7 @@ func (t *turn) knowledgeCall(tc run.ToolCall) (bool, error) {
 	case agent.KnowledgeSearchTool:
 		var req cmiclient.Request
 		if req, err = parseSearch(tc.Arguments, h.Now()); err == nil {
-			req.Purpose, req.Kinds, req.Sources, req.SensitivityCeiling = purpose, []string{"knowledge"}, t.def.Context.Sources, ceiling
+			req.Purpose, req.Kinds, req.Sources = purpose, []string{"knowledge"}, t.def.Context.Sources
 			req.Budget = &struct {
 				MaxTokens int `json:"maxTokens,omitempty"`
 				MaxItems  int `json:"maxItems,omitempty"`
@@ -245,7 +263,7 @@ func (t *turn) knowledgeCall(tc run.ToolCall) (bool, error) {
 	case agent.KnowledgeReadTool:
 		var req cmiclient.ReadRequest
 		if req, err = parseRead(tc.Arguments); err == nil {
-			req.Purpose, req.Budget, req.SensitivityCeiling = purpose, budget, ceiling
+			req.Purpose, req.Budget, req.Sources = purpose, budget, t.def.Context.Sources
 			detail["documentId"] = req.DocumentID
 			if req.Locator != nil {
 				detail["locator"] = req.Locator
@@ -255,7 +273,7 @@ func (t *turn) knowledgeCall(tc run.ToolCall) (bool, error) {
 	case agent.KnowledgeFindTool:
 		var req cmiclient.FindRequest
 		if req, err = parseFind(tc.Arguments); err == nil {
-			req.Purpose, req.Budget, req.SensitivityCeiling = purpose, budget, ceiling
+			req.Purpose, req.Budget, req.Sources = purpose, budget, t.def.Context.Sources
 			detail["documentId"], detail["text"] = req.DocumentID, req.Text
 			call = func(b string) (*cmiclient.Package, error) { return h.CMI.Find(t.callCtx, b, req) }
 		}
@@ -329,10 +347,10 @@ func (t *turn) knowledgePackage(tool string, pkg *cmiclient.Package, detail map[
 	// D44: the run was created under the rule, with this ceiling. A run that is screened (it has outward tools) but has no ceiling
 	// recorded fails closed: the ceiling is unusable and nothing passes.
 	if ceiling := t.rc.Run.Input.ContextCeiling; ceiling != "" || t.rc.Run.Input.ExternalTools {
-		if ceiling == "" {
-			ceiling = "none" // not a level: Screen lets nothing through (an empty one would read as internal)
-		}
 		s := cmiclient.Screen(items, ceiling)
+		if ceiling == "" { // no ceiling was recorded: nothing can be judged, and the note and the event say so (an empty one would read as internal)
+			s = cmiclient.ScreenAll(items)
+		}
 		items, screened = s.Kept, &s
 	}
 	first := t.citeNext

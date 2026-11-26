@@ -167,6 +167,17 @@ func (s *Server) handle(f answerer) http.HandlerFunc {
 			problem(w, st, "FAKE")
 			return
 		}
+		// sensitivityCeiling is a visibility filter in the real CMI (idp.telos.cmi): what is above it is not in the package and is not
+		// counted anywhere. A HOST that sent it could neither record nor say that anything was withheld.
+		if c, _ := body["sensitivityCeiling"].(string); c != "" {
+			kept := items[:0:0]
+			for _, it := range items {
+				if rank[it["sensitivity"].(string)] <= rank[c] {
+					kept = append(kept, it)
+				}
+			}
+			items = kept
+		}
 		s.mu.Lock()
 		s.n++
 		id := fmt.Sprintf("pkg_fake_%d", s.n)
@@ -181,6 +192,18 @@ func (s *Server) handle(f answerer) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"packageId": id, "digest": "sha256:" + hex.EncodeToString(sum[:]), "package": pkg})
 	}
+}
+
+var rank = map[string]int{"public": 0, "internal": 1, "confidential": 2, "restricted": 3}
+
+// inSources says whether a document of this source is within the request's sources (read and find: outside them it is a 404, as
+// a document that is not visible is).
+func inSources(body map[string]any, source string) bool {
+	v, ok := body["sources"]
+	if !ok {
+		return true
+	}
+	return has(strs(v), source)
 }
 
 func usedTokens(items []map[string]any) int {
@@ -350,7 +373,7 @@ func hit(l, want Locator) bool {
 func (s *Server) read(sub string, body map[string]any) ([]map[string]any, map[string]int, string, int) {
 	id, _ := body["documentId"].(string)
 	d, ok := s.doc(id, sub)
-	if !ok {
+	if !ok || !inSources(body, d.Source) {
 		return nil, nil, "", http.StatusNotFound
 	}
 	around := 1
@@ -412,7 +435,7 @@ func norm(s string) string {
 func (s *Server) find(sub string, body map[string]any) ([]map[string]any, map[string]int, string, int) {
 	id, _ := body["documentId"].(string)
 	d, ok := s.doc(id, sub)
-	if !ok {
+	if !ok || !inSources(body, d.Source) {
 		return nil, nil, "", http.StatusNotFound
 	}
 	text, _ := body["text"].(string)

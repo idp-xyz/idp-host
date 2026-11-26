@@ -1725,3 +1725,40 @@ HOST 一侧的 KB8。CMI 一侧（`context/read`、`context/find`、解析的 `k
 D65–D68 的各行在这次修订后的代码上也重新跑过，全部仍然失败；有两处测试名变了：第一行"没有退路"现在由 `TestARenewalThatFailedIsNotTriedAgainInTheTurn` 与上面的"工具只提供给持有成员令牌的运行"挡住（没有令牌的运行根本没有工具）；"工具结果一律不可信"由 `TestAKnowledgeResultIsWrappedAsUntrustedWhateverTheReleaseSays` 与线程历史那一行共同挡住（单独拿掉 `hasKnowledgeTools` 时测试仍过，因为线程里已有调用，`historyHasKnowledge` 也成立：两条是同一条规则的两个入口，所以按一起拿掉的算）。
 
 **平台验收还要查（补）：** `IDP_HOST_MEMBER_ROLES=ws-member,ws-admin` 配好；服务账号（只有写死的角色）与 A2A 对端没有工具、`runs.cmi_credential` 为空；子 agent 运行的 `cmi_credential_ref` 指向根运行，续期一次；轮换 `IDP_HOST_CREDENTIAL_KEY` 后在途运行照常做完；重放的创建请求没有第二次改写；改写的 token 出现在 `idp_host` 的用量里；`providers[].reasoningEffort` 只在声明过的提供者上设。
+
+
+**D69 补充（2026-11-26，第二轮评审后，决策人委托维护方决定）**
+
+| # | 决策（决策人委托维护方决定） | 理由 |
+|---|---|---|
+| D69-9 | **不会为 CreateRun 会拒绝的请求调模型（第二次评审，决策人委托维护方决定）。** 在交换令牌、读网关目录（D51）、缺钥匙的 409、改写与首次解析**之前**，依次做：(a) 幂等重放：按调用方发来的请求本身算的摘要（`rawRequestHash`：消息、工具、上下文、选项、发布件，不含附件票据，也不含从网关目录与 CMI 得来的东西）比对已存的运行，同一把键同一请求返回已存的运行，不同的请求 409（`Store.FindReplayRaw`，迁移 0016 的 `request_raw_sha256`；更早创建的运行没有这个摘要，仍由后面的整体摘要找到）；(b) 线程预检（`Store.Preflight`）：线程是别人的 403、绑在别的 agent 上 409、线程上还有在途的运行 409。线程不是调用者的时，`rewriteHistory` 绝不把请求里的消息当成它的前文（`ErrThreadNotOwned`）。 | 改写是一次模型调用；不该在注定被拒的请求上花。 |
+| D69-10 | **不把敏感上限传给 CMI（撤销 D69-3 的一半）。** CMI 把 `sensitivityCeiling` 当可见性过滤：高于它的条目悄悄不在包里，HOST 就记不到 `context.withheld`，也没法告诉模型扣下了几条。HOST 自己按 D44 筛。`fakecmi` 与真实 CMI 一样当过滤用，传了就会让测试看不到被扣下的条目。 | 筛选要留下记录，也要让模型知道。 |
+| D69-11 | **没有上限时的专门标记。** 有对外工具而没有记下上限的运行，知识工具的结果全部扣下，用 `Screening.NoCeiling`（`ScreenAll`，同 `InheritedEvent` 把级别记为 unknown）：事件带 `noCeiling: true`、`ceiling: ""`，给模型的话说"适用于这次运行的上限不知道，所以一条也没法判断"，**从不**说某条"高于上限"，也不再用假的级别 `none`。 | 假的级别会在说明里写出 "the limit is none"，把公开的条目说成超限。 |
+| D69-12 | **不被这个服务拿走的调用。** 一个 `knowledge__` 开头的调用，如果这一回合不提供工具（没有令牌），无论它是什么状态（CONFIRMED、中断后重发），`execute` 都答"not available"，**从不**交给网关，`mayResend` 对它也只在 HOST 自己提供时才为真，网关标注为可重复也不行。网关里有同名的工具也是这样（前缀归 HOST，列工具时本来就不提供它）。 | 评审的探针：一个带着 CONFIRMED 的知识调用进了没有令牌的回合，走到了网关。 |
+| D69-13 | **令牌不被子运行悄悄多用，也不被悄悄丢掉。** (a) 子运行总是引用父运行持有或引用的那一份（不看子运行自己的发布件有没有工具；工具提供与否仍按各回合自己的发布件与令牌），所以工具少一层的子 agent 后面的孙子也有令牌（三层有测试）；(b) 每次知识调用之前再问一次持有者的那一行（`CMICredential`）：根运行结束或被取消清掉了令牌，子运行就不再用内存里的旧令牌，这一回合的工具到此为止；别的运行续期过的，用新的；(c) 续期单飞：持有者那一行上一个短的续期租约（`cmi_renewing_until`，条件 UPDATE），拿到租约的运行**不持任何行锁**去调授权服务器，之后用比较并交换写回（令牌在这期间被清了，不写回，已被清的令牌不会复活）；没拿到租约的运行用手里仍然有效的令牌，过期了就稍等再看。需要同时锁持有者与自己那两行的短事务，先锁持有者再锁自己（取消先锁根）。子运行的心跳与根运行的取消在续期进行时不被挡住（有测试）。**没有证明的一点：**拿掉"先锁根再锁子"的顺序没有测试，只靠这段代码与事务都很短。 | 长事务里夹着对外的调用，会让心跳与取消等在授权服务器后面。 |
+| D69-14 | **`read`、`find` 把 `context.sources` 交给 CMI**（CMI 在 SQL 里作可见谓词，范围外的文档答 404）；HOST 自己丢条目的那一层留作兜底。 | CMI 的 2026-11-26 说明。 |
+| D69-15 | **编号看令牌，不看发布件。** 运行开头那个包的知识条目只在运行真的保存或引用着成员令牌（成员、非 A2A、令牌交换成功）时才编号；`onStale = refresh` 只在这一回合提供工具或已编过号时编号。没有令牌的运行看到的文字与 KB8 之前一字不差，即使它的发布件开了工具。 | 工具没提供的运行不该有只对工具有意义的编号。 |
+| D69-16 | **改写的账更全。** 改写的 token 同时记进 `runs.tokens_used`（所以 `maxTokensPerRun` 把它算在内）；一个候选在报告了用量之后失败的，那份用量也记给运行（`RewriteUsage` 是各候选之和）。读租户策略失败时**不改写**，用原话（失败关闭）。 | D15 的预算要把这次模型调用算进去。 |
+| D69-17 | **成员角色可以包括 `ws-admin`。** 读别的成员的个人库，CMI 现在要请求里明确点名那位成员的 `subject` 作用域，并且调用者有权点名；HOST 的三个工具从不点名，所以持 `ws-admin` 的成员替他干活的模型也读不到别人的个人库。平台设 `IDP_HOST_MEMBER_ROLES=ws-member,ws-admin` 是安全的。 | CMI 2026-11-26 说明。 |
+
+拿掉一个控制、看测试失败（同上的做法，在这次修订后的代码上，每一行都跑了）
+
+| 控制 | 拿掉的东西 | 失败的测试 |
+|---|---|---|
+| 不把上限传给 CMI（D69-10） | 三个调用传 `sensitivityCeiling` | `TestACeilingWithholdsTheItemsAboveItFromTheToolResultsAndRecordsIt`、`TestTheCeilingIsNotSentToTheCMIAndWhatIsAboveItIsStillWithheldAndSaid`（`fakecmi` 当过滤用，传了就看不到被扣下的） |
+| 知识调用不到网关（D69-12） | `execute` 去掉前缀的拦截 | `TestAConfirmedKnowledgeCallInATurnWithoutTheToolsNeverGoesToTheGateway`（网关里有同名工具，调用不得到达） |
+| 没有提供就不重发 | `mayResend` 看网关的可重复标注 | 同上、`TestAKnowledgeCallThatWasInProgressWhenAWorkerStoppedIsSentAgain` |
+| 线程预检（D69-9） | 去掉 `Preflight` | `TestTheQuestionRewriteOnPostgres`（忙线程与别人的线程，没有模型调用） |
+| 不是调用者的线程没有前文 | `ThreadMessages` 不报 `ErrThreadNotOwned` | 同上 |
+| 重放先于网关目录与令牌交换（D69-9） | 早的检查不做 | `TestAReplayIsFoundBeforeAnythingIsListedOrExchangedOnPostgres` |
+| 子运行总是引用（D69-13 a） | 只在子运行的发布件有工具时引用 | `TestTheMemberCredentialOfARunOnPostgres`（三层子例） |
+| 续期单飞（D69-13 c） | 去掉租约条件 | `TestTheMemberCredentialOfARunOnPostgres`（四个同时续期：授权服务器被调了不止一次，测试在 150 秒的限时内没有结束，也算失败） |
+| 续期写回用比较并交换 | 去掉比较 | 同上（续期进行时根被取消，令牌复活了） |
+| 每次调用前问持有者（D69-13 b） | 不再问 | `TestAClearedCredentialStopsTheChildsCallsAtOnce`（这条测试还发现了 `sanitize(nil)` 的空指针，已修） |
+| 编号看令牌（D69-15） | 看发布件 | `TestOnlyMembersGetTheKnowledgeToolsOnPostgres` |
+| 没有上限的专门标记（D69-11） | 改回假级别 `none` | `TestARunThatIsScreenedButHasNoCeilingFailsClosed` |
+| `read`、`find` 交 `sources`（D69-14） | 不交 | `TestReadAndFindHonourTheReleasesSourcesAndAnswerAsNotFound` |
+| 改写的 token 记进 `tokens_used`（D69-16） | 记 0 | `TestTheQuestionRewriteOnPostgres` |
+| 失败的候选的用量也记（D69-16） | 不累加 | `TestACandidateThatFailedAfterReportingUsageIsStillChargedFor` |
+
+**没有测试的两处（如实写下）：**读租户策略失败时不改写（D69-16）——要给存储注入故障才测得到；先锁根再锁子的顺序（D69-13）。**平台验收补充：** `IDP_HOST_MEMBER_ROLES=ws-member,ws-admin`；两个带着相同键的创建请求只产生一个运行，且第二次没有读网关目录、没有换令牌、没有模型调用；`context.withheld` 在带外部工具的运行里仍然出现（CMI 没有被传上限）；`cmi_renewing_until` 在续期之外为空。

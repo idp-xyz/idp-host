@@ -12,17 +12,19 @@ type ReadRequest struct {
 	Purpose            string   `json:"purpose"`
 	AsOf               *AsOf    `json:"asOf,omitempty"`
 	SensitivityCeiling string   `json:"sensitivityCeiling,omitempty"`
+	Sources            []string `json:"sources,omitempty"` // the release's context.sources: the CMI answers 404 for a document outside them
 }
 
 // FindRequest is the body of POST /v1/context/find: the blocks of one document that hold the text.
 type FindRequest struct {
-	DocumentID         string  `json:"documentId"`
-	Text               string  `json:"text"`
-	MaxHits            int     `json:"maxHits,omitempty"`
-	Budget             *Budget `json:"budget,omitempty"`
-	Purpose            string  `json:"purpose"`
-	AsOf               *AsOf   `json:"asOf,omitempty"`
-	SensitivityCeiling string  `json:"sensitivityCeiling,omitempty"`
+	DocumentID         string   `json:"documentId"`
+	Text               string   `json:"text"`
+	MaxHits            int      `json:"maxHits,omitempty"`
+	Budget             *Budget  `json:"budget,omitempty"`
+	Purpose            string   `json:"purpose"`
+	AsOf               *AsOf    `json:"asOf,omitempty"`
+	SensitivityCeiling string   `json:"sensitivityCeiling,omitempty"`
+	Sources            []string `json:"sources,omitempty"`
 }
 
 // Budget bounds a package.
