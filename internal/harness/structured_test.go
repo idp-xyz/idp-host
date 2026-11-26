@@ -227,7 +227,7 @@ func TestAMaximumSizeReadGoesThroughD40AsTheTextTheModelIsGiven(t *testing.T) {
 	if err := e2.h.Run(context.Background(), claim); err != nil {
 		t.Fatal(err)
 	}
-	if got := toolMessages2(m2)[0].Content; len(got) > 4<<10+100 || !strings.Contains(got, "[truncated:") || !strings.HasPrefix(got, "[1] ") {
+	if got := toolMessages2(m2)[0].Content; len(got) > 4<<10 || !strings.Contains(got, "the rest: web_fetch with offset") || !strings.HasPrefix(got, "[1] ") {
 		t.Errorf("%d bytes", len(got))
 	}
 }

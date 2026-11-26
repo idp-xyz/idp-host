@@ -18,11 +18,12 @@ import (
 
 // Bounds on what is recorded (D49).
 const (
-	MaxSources    = 100       // web sources of one run, and knowledge sources of one run, each; beyond that entries are dropped and counted
-	MaxSourceN    = 1_000_000 // the largest citation number taken as sane: idp-web numbers per caller and keeps counting
-	MaxSourceURL  = 2048      // bytes of an address
-	MaxSourceText = 300       // runes of a title
-	maxScanned    = 100       // entries read from one tool result; the rest are counted as over the limit
+	MaxCitationList = 100       // numbers listed in unlistedCitations
+	MaxSources      = 100       // web sources of one run, and knowledge sources of one run, each; beyond that entries are dropped and counted
+	MaxSourceN      = 1_000_000 // the largest citation number taken as sane: idp-web numbers per caller and keeps counting
+	MaxSourceURL    = 2048      // bytes of an address
+	MaxSourceText   = 300       // runes of a title
+	maxScanned      = 100       // entries read from one tool result; the rest are counted as over the limit
 )
 
 // Kinds of source (D70). A source recorded before D70 has no kind and is a web source.
@@ -48,6 +49,7 @@ type Source struct {
 	DocumentID string `json:"documentId,omitempty"`
 	Where      string `json:"where,omitempty"`
 	Origin     string `json:"source,omitempty"` // a knowledge source: the CMI source the document comes from
+	Digest     string `json:"digest,omitempty"` // a knowledge source: a digest of the passage's text, so that the same place with other text is another passage
 	Cited      bool   `json:"cited"`
 }
 
@@ -193,8 +195,8 @@ func validURL(s string) bool {
 		return false
 	}
 	for _, r := range s {
-		if r <= ' ' || unicode.IsControl(r) || unicode.IsSpace(r) {
-			return false
+		if r <= ' ' || unicode.IsControl(r) || unicode.IsSpace(r) || unicode.Is(unicode.Cf, r) {
+			return false // a control, bidirectional or other invisible format character can make an address read as another one
 		}
 	}
 	u, err := url.Parse(s)
@@ -317,7 +319,8 @@ func (s *SourceSet) checkKnowing(answer string, given int) {
 		s.Items[i].Cited = false
 		known[s.Items[i].N] = i
 	}
-	cited, unknown := CitationMarks(answer, func(n int) bool { _, ok := known[n]; return ok || (n >= 1 && n <= given) })
+	inList := func(n int) bool { _, ok := known[n]; return ok }
+	cited, unknown := CitationMarksIn(answer, func(n int) bool { return inList(n) || (n >= 1 && n <= given) }, inList)
 	for _, n := range cited {
 		if i, ok := known[n]; ok {
 			s.Items[i].Cited = true
@@ -327,9 +330,16 @@ func (s *SourceSet) checkKnowing(answer string, given int) {
 	s.Unverified = unknown
 	s.Unlisted = nil
 	for _, n := range cited {
-		if _, ok := known[n]; !ok {
+		if !inList(n) {
 			s.Unlisted = append(s.Unlisted, n)
 		}
+	}
+	// the lists are bounded as the contract says: the smallest numbers are kept
+	if len(s.Unlisted) > MaxCitationList {
+		s.Unlisted = s.Unlisted[:MaxCitationList]
+	}
+	if len(s.Unverified) > MaxCitationList {
+		s.Unverified = s.Unverified[:MaxCitationList]
 	}
 }
 
@@ -371,12 +381,20 @@ const maxUnverifiedDigits = 3
 //     is two marks. A range such as [1-3] is not a mark.
 //   - Not marks, whatever the numbers: anything inside a code block (fenced or inline); [n](...) and [n][...] preceded
 //     by a bracketed text, which are Markdown links; [x], [2026], [ ] and anything else that is not made of those numbers.
-//   - A group glued to an ASCII letter, digit or underscore ("array[1]", "word[3]") is an index and never a citation, whether or not
-//     a source has that number. One glued to other text (CJK: "文档[3]") is a citation. A number of more than three digits is never
-//     reported as unknown.
+//   - A group glued to an ASCII letter, digit or underscore ("array[1]", "true[1].", "2024[3]", and the marks that follow it:
+//     "growth[1][2]") is a citation only when the run's own lists hold a source of that number (listed); it is never one through the
+//     thread's counter (known) and never reported as unknown. One glued to other text (CJK: "文档[3]") is a citation like any other.
+//     A number of more than three digits is never reported as unknown.
 func CitationMarks(answer string, known func(int) bool) (cited, unknown []int) {
+	return CitationMarksIn(answer, known, known)
+}
+
+// CitationMarksIn is CitationMarks with two notions of "known": given says the thread gave the number (a mark of its own is a citation
+// if it is, and unknown if it is not), listed says the run's own lists hold its source (the only thing that makes a number glued to a word a citation).
+func CitationMarksIn(answer string, known, listed func(int) bool) (cited, unknown []int) {
 	text := withoutCode(answer)
 	seenCited, seenUnknown := map[int]bool{}, map[int]bool{}
+	prevEnd, prevGlued := -1, false
 	for _, loc := range markRE.FindAllStringSubmatchIndex(text, -1) {
 		start, end := loc[0], loc[1]
 		if end < len(text) && text[end] == '(' {
@@ -389,19 +407,24 @@ func CitationMarks(answer string, known func(int) bool) (cited, unknown []int) {
 				if !followsNumericMark(text, start) {
 					continue // [text][1]: a reference link
 				}
+				glued = start == prevEnd && prevGlued // growth[1][2]: the second mark goes with the first
 			case prev >= 'a' && prev <= 'z' || prev >= 'A' && prev <= 'Z' || prev >= '0' && prev <= '9' || prev == '_':
 				glued = true
 			}
 		}
-		if glued {
-			continue // array[3], word[3]: an index, not a citation, whatever is numbered 3
-		}
+		prevEnd, prevGlued = end, glued
 		for _, f := range strings.FieldsFunc(text[loc[2]:loc[3]], func(r rune) bool { return r == ',' || r == ' ' || r == '\t' }) {
 			n, err := strconv.Atoi(f)
 			if err != nil {
 				continue
 			}
 			switch {
+			case glued:
+				// true[1], 2024[3]: an index or a footnote reference more often than a citation. It counts only when the run's own lists hold
+				// a source of that number, and is never reported, whatever the thread gave
+				if listed(n) {
+					seenCited[n] = true
+				}
 			case known(n):
 				seenCited[n] = true
 			case len(f) <= maxUnverifiedDigits:

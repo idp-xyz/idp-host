@@ -120,9 +120,10 @@ func (n nestedKeys) check(raw json.RawMessage) error {
 	return nil
 }
 
-// restoreBrackets undoes what the HOST did to a heading, a sheet name or a text it showed the model (D72): the model writes the heading as it
-// read it, "Annex ⟦2⟧", and the CMI knows it as "Annex [2]". The residual ambiguity is a document whose own text has ⟦ or ⟧, which is rare;
-// such a heading is asked for with brackets and not found.
+// restoreBrackets is the fallback of undoing what the HOST did to a heading, a sheet name or a text it showed the model (D72): the model
+// writes the heading as it read it, "Annex ⟦2⟧", and the CMI knows it as "Annex [2]". It is used for what the HOST has no record of showing
+// (turn.restore knows the exact original of the headings and sheets it did show, whatever brackets they had). The residual ambiguity is a
+// document whose own text has ⟦ or ⟧, which is rare; such a heading is asked for with brackets and not found.
 func restoreBrackets(s string) string { return strings.NewReplacer("⟦", "[", "⟧", "]").Replace(s) }
 
 func clip(s string, n int) string {
@@ -304,14 +305,12 @@ func parseRead(raw string) (cmiclient.ReadRequest, error) {
 				return req, refuse("locator.headings entries must be headings of at most %d characters", maxHeadingRunes)
 			}
 		}
-		for _, h := range l.Headings {
-			out.Headings = append(out.Headings, restoreBrackets(h))
-		}
+		out.Headings = l.Headings
 	default:
 		if strings.TrimSpace(*l.Sheet) == "" || !plainText(*l.Sheet) || utf8.RuneCountInString(*l.Sheet) > maxSheetRunes {
 			return req, refuse("locator.sheet must be a sheet name of at most %d characters", maxSheetRunes)
 		}
-		out.Sheet = restoreBrackets(*l.Sheet)
+		out.Sheet = *l.Sheet
 		if l.Range != nil {
 			if !cellRangeRE.MatchString(*l.Range) {
 				return req, refuse("locator.range must be a cell range such as A12:F40")
@@ -343,5 +342,5 @@ func parseFind(raw string) (cmiclient.FindRequest, error) {
 	if err != nil {
 		return cmiclient.FindRequest{}, err
 	}
-	return cmiclient.FindRequest{DocumentID: id, Text: restoreBrackets(text)}, nil
+	return cmiclient.FindRequest{DocumentID: id, Text: text}, nil
 }

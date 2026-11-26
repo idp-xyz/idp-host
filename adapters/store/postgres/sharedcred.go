@@ -214,12 +214,20 @@ func (s *Store) renewShared(ctx context.Context, c *run.Claim, k credKind, seen 
 			if err := s.dropRenewal(context.WithoutCancel(ctx), c, k, holder, token); err != nil && !errors.Is(err, run.ErrFenced) {
 				return nil, err
 			}
+			// the authorization server refused, or could not be reached: another run of the tree may have renewed meanwhile (with a rotating
+			// refresh token that is why this one was refused), and its credential is the answer
+			if f := s.fresher(ctx, c, k, cur); f != nil {
+				return f, nil
+			}
 			return nil, rerr
 		}
 		if next.RefreshToken == "" {
 			next.RefreshToken = cur.RefreshToken
 		}
 		if err := s.storeRenewed(context.WithoutCancel(ctx), c, k, holder, snap.sealed, token, next); err != nil {
+			if f := s.fresher(ctx, c, k, cur); f != nil { // the credential changed under the write: whoever changed it renewed first
+				return f, nil
+			}
 			return nil, err
 		}
 		return next, nil
@@ -308,4 +316,28 @@ func (s *Store) storeRenewed(ctx context.Context, c *run.Claim, k credKind, hold
 		return k.gone()
 	}
 	return err
+}
+
+// fresher is the credential the holder has now when it is not the one cur this run started with (another run of the tree stored it), nil
+// when there is none, or the credential is gone, or the wait was cancelled. Read without a lock.
+func (s *Store) fresher(ctx context.Context, c *run.Claim, k credKind, cur *credential.Token) *credential.Token {
+	if ctx.Err() != nil || cur == nil {
+		return nil
+	}
+	var snap credSnap
+	err := s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
+		holder, err := holderOf(ctx, tx, k, c.RunID)
+		if err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT `+k.cols+` FROM runs WHERE id = $1`, holder).Scan(k.dests(&snap)...)
+	})
+	if err != nil || len(snap.sealed) == 0 {
+		return nil
+	}
+	now, err := k.open(s, snap)
+	if err != nil || now == nil || now.AccessToken == cur.AccessToken {
+		return nil
+	}
+	return now
 }

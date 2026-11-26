@@ -14,7 +14,7 @@ CREATE TABLE citation_counters (
   tenant_id uuid NOT NULL REFERENCES tenants(id),
   thread_id text NOT NULL,
   next      integer NOT NULL DEFAULT 1 CHECK (next >= 1),
-  known     jsonb NOT NULL DEFAULT '{}'::jsonb,
+  known_count integer NOT NULL DEFAULT 0,
   PRIMARY KEY (tenant_id, thread_id),
   FOREIGN KEY (tenant_id, thread_id) REFERENCES threads (tenant_id, id)
 );
@@ -22,6 +22,19 @@ ALTER TABLE citation_counters ENABLE ROW LEVEL SECURITY;
 ALTER TABLE citation_counters FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_rows ON citation_counters USING (tenant_id = current_tenant()) WITH CHECK (tenant_id = current_tenant());
 GRANT SELECT, INSERT, UPDATE ON citation_counters TO idp_host_app;
+
+CREATE TABLE citation_known (
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  thread_id text NOT NULL,
+  key       text NOT NULL,
+  n         integer NOT NULL CHECK (n >= 1),
+  PRIMARY KEY (tenant_id, thread_id, key),
+  FOREIGN KEY (tenant_id, thread_id) REFERENCES threads (tenant_id, id)
+);
+ALTER TABLE citation_known ENABLE ROW LEVEL SECURITY;
+ALTER TABLE citation_known FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_rows ON citation_known USING (tenant_id = current_tenant()) WITH CHECK (tenant_id = current_tenant());
+GRANT SELECT, INSERT ON citation_known TO idp_host_app;
 
 ALTER TABLE runs ADD COLUMN credential_ref text;
 ALTER TABLE runs ADD COLUMN credential_renewing_until timestamptz;

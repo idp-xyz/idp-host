@@ -169,7 +169,7 @@ func TestAMaximumSizeReadIsLimitedAsWhatTheModelIsGivenNotAsTheRawResult(t *test
 	}
 	// under a smaller limit it is cut and says so, and still carries the HOST's number
 	r = st.Render("web_fetch", 1, nil, 4<<10)
-	if len(r.Text) > 4<<10+80 || !strings.HasPrefix(r.Text, "[1] ") || !strings.Contains(r.Text, "[truncated:") {
+	if len(r.Text) > 4<<10 || !strings.HasPrefix(r.Text, "[1] ") || !strings.Contains(r.Text, "the rest: web_fetch with offset") || strings.Contains(r.Text, "[truncated") {
 		t.Errorf("%d bytes", len(r.Text))
 	}
 	// a search that would pass the limit shows the blocks that fit and numbers only those
@@ -178,7 +178,7 @@ func TestAMaximumSizeReadIsLimitedAsWhatTheModelIsGivenNotAsTheRawResult(t *test
 		items = append(items, searchItem(i, fmt.Sprintf("https://a.example/%d", i), map[string]any{"excerpt": strings.Repeat("e", 600)}))
 	}
 	r = structuredOf(t, idpWebSearchSchema, doc(items...)).Render("web_search", 1, nil, 4<<10)
-	if r.NotShown == 0 || r.Used != len(r.Sources) || len(r.Text) > 4<<10+200 || r.Used+r.NotShown != 30 {
+	if r.NotShown == 0 || r.Used != len(r.Sources) || len(r.Text) > 4<<10 || r.Used+r.NotShown != 30 {
 		t.Errorf("shown %d, not shown %d, %d bytes", r.Used, r.NotShown, len(r.Text))
 	}
 }

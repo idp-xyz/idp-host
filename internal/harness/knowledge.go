@@ -93,6 +93,49 @@ func (t *turn) setupKnowledge() error {
 	return nil
 }
 
+// ambiguousShown marks a displayed heading that two different originals share (〖2〗 and \[2\] both read ⟦2⟧): it is not restored by the map.
+const ambiguousShown = "\x00"
+
+// rememberShown records, for the headings and the sheet of a passage the model is shown, what it reads (neutralised) and what the document
+// wrote, so that the heading the model sends back goes to the CMI exactly as written (D82).
+func (t *turn) rememberShown(it cmiclient.Item) {
+	if it.Locator == nil {
+		return
+	}
+	add := func(original string) {
+		if shown, n := run.Neutralise(original); n > 0 {
+			t.shownMu.Lock()
+			defer t.shownMu.Unlock()
+			if t.shown == nil {
+				t.shown = map[string]string{}
+			}
+			if prev, ok := t.shown[shown]; ok && prev != original {
+				t.shown[shown] = ambiguousShown
+			} else {
+				t.shown[shown] = original
+			}
+		}
+	}
+	for _, h := range it.Locator.Headings {
+		add(oneLine(h, 200))
+	}
+	if it.Locator.Sheet != "" {
+		add(oneLine(it.Locator.Sheet, 128))
+	}
+}
+
+// restore is a heading, sheet or text the model sent as the CMI knows it: the exact original when the HOST showed it, else the brackets
+// ⟦ ⟧ turned back into [ ].
+func (t *turn) restore(s string) string {
+	t.shownMu.Lock()
+	o, ok := t.shown[s]
+	t.shownMu.Unlock()
+	if ok && o != ambiguousShown {
+		return o
+	}
+	return restoreBrackets(s)
+}
+
 // knowledgeEnabled lists the knowledge tools this turn offers (setupKnowledge).
 func (t *turn) knowledgeEnabled() []string { return t.kTools }
 
@@ -138,11 +181,12 @@ func (t *turn) contextNumbered() bool {
 	return false
 }
 
-// numbering reports whether this turn's run numbers citations: it has the knowledge tools, its first package was numbered, or its
-// release has an outward tool. What a tool or a remote agent returns is neutralised in such a run (D72), so that no text of a page, a
+// numbering reports whether this turn's run numbers citations: it has the knowledge tools, its first package was numbered, its release has
+// an outward tool, or its thread has given numbers already (D77: the model reads the whole thread, so every run of it is in the same case,
+// even one whose release has lost the tools). What a tool or a remote agent returns is neutralised in such a run (D72), so that no text of a page, a
 // document, a file or a remote agent can put a number of its own where the HOST's are.
 func (t *turn) numbering() bool {
-	return len(t.kTools) > 0 || t.contextNumbered() || len(t.external) > 0
+	return len(t.kTools) > 0 || t.contextNumbered() || len(t.external) > 0 || t.rc.ThreadNumbered
 }
 
 // errNoMemberCredential: the run has no credential to call the CMI with, or it cannot be used.
@@ -154,8 +198,10 @@ var errNoMemberCredential = errors.New("no usable credential for the knowledge s
 // turn (errNoMemberCredential, sticky as the gateway's credErr is) and the tool answers that the knowledge service is not available.
 func (t *turn) cmiBearer(force bool, refused string) (string, error) {
 	h := t.h
-	t.credMu.Lock()
-	defer t.credMu.Unlock()
+	if err := t.cmiMu.lock(t.callCtx); err != nil {
+		return "", err
+	}
+	defer t.cmiMu.unlock()
 	tok := t.cmiCred
 	if t.cmiFailed || tok == nil {
 		return "", errNoMemberCredential
@@ -265,6 +311,12 @@ func (t *turn) knowledgeCall(tc run.ToolCall) (bool, error) {
 		var req cmiclient.ReadRequest
 		if req, err = parseRead(tc.Arguments); err == nil {
 			req.Purpose, req.Budget, req.Sources = purpose, budget, t.def.Context.Sources
+			if req.Locator != nil {
+				for i, h := range req.Locator.Headings {
+					req.Locator.Headings[i] = t.restore(h)
+				}
+				req.Locator.Sheet = t.restore(req.Locator.Sheet)
+			}
 			detail["documentId"] = req.DocumentID
 			if req.Locator != nil {
 				detail["locator"] = req.Locator
@@ -275,6 +327,7 @@ func (t *turn) knowledgeCall(tc run.ToolCall) (bool, error) {
 		var req cmiclient.FindRequest
 		if req, err = parseFind(tc.Arguments); err == nil {
 			req.Purpose, req.Budget, req.Sources = purpose, budget, t.def.Context.Sources
+			req.Text = t.restore(req.Text)
 			detail["documentId"], detail["text"] = req.DocumentID, req.Text
 			call = func(b string) (*cmiclient.Package, error) { return h.CMI.Find(t.callCtx, b, req) }
 		}
@@ -367,7 +420,7 @@ func (t *turn) knowledgePackage(tool string, pkg *cmiclient.Package, detail map[
 	reserve := 700 // what the notes after the items may need
 	for _, it := range items {
 		// a passage the thread has numbered already (the same document and place) keeps its number (D73); a new one takes the next
-		num, known := tree.KnownKnowledge(it.ID, cmiclient.OneLine(cmiclient.Where(it.Locator), 1000))
+		num, known := tree.KnownKnowledge(it.ID, cmiclient.OneLine(cmiclient.Where(it.Locator), 1000), cmiclient.ExcerptDigest(it.Excerpt))
 		if !known {
 			num = first + given
 		}
@@ -379,6 +432,7 @@ func (t *turn) knowledgePackage(tool string, pkg *cmiclient.Package, detail map[
 			block = cutBlock(block, max(limit-b.Len()-reserve, 200)) // one passage that alone is too long is shown cut, not left out
 		}
 		b.WriteString(block)
+		t.rememberShown(it)
 		if src, ok := cmiclient.KnowledgeSource(num, it); ok {
 			sources = append(sources, src)
 		}

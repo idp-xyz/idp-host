@@ -96,17 +96,18 @@ func TestAnAmbiguousTextIsNotRewrittenButListedAndNeutralised(t *testing.T) {
 	}
 }
 
-func TestANumberGluedToAWordIsNotACitationButOneGluedToCJKTextIs(t *testing.T) {
-	all := func(int) bool { return true }
+func TestANumberGluedToAWordIsNotACitationUnlessTheRunListsItButOneGluedToCJKTextIs(t *testing.T) {
+	all, none := func(int) bool { return true }, func(int) bool { return false }
 	for _, in := range []string{"array[3]", "word[3]", "x_[3]", "v2[3]"} {
-		if cited, unknown := run.CitationMarks(in, all); len(cited) != 0 || len(unknown) != 0 {
+		if cited, unknown := run.CitationMarksIn(in, all, none); len(cited) != 0 || len(unknown) != 0 {
 			t.Errorf("%q: %v %v", in, cited, unknown)
 		}
+		if cited, _ := run.CitationMarksIn(in, all, all); fmt.Sprint(cited) != "[3]" {
+			t.Errorf("%q with the source listed: %v", in, cited)
+		}
 	}
-	for _, in := range []string{"文档[3]", "见[3]", "ok [3]", "(see[3]" /* glued to a letter */} {
-		cited, _ := run.CitationMarks(in, all)
-		want := in != "(see[3]"
-		if (len(cited) == 1) != want {
+	for _, in := range []string{"文档[3]", "见[3]", "ok [3]"} {
+		if cited, _ := run.CitationMarksIn(in, all, none); fmt.Sprint(cited) != "[3]" {
 			t.Errorf("%q: %v", in, cited)
 		}
 	}

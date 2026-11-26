@@ -373,6 +373,22 @@ func (c *capped) WriteString(s string) {
 // there is no text. An embedded text resource is its header line "[resource <uri> <mimeType>]" and its text; a blob is only
 // named with its size (D62). Bounded to limit bytes (D40) as a whole.
 func (r *CallResult) Text(limit int) string {
+	c := r.render(limit)
+	s := c.sb.String()
+	if limit > 0 && c.total > limit {
+		cut := limit
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+		s = s[:cut] + fmt.Sprintf("\n[truncated: %d of %d bytes shown; narrow the output (head, grep, a summary) to see the part you need]", cut, c.total)
+	}
+	return s
+}
+
+// TextLen is how many bytes Text would give without a limit, which is what the limit is compared with: whether a limited Text is cut.
+func (r *CallResult) TextLen() int { return r.render(1).total }
+
+func (r *CallResult) render(limit int) *capped {
 	c := &capped{max: limit}
 	for _, b := range r.Content {
 		switch b.Type {
@@ -403,15 +419,7 @@ func (r *CallResult) Text(limit int) string {
 	if c.total == 0 && len(r.StructuredContent) > 0 {
 		c.WriteString(string(r.StructuredContent))
 	}
-	s := c.sb.String()
-	if limit > 0 && c.total > limit {
-		cut := limit
-		for cut > 0 && !utf8.RuneStart(s[cut]) {
-			cut--
-		}
-		s = s[:cut] + fmt.Sprintf("\n[truncated: %d of %d bytes shown; narrow the output (head, grep, a summary) to see the part you need]", cut, c.total)
-	}
-	return s
+	return c
 }
 
 // CallTool calls one tool with JSON arguments.

@@ -151,3 +151,5 @@ provider 的 `retry` 与 `idleTimeoutSeconds`（ADR D45、D46）都可以不配�
 ## 许可证
 
 本仓库采用 [PolyForm Noncommercial License 1.0.0](LICENSE)：允许非商业用途，禁止任何商业使用。
+
+**引用编号，第二轮评审后（ADR D86–D100）。** 契约 1.13.0 里引用编号上限一律 999999，`unlistedCitations` 至多 100 个；粘在词后面的 `true[1]`、`growth[1][2]`、`2024[3]` 只在运行自己的列表里有这个来源时才算引用；D40 截短一页时先在原文上截，头行的 `bytes 起–止` 与 `the rest: … with offset 止` 正好是模型停下的地方，被截过的文字一律走来源表而不改写，说明也算在限之内；结构化的地址 `[ ]` 显示成 `%5B %5D`；`known` 单独一张表 `citation_known`（迁移 0017 又就地改过），知识段落的身份含摘录摘要；`Neutralise` 再覆盖上标数字、键帽、HTML 字符引用；发回的标题按记录还原成原文；续期失败时若别的运行已续成就返回它，网关与 CMI 凭据各一把可取消的锁；编过号的线程里每个运行都中和、核对，调用方自己的工具结果也中和。模型替身（`tests/fixtures/fakemodel`）：`web:` 系列引用抓取结果的 HOST 编号，新增 `mixed:`、`mixed-cite:`、`fan:`。

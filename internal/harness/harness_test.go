@@ -74,6 +74,7 @@ func (m *memStore) Context(context.Context, *run.Claim) (*run.Context, error) {
 		return nil, err
 	}
 	rc := m.rc
+	rc.ThreadNumbered = rc.ThreadNumbered || m.next > 1
 	rc.Messages = append([]agui.Message(nil), m.rc.Messages...)
 	rc.ToolCalls, rc.LastCalls = nil, nil
 	lastWithCalls := ""
@@ -168,7 +169,7 @@ func (m *memStore) AnswerCited(_ context.Context, _ *run.Claim, id string, cite 
 	if err := m.check(); err != nil {
 		return err
 	}
-	tree := &run.TreeNumbers{Known: run.KnownOf(m.sources.Items)}
+	tree := run.TreeFrom(run.KnownOf(m.sources.Items))
 	first := m.counter()
 	a, err := cite(first, tree)
 	if err != nil {

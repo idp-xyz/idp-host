@@ -3,6 +3,8 @@ package cmiclient
 // What the HOST records of a knowledge passage it numbered (ADR-0001 D70): the number, the document, where in it.
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"strconv"
 	"strings"
 	"unicode"
@@ -59,6 +61,12 @@ func Where(l *Locator) string {
 	return strings.Join(parts, "; ")
 }
 
+// ExcerptDigest identifies the text of a passage: the same place with other text is another passage.
+func ExcerptDigest(excerpt string) string {
+	sum := sha256.Sum256([]byte(excerpt))
+	return hex.EncodeToString(sum[:8])
+}
+
 // MaxDocumentID is the longest document id the HOST records (the contract's maxLength).
 const MaxDocumentID = 128
 
@@ -74,7 +82,7 @@ func KnowledgeSource(n int, it Item) (src run.Source, ok bool) {
 	if title == "" {
 		title = OneLine(it.Ref, run.MaxSourceText)
 	}
-	return run.Source{N: n, Kind: run.KindKnowledge, Title: title, DocumentID: it.ID, Where: OneLine(Where(it.Locator), 1000), Origin: OneLine(it.Source, 64)}, true
+	return run.Source{N: n, Kind: run.KindKnowledge, Title: title, DocumentID: it.ID, Where: OneLine(Where(it.Locator), 1000), Origin: OneLine(it.Source, 64), Digest: ExcerptDigest(it.Excerpt)}, true
 }
 
 // KnowledgeSources are the records of the knowledge items ContextFrom numbers first, first+1, ... (the items of kind knowledge, in

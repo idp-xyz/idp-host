@@ -108,6 +108,9 @@ type Context struct {
 	// two) may lack the records of some of them or the tool messages of finished ones; the harness repairs it from this.
 	LastCalls       []ToolCall
 	BlockedPatterns []string // the tenant policy's blocked output patterns (D28)
+	// ThreadNumbered: the thread of the run's tree has a citation counter that has given numbers (D77): every run of it numbers, neutralises
+	// and is checked, whatever its release has.
+	ThreadNumbered bool
 }
 
 // Answer is what a tool call came to, as the store writes it (D47): the call's final state, its tool message, the sources the result
@@ -130,36 +133,42 @@ type Answer struct {
 // compute: no call to another service, no wait, and it may be called more than once.
 type CiteFunc func(first int, tree *TreeNumbers) (Answer, error)
 
-// TreeNumbers is what the thread's counter already numbered that a later result may share (D70, D71, D73): a web address read again
-// and a knowledge passage met again keep their numbers.
+// TreeNumbers is what the thread's counter already numbered that a later result may share (D70, D71, D73): a web address read again and
+// a knowledge passage met again keep their numbers. It is asked key by key, for the keys of the answer being made and no others.
 type TreeNumbers struct {
-	// Known maps WebKey and KnowledgeKey to the number the HOST gave.
-	Known map[string]int
+	// Lookup returns the number the thread gave to the source with this key (WebKey, KnowledgeKey).
+	Lookup func(key string) (int, bool)
 }
 
 // WebKey is the key of a web source in TreeNumbers: idp-web's number for the address and the address.
 func WebKey(webN int, url string) string { return "w:" + strconv.Itoa(webN) + ":" + url }
 
-// KnowledgeKey is the key of a knowledge passage: the document and the place in it.
-func KnowledgeKey(documentID, where string) string { return "k:" + documentID + "\x1f" + where }
+// KnowledgeKey is the key of a knowledge passage: the document, the place in it and a digest of the passage's text. The same place with
+// other text is another passage.
+func KnowledgeKey(documentID, where, digest string) string {
+	return "k:" + documentID + "\x1f" + where + "\x1f" + digest
+}
+
+// TreeFrom is a TreeNumbers over a map of known numbers.
+func TreeFrom(m map[string]int) *TreeNumbers {
+	return &TreeNumbers{Lookup: func(key string) (int, bool) { n, ok := m[key]; return n, ok }}
+}
 
 // KnownWeb returns the HOST's number for the address idp-web numbered webN, when the thread has numbered it already.
 func (t *TreeNumbers) KnownWeb(webN int, url string) (int, bool) {
-	if t == nil {
+	if t == nil || t.Lookup == nil {
 		return 0, false
 	}
-	n, ok := t.Known[WebKey(webN, url)]
-	return n, ok
+	return t.Lookup(WebKey(webN, url))
 }
 
-// KnownKnowledge returns the number of a passage the thread has numbered already (same document, same place). A passage with no place is
-// never known: two of them are not the same passage.
-func (t *TreeNumbers) KnownKnowledge(documentID, where string) (int, bool) {
-	if t == nil || where == "" {
+// KnownKnowledge returns the number of a passage the thread has numbered already (same document, same place, same text). A passage with
+// neither a place nor a digest is never known: two of them are not the same passage.
+func (t *TreeNumbers) KnownKnowledge(documentID, where, digest string) (int, bool) {
+	if t == nil || t.Lookup == nil || where == "" && digest == "" {
 		return 0, false
 	}
-	n, ok := t.Known[KnowledgeKey(documentID, where)]
-	return n, ok
+	return t.Lookup(KnowledgeKey(documentID, where, digest))
 }
 
 // KnownOf lists what the sources of an answer add to the known numbers of the thread.
@@ -167,8 +176,8 @@ func KnownOf(items []Source) map[string]int {
 	out := map[string]int{}
 	for _, s := range items {
 		switch {
-		case s.Kind == KindKnowledge && s.DocumentID != "" && s.Where != "":
-			out[KnowledgeKey(s.DocumentID, s.Where)] = s.N
+		case s.Kind == KindKnowledge && s.DocumentID != "" && (s.Where != "" || s.Digest != ""):
+			out[KnowledgeKey(s.DocumentID, s.Where, s.Digest)] = s.N
 		case s.Kind != KindKnowledge && s.WebN > 0 && s.URL != "":
 			out[WebKey(s.WebN, s.URL)] = s.N
 		}

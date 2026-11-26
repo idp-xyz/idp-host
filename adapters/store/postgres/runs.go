@@ -293,14 +293,19 @@ func (s *Store) CreateRun(ctx context.Context, tenant string, in CreateRunInput)
 				return err
 			}
 			if in.CitationNext > 0 { // D70: the first package was numbered: the thread's counter moves past its numbers
-				next, known, err := lockCounter(ctx, tx, tenant, threadID)
+				next, knownCount, err := lockCounter(ctx, tx, tenant, threadID)
 				if err != nil {
 					return err
 				}
 				if next != max(in.CitationFirst, 1) {
 					return fail("CONFLICT", "the thread's citation numbers moved while the request was handled; send it again")
 				}
-				if err := moveCounter(ctx, tx, tenant, threadID, in.CitationNext, known, in.Sources); err != nil {
+				th := &threadTree{ctx: ctx, tx: tx, tenant: tenant, thread: threadID, found: map[string]bool{}}
+				remembered, err := th.remember(in.Sources, knownCount)
+				if err != nil {
+					return err
+				}
+				if err := moveCounter(ctx, tx, tenant, threadID, in.CitationNext, remembered); err != nil {
 					return err
 				}
 				if len(in.Sources) > 0 {
@@ -749,6 +754,12 @@ func (s *Store) Context(ctx context.Context, c *run.Claim) (*run.Context, error)
 			return err
 		}
 		out.BlockedPatterns = policy.BlockedPatterns
+		// D77: a thread that has given numbers says so to every run of it
+		if given, err := citationsGiven(ctx, tx, c.TenantID, c.RunID); err != nil {
+			return err
+		} else {
+			out.ThreadNumbered = given > 0
+		}
 		out.ToolCalls, err = runCalls(ctx, tx, c.RunID, []string{run.CallPendingConfirmation, run.CallConfirmed, run.CallRejected, run.CallExpired, run.CallExecuting, run.CallDelegated, run.CallDenied}, true)
 		if err != nil {
 			return err

@@ -896,3 +896,127 @@ func TestSaveCredentialLocksTheHolderFirstOnPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// What the thread has numbered is a table of its own: only the keys of the answer are looked up, only new ones are written.
+func TestWhatTheThreadHasNumberedIsRememberedKeyByKeyOnPostgres(t *testing.T) {
+	e, _ := knowledgeEnv(t, handbookDoc())
+	root, _ := citationTree(t, e, 1, false)
+	if ok, err := e.worker.Once(context.Background()); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	cl, err := e.store.Claim(context.Background(), "w-kn", time.Minute)
+	if err != nil || cl == nil {
+		t.Fatal(err, cl)
+	}
+	msgSeq := 0
+	answer := func(items ...run.Source) run.CiteFunc {
+		return func(first int, tree *run.TreeNumbers) (run.Answer, error) {
+			msgSeq++
+			used := 0
+			var out []run.Source
+			for _, it := range items {
+				if n, ok := tree.KnownKnowledge(it.DocumentID, it.Where, it.Digest); ok && it.Kind == run.KindKnowledge {
+					it.N = n
+				} else if n, ok := tree.KnownWeb(it.WebN, it.URL); ok && it.Kind == run.KindWeb {
+					it.N = n
+				} else {
+					it.N = first + used
+					used++
+				}
+				out = append(out, it)
+			}
+			return run.Answer{State: run.CallDone, Msg: agui.Message{ID: fmt.Sprintf("m-k-%d", msgSeq), Role: agui.RoleTool, ToolCallID: "x", Content: "r"}, Used: used, Src: &run.SourceBatch{Items: out}}, nil
+		}
+	}
+	k1 := run.Source{Kind: run.KindKnowledge, Title: "k", DocumentID: "doc-1", Where: "page 1", Digest: "aaaa"}
+	w1 := run.Source{Kind: run.KindWeb, Title: "w", URL: "https://n.example/1", WebN: 40}
+	if err := e.store.AnswerCited(context.Background(), cl, "x", answer(k1, w1)); err != nil {
+		t.Fatal(err)
+	}
+	count := func() string {
+		return e.scalar(`SELECT count(*)::text FROM citation_known WHERE thread_id = (SELECT thread_id FROM runs WHERE id = $1)`, root)
+	}
+	if count() != "2" || e.scalar(`SELECT known_count::text FROM citation_counters WHERE thread_id = (SELECT thread_id FROM runs WHERE id = $1)`, root) != "2" {
+		t.Fatalf("%s keys", count())
+	}
+	before := e.counterOf(root)
+	// the same passage and address again: they keep their numbers, take none, and nothing is written to the table
+	var xminBefore string = e.scalar(`SELECT max(xmin::text::bigint)::text FROM citation_known`)
+	if err := e.store.AnswerCited(context.Background(), cl, "x", answer(k1, w1)); err != nil {
+		t.Fatal(err)
+	}
+	if e.counterOf(root) != before || count() != "2" || e.scalar(`SELECT max(xmin::text::bigint)::text FROM citation_known`) != xminBefore {
+		t.Errorf("a result with nothing new moved the counter or wrote keys: %d -> %d, %s keys", before, e.counterOf(root), count())
+	}
+	// the same place with other text is another passage
+	k2 := k1
+	k2.Digest = "bbbb"
+	if err := e.store.AnswerCited(context.Background(), cl, "x", answer(k2)); err != nil {
+		t.Fatal(err)
+	}
+	if e.counterOf(root) != before+1 || count() != "3" {
+		t.Errorf("%d %s", e.counterOf(root), count())
+	}
+}
+
+// A thread that has given numbers says so to every run of it, whatever the run's release has.
+func TestTheContextOfARunSaysWhenItsThreadHasNumberedOnPostgres(t *testing.T) {
+	e := newEnv(t)
+	e.publish("plain-n", definition("", nil, nil))
+	mk := func(thread string) *run.Claim {
+		e.must(202, "POST", "/v1/agents/plain-n/runs", "carol", runBody(thread, "hi "+thread), "Idempotency-Key", thread)
+		cl, err := e.store.Claim(context.Background(), "w-"+thread, time.Minute)
+		if err != nil || cl == nil {
+			t.Fatal(err, cl)
+		}
+		return cl
+	}
+	a, b := mk("tn-a"), mk("tn-b")
+	e.exec(`INSERT INTO citation_counters (tenant_id, thread_id, next) SELECT tenant_id, 'tn-a', 5 FROM threads WHERE id = 'tn-a'`)
+	for cl, want := range map[*run.Claim]bool{a: true, b: false} {
+		rc, err := e.store.Context(context.Background(), cl)
+		if err != nil || rc.ThreadNumbered != want {
+			t.Errorf("%s: %v %v", cl.RunID, rc != nil && rc.ThreadNumbered, err)
+		}
+	}
+}
+
+// A renewal that fails, or whose write finds the credential changed, returns the fresher credential another run stored meanwhile.
+func TestARenewalReturnsTheFresherCredentialAnotherRunStoredInsteadOfFailingOnPostgres(t *testing.T) {
+	e := newEnv(t)
+	_, kids := gatewayTree(t, e, 1)
+	cl, err := e.store.Claim(context.Background(), "w-fr", time.Minute)
+	if err != nil || cl == nil || len(kids) != 1 {
+		t.Fatal(err, cl)
+	}
+	store := func(access string) {
+		if err := e.store.SaveCredential(context.Background(), cl, &credential.Token{AccessToken: access, RefreshToken: "rt-fr", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cur, _ := e.store.RunCredential(context.Background(), cl)
+	// the authorization server refuses (the refresh token was just rotated by another run): the other run's credential is the answer
+	got, err := e.store.RenewRunCredential(context.Background(), cl, cur, true, func(context.Context, string) (*credential.Token, error) {
+		store("fresher-1")
+		return nil, errors.New("the authorization server refused: the refresh token was used")
+	})
+	if err != nil || got.AccessToken != "fresher-1" {
+		t.Fatalf("an error of the identity provider, with a fresher credential stored: %v %v", got, err)
+	}
+	// the write finds the credential changed: the same
+	cur, _ = e.store.RunCredential(context.Background(), cl)
+	got, err = e.store.RenewRunCredential(context.Background(), cl, cur, true, func(context.Context, string) (*credential.Token, error) {
+		store("fresher-2")
+		return &credential.Token{AccessToken: "late", RefreshToken: "rt-late", ExpiresAt: time.Now().Add(time.Hour)}, nil
+	})
+	if err != nil || got.AccessToken != "fresher-2" {
+		t.Fatalf("a compare and swap that missed, with a fresher credential stored: %v %v", got, err)
+	}
+	// with nothing fresher the error stays an error
+	cur, _ = e.store.RunCredential(context.Background(), cl)
+	if _, err := e.store.RenewRunCredential(context.Background(), cl, cur, true, func(context.Context, string) (*credential.Token, error) {
+		return nil, errors.New("refused")
+	}); err == nil {
+		t.Error("a refusal with nothing fresher stored returned a token")
+	}
+}

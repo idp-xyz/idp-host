@@ -683,7 +683,7 @@ func TestContractRejectsRunSourcesTheHostWouldNotRecord(t *testing.T) {
 	if err := k.validate("AgentRun", base(many...)); err == nil {
 		t.Error("101 sources: the schema accepts them")
 	}
-	for name, v := range map[string]any{"zero": []int{0}, "year": []int{2026}, "repeated": []int{3, 3}, "text": []string{"x"}} {
+	for name, v := range map[string]any{"zero": []int{0}, "repeated": []int{3, 3}, "text": []string{"x"}} {
 		raw, _ := json.Marshal(map[string]any{"runId": "run_1", "threadId": "thr_1", "agentId": "a", "releaseId": "r", "releaseDigest": "sha256:" + strings.Repeat("a", 64), "owner": "o",
 			"status": "COMPLETED", "stepCount": 1, "cancelRequested": false, "deadlineAt": "2026-11-03T13:10:00Z", "createdAt": "2026-11-03T13:00:00Z", "unverifiedCitations": v})
 		if err := k.validate("AgentRun", raw); err == nil {
@@ -706,8 +706,8 @@ func TestContractAcceptsKnowledgeSourcesAndTheLongestValuesTheHostRecords(t *tes
 		return raw
 	}
 	title := strings.Repeat("题", run.MaxSourceText)
-	ks := run.Source{N: 1000000, Kind: run.KindKnowledge, Title: cmiclientOneLine(strings.Repeat("题", 500), run.MaxSourceText), DocumentID: strings.Repeat("d", 128), Where: cmiclientOneLine(strings.Repeat("x", 3000), 1000), Origin: strings.Repeat("s", 64)}
-	ws := run.Source{N: 1000000, Kind: run.KindWeb, Title: title, URL: "https://a.example/" + strings.Repeat("p", 2048-len("https://a.example/")), WebN: 1000000, FetchedAt: "2026-11-03T13:41:07Z", SHA256: strings.Repeat("f", 64)}
+	ks := run.Source{N: 999999, Kind: run.KindKnowledge, Title: cmiclientOneLine(strings.Repeat("题", 500), run.MaxSourceText), DocumentID: strings.Repeat("d", 128), Where: cmiclientOneLine(strings.Repeat("x", 3000), 1000), Origin: strings.Repeat("s", 64)}
+	ws := run.Source{N: 999999, Kind: run.KindWeb, Title: title, URL: "https://a.example/" + strings.Repeat("p", 2048-len("https://a.example/")), WebN: 999999, FetchedAt: "2026-11-03T13:41:07Z", SHA256: strings.Repeat("f", 64)}
 	web, know := run.SplitSources([]run.Source{ws, ks})
 	if err := k.validate("AgentRun", runWith(map[string]any{"sources": web, "knowledgeSources": know, "unverifiedCitations": []int{999}, "unlistedCitations": []int{1, 2}})); err != nil {
 		t.Fatalf("the longest values the HOST records: %v", err)

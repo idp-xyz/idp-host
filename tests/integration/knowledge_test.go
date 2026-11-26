@@ -165,13 +165,13 @@ func TestKnowledgeToolsOnPostgres(t *testing.T) {
 		}
 		resolved := e.eventsOf(id, "erin", agui.CustomContextResolved)
 		pk := e.eventsOf(id, "erin", agui.CustomContextPackage)
-		// the first retrieval matched the three blocks and carol's note (4 entries), numbered 1-4; the search meets the same passages (D73: they
-		// keep their numbers; one is new, 5), and the find's passage is one of them (no new number, the counter is at 6)
+		// the first retrieval matched the three blocks and carol's note (4 entries), numbered 1-4; the search meets the same passages (D73, D93: the same
+		// passages with the same text keep their numbers, none is new) and so does the find's passage: the counter stays at 5
 		if len(resolved) != 1 || resolved[0]["packageId"] != got["contextPackageId"] || resolved[0]["firstIndex"] != float64(1) || resolved[0]["numbered"] != float64(4) || resolved[0]["query"] != "know-dig: returns | fuel surcharge" {
 			t.Fatalf("%v %v", resolved, got["contextPackageId"])
 		}
-		if len(pk) != 2 || pk[0]["tool"] != "knowledge__search" || pk[0]["firstIndex"] != float64(5) || pk[0]["itemCount"] != float64(1) || pk[0]["shown"] != float64(4) || pk[0]["query"] != "returns" ||
-			pk[1]["tool"] != "knowledge__find" || pk[1]["firstIndex"] != float64(6) || pk[1]["itemCount"] != float64(0) || pk[1]["documentId"] != "doc-1" || pk[1]["text"] != "fuel surcharge" || pk[0]["packageId"] == resolved[0]["packageId"] {
+		if len(pk) != 2 || pk[0]["tool"] != "knowledge__search" || pk[0]["firstIndex"] != float64(5) || pk[0]["itemCount"] != float64(0) || pk[0]["shown"] != float64(4) || pk[0]["query"] != "returns" ||
+			pk[1]["tool"] != "knowledge__find" || pk[1]["firstIndex"] != float64(5) || pk[1]["itemCount"] != float64(0) || pk[1]["documentId"] != "doc-1" || pk[1]["text"] != "fuel surcharge" || pk[0]["packageId"] == resolved[0]["packageId"] {
 			t.Fatalf("%v", pk)
 		}
 		// every CMI call was made as the member, and the knowledge tools reached the three endpoints they should

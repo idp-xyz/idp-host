@@ -134,6 +134,9 @@ func ParseStructured(schema, structured json.RawMessage) (*StructuredWeb, string
 			return v
 		}
 		it.Ref, it.Published, it.Excerpt, it.FinalURL, it.Notice = str("ref"), str("published"), str("excerpt"), str("finalUrl"), str("notice")
+		if it.FinalURL != "" && !validURL(it.FinalURL) {
+			it.FinalURL = "" // where a redirect ended is shown only when it is an address like any other; otherwise the note is dropped
+		}
 		_ = json.Unmarshal(m["rendered"], &it.Rendered)
 		_ = json.Unmarshal(m["truncated"], &it.Truncated)
 		if _, ok := m["text"]; ok {
@@ -184,101 +187,182 @@ func oneLineText(s string, max int) string {
 	return s
 }
 
+// showURL is an address as it is written into the text the model reads: the square brackets are percent-encoded, so that a "[2]" in an
+// address is not a number.
+func showURL(u string) string { return strings.NewReplacer("[", "%5B", "]", "%5D").Replace(u) }
+
 // Render writes the text the model reads of the result (D71): for a search, a block per source with its HOST number, address, ref,
 // date and excerpt; for a read, a head line with the HOST number, the title and where in the page this part lies, the address and
 // ref, and the text. tool is the name the call was made with ("the rest: web_fetch with offset N"). Every field that came from a web
 // page is cleaned and neutralised (D72); the number at the head of a block is the only bracketed number the HOST writes. limit is
-// D40's limit on what the model is given: a block that would pass it is not shown and not numbered, and one read part that alone
-// passes it is cut.
+// D40's limit on what the model is given, all of it counted (the blocks, the note on neutralised numbers): a block that would pass it is
+// not shown and not numbered. A part of a page that would pass it is cut on the RAW text, at a character boundary, before it is cleaned and
+// neutralised; the head then says where the shown part ends and offers that offset to continue from, so that continuing resumes exactly where
+// the model stopped and skips nothing.
 func (s *StructuredWeb) Render(tool string, first int, known func(webN int, url string) (int, bool), limit int) WebRendered {
 	out := WebRendered{Mode: WebRewritten, Render: RenderStructured}
 	if len(s.items) == 0 {
 		out.Text = "no results"
 		return out
 	}
-	var b strings.Builder
-	next := first
-	changed := 0
-	neut := func(x string) string {
-		y, n := Neutralise(x)
-		changed += n
-		return y
+	type block struct {
+		text    string
+		changed int
+		isNew   bool
+		src     Source
 	}
-	for i, it := range s.items {
-		var blk strings.Builder
+	noteSize := len(neutralisedNote(1))
+	var blocks []block
+	used := 0 // bytes of the blocks so far, with the blank lines between them
+	next := first
+	for _, it := range s.items {
 		n, isNew := number(it.Source, next, known)
+		changed := 0
+		neut := func(x string) string {
+			y, k := Neutralise(x)
+			changed += k
+			return y
+		}
 		title := neut(oneLineText(it.Title, MaxSourceText))
 		if title == "" {
-			title = neut(it.URL)
+			title = neut(showURL(it.URL))
 		}
+		var text string
 		if !it.IsRead {
-			fmt.Fprintf(&blk, "[%d] %s\naddress: %s\nref: %s", n, title, it.URL, oneLineText(it.Ref, 4096))
+			var blk strings.Builder
+			fmt.Fprintf(&blk, "[%d] %s\naddress: %s\nref: %s", n, title, showURL(it.URL), neut(oneLineText(it.Ref, 4096)))
 			if it.Published != "" {
 				fmt.Fprintf(&blk, "\npublished: %s", neut(oneLineText(it.Published, 64)))
 			}
 			if it.Excerpt != "" {
 				fmt.Fprintf(&blk, "\nexcerpt: %s", neut(oneLineText(it.Excerpt, 4000)))
 			}
+			text = blk.String()
 		} else {
-			head := fmt.Sprintf("[%d] %s", n, title)
-			if it.FinalURL != "" && it.FinalURL != it.URL {
-				head += " [the address redirected to " + neut(oneLineText(it.FinalURL, 2048)) + "]"
+			sep := 0
+			if len(blocks) > 0 {
+				sep = 2
 			}
-			var what string
-			if it.PDF != nil {
-				what = fmt.Sprintf("PDF, %d pages", it.PDF.Pages)
-				if it.PDF.Cut {
-					what += fmt.Sprintf(", only the first %d are read", it.PDF.PagesRead)
-				}
-				what += "; "
-			}
-			if it.Rendered {
-				what += "rendered; "
-			}
-			head += fmt.Sprintf(" (%sbytes %d–%d of %d", what, it.Start, it.End, it.Total)
-			if it.Next != nil {
-				head += fmt.Sprintf("; the rest: %s with offset %d)", tool, *it.Next)
-			} else {
-				head += ")"
-			}
-			blk.WriteString(head + "\naddress: " + it.URL)
-			if it.Ref != "" {
-				blk.WriteString("\nref: " + oneLineText(it.Ref, 4096))
-			}
-			body := neut(cleanPageText(it.Text))
-			switch {
-			case it.Notice == "offset_past_end":
-				body = "(nothing at this offset: the page text is shorter)"
-			case it.Notice == "no_text" || body == "":
-				body = "(no text found on this page)"
-			}
-			blk.WriteString("\n\n" + body)
+			budget := limit - used - sep - noteSize
+			var add int
+			text, add = renderRead(it, n, title, tool, budget, limit > 0)
+			changed += add
 		}
-		text := blk.String()
-		if b.Len() > 0 {
-			text = "\n\n" + text
+		sep := 0
+		if len(blocks) > 0 {
+			sep = 2
 		}
-		if limit > 0 && b.Len()+len(text) > limit {
-			if b.Len() > 0 {
-				out.NotShown = len(s.items) - i
-				break
-			}
-			// one block that alone passes D40's limit is shown cut, as any tool result is
-			cut := limit
-			for cut > 0 && cut < len(text) && !utf8.RuneStart(text[cut]) {
-				cut--
-			}
-			text = text[:cut] + fmt.Sprintf("\n[truncated: %d of %d bytes shown]", cut, len(text))
+		if limit > 0 && len(blocks) > 0 && used+sep+len(text) > limit-noteSize {
+			out.NotShown = len(s.items) - len(blocks)
+			break
 		}
-		b.WriteString(text)
+		used += sep + len(text)
 		if isNew {
 			next++
 		}
 		src := it.Source
 		src.WebN, src.N = src.N, n
-		out.Sources = append(out.Sources, src)
+		blocks = append(blocks, block{text, changed, isNew, src})
 	}
-	out.Used = next - first
-	out.Text = b.String() + neutralisedNote(changed)
+	var b strings.Builder
+	changed := 0
+	for i, bl := range blocks {
+		if i > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(bl.text)
+		changed += bl.changed
+		out.Sources = append(out.Sources, bl.src)
+		if bl.isNew {
+			out.Used++
+		}
+	}
+	out.Text = capText(b.String()+neutralisedNote(changed), limit)
 	return out
+}
+
+// renderRead writes one part of a page: the head, the address and ref, and the text, cut on the raw text to fit budget when there is one. It
+// returns the text and how many bracketed numbers it neutralised (the title, neutralised by the caller, is not among them).
+func renderRead(it webItem, n int, title, tool string, budget int, limited bool) (string, int) {
+	changed := 0
+	neut := func(x string) string {
+		y, k := Neutralise(x)
+		changed += k
+		return y
+	}
+	final, ref := "", ""
+	if it.FinalURL != "" && it.FinalURL != it.URL {
+		final = neut(showURL(it.FinalURL))
+	}
+	if it.Ref != "" {
+		ref = neut(oneLineText(it.Ref, 4096))
+	}
+	head := func(end int, next *int) string {
+		h := fmt.Sprintf("[%d] %s", n, title)
+		if final != "" {
+			h += " [the address redirected to " + final + "]"
+		}
+		var what string
+		if it.PDF != nil {
+			what = fmt.Sprintf("PDF, %d pages", it.PDF.Pages)
+			if it.PDF.Cut {
+				what += fmt.Sprintf(", only the first %d are read", it.PDF.PagesRead)
+			}
+			what += "; "
+		}
+		if it.Rendered {
+			what += "rendered; "
+		}
+		h += fmt.Sprintf(" (%sbytes %d–%d of %d", what, it.Start, end, it.Total)
+		if next != nil {
+			h += fmt.Sprintf("; the rest: %s with offset %d)", tool, *next)
+		} else {
+			h += ")"
+		}
+		h += "\naddress: " + showURL(it.URL)
+		if ref != "" {
+			h += "\nref: " + ref
+		}
+		return h
+	}
+	if it.Notice != "" || it.Text == "" {
+		body := "(no text found on this page)"
+		if it.Notice == "offset_past_end" {
+			body = "(nothing at this offset: the page text is shorter)"
+		}
+		return head(it.End, it.Next) + "\n\n" + body, changed
+	}
+	raw, end, next := it.Text, it.End, it.Next
+	cut := len(raw)
+	if limited {
+		// the room for the text is what the budget leaves after the head; what neutralising adds is counted, and the raw text is cut
+		// until the whole fits
+		room := budget - len(head(end, next)) - 2 - 40
+		for tries := 0; ; tries++ {
+			cut = min(len(raw), max(room, 0))
+			for cut > 0 && cut < len(raw) && !utf8.RuneStart(raw[cut]) {
+				cut--
+			}
+			e, nx := end, next
+			if cut < len(raw) {
+				e = it.Start + cut
+				v := e
+				nx = &v
+			}
+			body, _ := Neutralise(cleanPageText(raw[:cut]))
+			size := len(head(e, nx)) + 2 + len(body)
+			if size <= budget || cut == 0 || tries > 8 {
+				if cut < len(raw) {
+					end, next = e, nx
+				}
+				break
+			}
+			room -= size - budget + 1
+		}
+	}
+	body := neut(cleanPageText(raw[:cut]))
+	if body == "" {
+		body = "(the limit left no room for the text of this part)"
+	}
+	return head(end, next) + "\n\n" + body, changed
 }

@@ -172,3 +172,102 @@ func TestCallFlowCallsTheNamedToolWithTheGivenArguments(t *testing.T) {
 		t.Fatalf("%+v", got)
 	}
 }
+
+// The answer of the web flows cites the HOST number of the entry it fetched, read from the first block header of the fetch result
+// ("[n] title ..." followed by "address:"); without one it says [1], as before.
+func TestWebFlowsCiteTheHostNumberOfTheEntryTheyFetched(t *testing.T) {
+	tools := []string{"web__web_search", "web__web_fetch", "web__web_open_url"}
+	fetched := "[7] A page (bytes 0–9 of 9)\naddress: https://example.com/a\nref: REF1\n\nthe page"
+	for _, prefix := range []string{"web", "web-cite", "web-obey"} {
+		user := Message{Role: "user", Content: prefix + ": what is new"}
+		t1 := DefaultScript([]Message{user}, tools)
+		conv := []Message{user, {Role: "assistant", ToolCalls: t1.ToolCalls}, {Role: "tool", Content: webSearchResult}}
+		t2 := DefaultScript(conv, tools)
+		content := fetched
+		if prefix == "web-obey" { // a page with no link in it: the obeying flow has nothing to follow and answers
+			content = "[7] A page (bytes 0–9 of 9)\naddress: -\n\nno link here"
+		}
+		conv = append(conv, Message{Role: "assistant", ToolCalls: t2.ToolCalls}, Message{Role: "tool", Content: content})
+		t3 := DefaultScript(conv, tools)
+		if prefix == "web-obey" { // no URL in the page: the flow answers with what it read
+			if !strings.HasPrefix(t3.Text, "Result [7]: ") {
+				t.Errorf("%s: %q", prefix, t3.Text)
+			}
+			continue
+		}
+		want := "Result [7]: " + firstRunes(fetched, 300)
+		if prefix == "web-cite" {
+			want += " Also [987]."
+		}
+		if t3.Text != want {
+			t.Errorf("%s: %q", prefix, t3.Text)
+		}
+	}
+}
+
+func TestMixedFlowSearchesTheKnowledgeBaseThenTheWebThenFetchesAndCitesBoth(t *testing.T) {
+	tools := []string{"knowledge__search", "web__web_search", "web__web_fetch"}
+	for _, prefix := range []string{"mixed", "mixed-cite"} {
+		user := Message{Role: "user", Content: prefix + ": returns policy"}
+		t1 := DefaultScript([]Message{user}, tools)
+		if len(t1.ToolCalls) != 1 || t1.ToolCalls[0].Name != "knowledge__search" || t1.ToolCalls[0].Args != `{"query":"returns policy"}` {
+			t.Fatalf("%s: first turn %+v", prefix, t1)
+		}
+		knowledge := "knowledge__search: package p, 2 passages found.\n\n[3] Returns policy\ndocument: doc-1; source: kb\nwhere: page 1\ntext\n\n[4] Returns policy\ndocument: doc-1; source: kb"
+		conv := []Message{user, {Role: "assistant", ToolCalls: t1.ToolCalls}, {Role: "tool", Content: knowledge}}
+		t2 := DefaultScript(conv, tools)
+		if len(t2.ToolCalls) != 1 || t2.ToolCalls[0].Name != "web__web_search" || t2.ToolCalls[0].Args != `{"query":"returns policy"}` {
+			t.Fatalf("%s: second turn %+v", prefix, t2)
+		}
+		search := "[5] Web title\naddress: https://example.com/a\nref: REF1\nexcerpt: x"
+		conv = append(conv, Message{Role: "assistant", ToolCalls: t2.ToolCalls}, Message{Role: "tool", Content: search})
+		t3 := DefaultScript(conv, tools)
+		if len(t3.ToolCalls) != 1 || t3.ToolCalls[0].Name != "web__web_fetch" || t3.ToolCalls[0].Args != `{"ref":"REF1","url":"https://example.com/a"}` {
+			t.Fatalf("%s: third turn %+v", prefix, t3)
+		}
+		conv = append(conv, Message{Role: "assistant", ToolCalls: t3.ToolCalls}, Message{Role: "tool", Content: "[5] Web title (bytes 0–4 of 4)\naddress: https://example.com/a\n\npage"})
+		t4 := DefaultScript(conv, tools)
+		want := "Mixed: [3] [5] "
+		if len(t4.ToolCalls) != 0 || !strings.HasPrefix(t4.Text, want) {
+			t.Fatalf("%s: fourth turn %+v", prefix, t4)
+		}
+		if strings.HasSuffix(t4.Text, " Also [987].") != (prefix == "mixed-cite") {
+			t.Errorf("%s: %q", prefix, t4.Text)
+		}
+	}
+	// without all three tools the request is echoed, and an error ends the flow
+	if got := DefaultScript([]Message{{Role: "user", Content: "mixed: x"}}, tools[:2]); len(got.ToolCalls) != 0 {
+		t.Errorf("%+v", got)
+	}
+	user := Message{Role: "user", Content: "mixed: x"}
+	t1 := DefaultScript([]Message{user}, tools)
+	if got := DefaultScript([]Message{user, {Role: "assistant", ToolCalls: t1.ToolCalls}, {Role: "tool", Content: "error: the knowledge service is unavailable"}}, tools); got.Text != "error: the knowledge service is unavailable" {
+		t.Errorf("%+v", got)
+	}
+}
+
+func TestFanFlowCallsTheSubagentOncePerSegmentInOneStepAndJoinsTheAnswers(t *testing.T) {
+	tools := []string{"agent__researcher-c", "web__web_search"}
+	user := Message{Role: "user", Content: "fan: alpha please ;; beta please ;;  gamma "}
+	t1 := DefaultScript([]Message{user}, tools)
+	if len(t1.ToolCalls) != 3 {
+		t.Fatalf("%+v", t1)
+	}
+	for i, in := range []string{"alpha please", "beta please", "gamma"} {
+		if t1.ToolCalls[i].Name != "agent__researcher-c" || t1.ToolCalls[i].Args != `{"input":"`+in+`"}` {
+			t.Errorf("call %d: %+v", i, t1.ToolCalls[i])
+		}
+	}
+	conv := []Message{user, {Role: "assistant", ToolCalls: t1.ToolCalls},
+		{Role: "tool", Content: "found [3] and the parent's [1]"}, {Role: "tool", Content: "found [5]"}, {Role: "tool", Content: "found [6]"}}
+	if t2 := DefaultScript(conv, tools); t2.Text != "Fan: found [3] and the parent's [1] | found [5] | found [6]" || len(t2.ToolCalls) != 0 {
+		t.Errorf("%+v", t2)
+	}
+	// a single segment is one call; with no sub-agent tool the request is echoed
+	if got := DefaultScript([]Message{{Role: "user", Content: "fan: only"}}, tools); len(got.ToolCalls) != 1 || got.ToolCalls[0].Args != `{"input":"only"}` {
+		t.Errorf("%+v", got)
+	}
+	if got := DefaultScript([]Message{user}, []string{"web__web_search"}); len(got.ToolCalls) != 0 {
+		t.Errorf("%+v", got)
+	}
+}

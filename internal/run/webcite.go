@@ -35,6 +35,7 @@ type WebCitations struct {
 	Excess   int
 	Declared int  // entries in the array, valid or not
 	Present  bool // the result has a citations array, even an empty one
+	Cut      bool // the text was cut for D40's limit before the HOST saw it: a header in it proves nothing about what was cut off
 }
 
 // ParseWebCitations reads structuredContent.citations (platform ADR-0003 D9) as ParseCitations does and also says how many entries
@@ -119,7 +120,7 @@ func RenderWeb(text string, c WebCitations, first int, known func(webN int, url 
 	}
 	cites := c.Items
 	pos, ok := headerPositions(text, cites)
-	if !ok {
+	if !ok || c.Cut { // a text the limit cut proves nothing about the blocks that were cut off: whatever header is left may be a forged one
 		return renderIndexed(text, cites, first, known, limit)
 	}
 	type block struct {
@@ -170,21 +171,34 @@ func RenderWeb(text string, c WebCitations, first int, known func(webN int, url 
 			out.Used++
 		}
 	}
-	out.Text = capText(b.String()+neutralisedNote(changed), limit)
+	// idp-web's head line names the offset where ITS part of the page ends; a text cut here ends earlier, so the offset is no way to continue
+	out.Text = capTextWith(b.String()+neutralisedNote(changed), limit, func(cut, total int) string {
+		return fmt.Sprintf("\n[truncated here: %d of %d bytes shown; do not continue from the offset in the first line, it is past what you were shown]", cut, total)
+	})
 	return out
 }
 
 // capText cuts s to at most limit bytes at a character boundary, and says so; limit 0 is no limit.
 func capText(s string, limit int) string {
+	return capTextWith(s, limit, func(cut, total int) string {
+		return fmt.Sprintf("\n[truncated: %d of %d bytes shown]", cut, total)
+	})
+}
+
+// capTextWith is capText with the note it ends with: the result, note included, is at most limit bytes.
+func capTextWith(s string, limit int, note func(cut, total int) string) string {
 	if limit <= 0 || len(s) <= limit {
 		return s
 	}
-	note := fmt.Sprintf("\n[truncated: %d of %d bytes shown]", 0, len(s))
-	cut := max(limit-len(note)-8, 0)
+	cut := max(limit-len(note(limit, len(s))), 0) // the note with the longest numbers it can have
 	for cut > 0 && cut < len(s) && !utf8.RuneStart(s[cut]) {
 		cut--
 	}
-	return s[:cut] + fmt.Sprintf("\n[truncated: %d of %d bytes shown]", cut, len(s))
+	out := s[:cut] + note(cut, len(s))
+	if len(out) > limit {
+		return out[:limit]
+	}
+	return out
 }
 
 // number is the HOST's number for a cited source: the one the tree already gave this address, else next (isNew).
@@ -293,7 +307,11 @@ func renderIndexed(text string, cites []Source, first int, known func(int, strin
 	b.WriteString(neutral)
 	out.Text = b.String()
 	if limit > 0 && len(out.Text) > limit {
-		out.Text = out.Text[:head] + capText(neutral, limit-head)
+		if limit-head > 120 {
+			out.Text = out.Text[:head] + capText(neutral, limit-head)
+		} else {
+			out.Text = capText(out.Text, limit)
+		}
 	}
 	return out
 }
@@ -309,60 +327,72 @@ func NeutraliseText(text string, limit int) string {
 const openBrackets = "[［【〔〖〘〚⦋⦍⦏﹝❲⁅⟬"
 const closeBrackets = "]］】〕〗〙〛⦌⦎⦐﹞❳⁆⟭"
 
-// inBracket is what may stand between the brackets of a number as a model reads it: digits of any script, spaces of any kind (NBSP and the
-// ideographic space too), the invisible format characters (zero-width and the like), the separators, dashes and Markdown emphasis marks.
+// inBracket is what may stand between the brackets of a number as a model reads it: digits of any script and the other numerals
+// (superscripts), spaces of any kind (NBSP and the ideographic space too), combining marks (the keycap sequence 3 U+FE0F U+20E3 is a mark
+// after a digit), the invisible format characters (zero-width and the like), the separators, dashes and Markdown emphasis marks.
 func inBracket(r rune) bool {
-	return unicode.IsDigit(r) || unicode.IsSpace(r) || unicode.Is(unicode.Cf, r) || strings.ContainsRune(",;，、；*_`-‐‑‒–—―~", r)
+	return unicode.IsNumber(r) || unicode.IsSpace(r) || unicode.Is(unicode.M, r) || unicode.Is(unicode.Cf, r) || strings.ContainsRune(",;，、；*_`-‐‑‒–—―~", r)
 }
 
-// Neutralise turns every bracketed number in text from a page or a document ([3], [1, 2], 【4】, [ 5 ], \[3\], [**3**], [３], [3–4],
-// [\u200b3]) into ⟦3⟧: still readable as what the page wrote, but not a number the model can cite and not one the HOST's check of the
-// answer would take for a citation. A group is a bracket (or an escaped one) that opens, at least one digit and only digits, spaces,
-// invisible characters, separators, dashes and emphasis marks, and a bracket that closes (or an escaped one); the matching is done on the
-// text as it is, character by character, so that nothing that reads as a number slips through by being written another way. It returns the
-// number of groups changed. It is applied to everything a tool result holds that the HOST did not write, so that a page (or a document)
-// cannot put a citation number in front of the model, which is what a fake citation list in an excerpt would be. The ⟦ ⟧ of its own
-// output are not brackets of this kind, so it can be applied twice.
+// The brackets as HTML character references, which a model reads as the brackets they stand for: numeric (decimal and hexadecimal) and named.
+var openEntities = []string{"&#91;", "&#x5b;", "&lsqb;", "&lbrack;"}
+var closeEntities = []string{"&#93;", "&#x5d;", "&rsqb;", "&rbrack;"}
+
+// bracketAt is how many characters the opening (or closing) bracket at rs[i] takes: 1 for a bracket, 2 for one with a backslash before it,
+// the length of a character reference for one, 0 when there is none.
+func bracketAt(rs []rune, i int, brackets string, entities []string) int {
+	if i >= len(rs) {
+		return 0
+	}
+	switch {
+	case rs[i] == '\\' && i+1 < len(rs) && strings.ContainsRune(brackets, rs[i+1]):
+		return 2
+	case strings.ContainsRune(brackets, rs[i]):
+		return 1
+	case rs[i] == '&':
+		for _, e := range entities {
+			if i+len(e) <= len(rs) && strings.EqualFold(string(rs[i:i+len(e)]), e) {
+				return len(e)
+			}
+		}
+	}
+	return 0
+}
+
+// Neutralise turns every bracketed number in text from a page or a document ([3], [1, 2], 【4】, [ 5 ], \[3\], [**3**], [３], [³], [3-keycap],
+// [3–4], &#91;3&#93;, [\u200b3]) into ⟦3⟧: still readable as what the page wrote, but not a number the model can cite and not one the HOST's
+// check of the answer would take for a citation. A group is a bracket (escaped, or a character reference) that opens, at least one numeral
+// and only numerals, spaces, marks, invisible characters, separators, dashes and emphasis marks, and a bracket that closes; the matching is
+// done on the text as it is, character by character, so that nothing that reads as a number slips through by being written another way. It
+// returns the number of groups changed. It is applied to everything a tool result holds that the HOST did not write, so that a page (or a
+// document) cannot put a citation number in front of the model, which is what a fake citation list in an excerpt would be. The ⟦ ⟧ of its
+// own output are not brackets of this kind, so it can be applied twice.
 func Neutralise(text string) (string, int) {
-	if !strings.ContainsAny(text, openBrackets) {
+	if !strings.ContainsAny(text, openBrackets+"&") {
 		return text, 0
 	}
 	rs := []rune(text)
 	var b strings.Builder
 	n := 0
 	for i := 0; i < len(rs); {
-		start, j := i, 0
-		switch {
-		case rs[i] == '\\' && i+1 < len(rs) && strings.ContainsRune(openBrackets, rs[i+1]):
-			j = i + 2
-		case strings.ContainsRune(openBrackets, rs[i]):
-			j = i + 1
-		}
-		if j > 0 {
+		if open := bracketAt(rs, i, openBrackets, openEntities); open > 0 {
+			j := i + open
 			k, digits := j, false
 			for k < len(rs) && inBracket(rs[k]) {
-				digits = digits || unicode.IsDigit(rs[k])
+				digits = digits || unicode.IsNumber(rs[k])
 				k++
 			}
-			end := 0
-			switch {
-			case !digits || k >= len(rs):
-			case rs[k] == '\\' && k+1 < len(rs) && strings.ContainsRune(closeBrackets, rs[k+1]):
-				end = k + 2
-			case strings.ContainsRune(closeBrackets, rs[k]):
-				end = k + 1
-			}
-			if end > 0 {
+			if closing := bracketAt(rs, k, closeBrackets, closeEntities); digits && closing > 0 {
 				b.WriteString("⟦")
 				b.WriteString(string(rs[j:k]))
 				b.WriteString("⟧")
 				n++
-				i = end
+				i = k + closing
 				continue
 			}
 		}
-		b.WriteRune(rs[start])
-		i = start + 1
+		b.WriteRune(rs[i])
+		i++
 	}
 	return b.String(), n
 }

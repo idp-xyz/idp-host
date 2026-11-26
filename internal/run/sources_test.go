@@ -199,7 +199,7 @@ func TestCitationMarksAreFoundByTheGrammarAndNothingElseIsReported(t *testing.T)
 		{"an index in a code block", "```go\nx := a[7]\ny := b[1]\n```\nno marks here", "[]", "[]"},
 		{"a code block with tildes, not closed", "text\n~~~\nz[9]\n[1]", "[]", "[]"},
 		{"an index glued to a word", "set arr[7] and x_2[5] and a.b[9]", "[]", "[]"},
-		{"a mark glued to a letter is an index, known or not", "the claim[2] holds", "[]", "[]"},
+		{"a mark glued to a letter counts when its source is listed (here known is listed)", "the claim[2] holds", "[2]", "[]"},
 		{"an empty pair, a checkbox, a nested pair", "[] [ ] [[7]] and [1 2] and [1;2]", "[]", "[7]"},
 		{"a mark with text in it", "[1 see above] [2nd]", "[]", "[]"},
 		{"full-width brackets are not marks", "【1】［2］", "[]", "[]"},

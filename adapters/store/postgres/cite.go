@@ -2,7 +2,6 @@ package postgres
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 
 	"github.com/jackc/pgx/v5"
@@ -24,7 +23,7 @@ import (
 // commit together; the bulk of the answer (the message and the events) is written after it but is a few statements.
 
 // maxKnown bounds the memory of what the thread has numbered (reading the same address or passage again keeps its number); past it a source
-// is simply numbered again.
+// is simply numbered again. It is counted in citation_counters.known_count, not by counting rows.
 const maxKnown = 5000
 
 // rootOf is the root of the run tree that contains run id, and the thread of that root. parent_run_id never changes, so this needs no lock.
@@ -37,31 +36,65 @@ func rootOf(ctx context.Context, tx pgx.Tx, id string) (root, thread string, err
 	return root, thread, err
 }
 
-// lockCounter locks the thread's counter row (creating it) and returns the number the thread's next source gets and what it has numbered.
-func lockCounter(ctx context.Context, tx pgx.Tx, tenant, thread string) (int, map[string]int, error) {
+// lockCounter locks the thread's counter row (creating it) and returns the number the thread's next source gets and how many sources it
+// remembers.
+func lockCounter(ctx context.Context, tx pgx.Tx, tenant, thread string) (next, knownCount int, err error) {
 	if _, err := tx.Exec(ctx, `INSERT INTO citation_counters (tenant_id, thread_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, tenant, thread); err != nil {
-		return 0, nil, err
+		return 0, 0, err
 	}
-	var next int
-	var raw []byte
-	if err := tx.QueryRow(ctx, `SELECT next, known FROM citation_counters WHERE tenant_id = $1 AND thread_id = $2 FOR UPDATE`, tenant, thread).Scan(&next, &raw); err != nil {
-		return 0, nil, err
-	}
-	known := map[string]int{}
-	if err := json.Unmarshal(raw, &known); err != nil {
-		return 0, nil, err
-	}
-	return next, known, nil
+	err = tx.QueryRow(ctx, `SELECT next, known_count FROM citation_counters WHERE tenant_id = $1 AND thread_id = $2 FOR UPDATE`, tenant, thread).Scan(&next, &knownCount)
+	return next, knownCount, err
 }
 
-// moveCounter writes the new counter and what the answer's sources add to the known numbers.
-func moveCounter(ctx context.Context, tx pgx.Tx, tenant, thread string, next int, known map[string]int, items []run.Source) error {
+// threadTree is what the thread has numbered, asked key by key inside the transaction (only the keys of the answer being made are read).
+// A failed read is kept and reported by err: the questions have no way to return it.
+type threadTree struct {
+	ctx    context.Context
+	tx     pgx.Tx
+	tenant string
+	thread string
+	found  map[string]bool
+	failed error
+}
+
+func (t *threadTree) tree() *run.TreeNumbers {
+	return &run.TreeNumbers{Lookup: func(key string) (int, bool) {
+		var n int
+		err := t.tx.QueryRow(t.ctx, `SELECT n FROM citation_known WHERE tenant_id = $1 AND thread_id = $2 AND key = $3`, t.tenant, t.thread, key).Scan(&n)
+		switch {
+		case err == nil:
+			t.found[key] = true
+			return n, true
+		case errors.Is(err, pgx.ErrNoRows):
+			return 0, false
+		}
+		if t.failed == nil {
+			t.failed = err
+		}
+		return 0, false
+	}}
+}
+
+// remember writes the sources of an answer that the thread did not know (only those), up to maxKnown, and returns how many it wrote.
+func (t *threadTree) remember(items []run.Source, knownCount int) (int, error) {
 	add := run.KnownOf(items)
-	if len(known)+len(add) > maxKnown {
-		add = map[string]int{}
+	var keys []string
+	var nums []int32
+	for k, n := range add {
+		if !t.found[k] {
+			keys, nums = append(keys, k), append(nums, int32(n))
+		}
 	}
-	raw, _ := json.Marshal(add)
-	_, err := tx.Exec(ctx, `UPDATE citation_counters SET next = $3, known = known || $4::jsonb WHERE tenant_id = $1 AND thread_id = $2`, tenant, thread, next, raw)
+	if len(keys) == 0 || knownCount+len(keys) > maxKnown {
+		return 0, nil
+	}
+	tag, err := t.tx.Exec(t.ctx, `INSERT INTO citation_known (tenant_id, thread_id, key, n) SELECT $1, $2, k, n FROM unnest($3::text[], $4::int[]) AS u(k, n) ON CONFLICT DO NOTHING`, t.tenant, t.thread, keys, nums)
+	return int(tag.RowsAffected()), err
+}
+
+// moveCounter writes the new counter and how many sources were remembered more.
+func moveCounter(ctx context.Context, tx pgx.Tx, tenant, thread string, next, remembered int) error {
+	_, err := tx.Exec(ctx, `UPDATE citation_counters SET next = $3, known_count = known_count + $4 WHERE tenant_id = $1 AND thread_id = $2`, tenant, thread, next, remembered)
 	return err
 }
 
@@ -72,7 +105,7 @@ func (s *Store) AnswerCited(ctx context.Context, c *run.Claim, id string, cite r
 		if err != nil {
 			return err
 		}
-		first, known, err := lockCounter(ctx, tx, c.TenantID, thread) // the counter's row before the run's own
+		first, knownCount, err := lockCounter(ctx, tx, c.TenantID, thread) // the counter's row before the run's own
 		if err != nil {
 			return err
 		}
@@ -80,9 +113,13 @@ func (s *Store) AnswerCited(ctx context.Context, c *run.Claim, id string, cite r
 		if err != nil {
 			return err
 		}
-		a, err := cite(first, &run.TreeNumbers{Known: known})
+		th := &threadTree{ctx: ctx, tx: tx, tenant: c.TenantID, thread: thread, found: map[string]bool{}}
+		a, err := cite(first, th.tree())
 		if err != nil {
 			return err
+		}
+		if th.failed != nil {
+			return th.failed
 		}
 		if a.Used < 0 {
 			return errors.New("an answer cannot take a negative number of citation numbers")
@@ -91,12 +128,12 @@ func (s *Store) AnswerCited(ctx context.Context, c *run.Claim, id string, cite r
 		if a.Src != nil {
 			items = a.Src.Items
 		}
-		if a.Used > 0 {
-			if err := moveCounter(ctx, tx, c.TenantID, thread, first+a.Used, known, items); err != nil {
-				return err
-			}
-		} else if len(run.KnownOf(items)) > 0 {
-			if err := moveCounter(ctx, tx, c.TenantID, thread, first, known, items); err != nil {
+		remembered, err := th.remember(items, knownCount)
+		if err != nil {
+			return err
+		}
+		if a.Used > 0 || remembered > 0 { // nothing new: nothing is written to the counter
+			if err := moveCounter(ctx, tx, c.TenantID, thread, first+a.Used, remembered); err != nil {
 				return err
 			}
 		}
@@ -121,15 +158,20 @@ func (s *Store) CiteContext(ctx context.Context, c *run.Claim, count int, source
 		if err != nil {
 			return err
 		}
-		var known map[string]int
-		if first, known, err = lockCounter(ctx, tx, c.TenantID, thread); err != nil {
+		var knownCount int
+		if first, knownCount, err = lockCounter(ctx, tx, c.TenantID, thread); err != nil {
 			return err
 		}
 		if _, err := s.owned(ctx, tx, c); err != nil {
 			return err
 		}
 		items := sources(first)
-		if err := moveCounter(ctx, tx, c.TenantID, thread, first+count, known, nil); err != nil {
+		th := &threadTree{ctx: ctx, tx: tx, tenant: c.TenantID, thread: thread, found: map[string]bool{}}
+		remembered, err := th.remember(items, knownCount)
+		if err != nil {
+			return err
+		}
+		if err := moveCounter(ctx, tx, c.TenantID, thread, first+count, remembered); err != nil {
 			return err
 		}
 		return recordSources(ctx, tx, c, &run.SourceBatch{Items: items})

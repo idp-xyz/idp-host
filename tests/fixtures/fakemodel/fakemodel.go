@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"path"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -122,6 +123,18 @@ var webRE = regexp.MustCompile(`(?s)^(web|web-obey|web-cite):\s*(.+)$`)
 // any number a caller's sources reach in an acceptance run.
 const InventedCitation = 987
 
+// the first block header of a web result as the HOST writes it ("[n] title" followed by "address:"): n is the HOST's number of the
+// entry. hostNumber is 1 for a result without one (a fresh thread's first source, and what the flows said before the HOST numbered).
+var blockHeaderRE = regexp.MustCompile(`(?m)^\[(\d+)\] [^\n]*\naddress:`)
+
+func hostNumber(result string) int {
+	if m := blockHeaderRE.FindStringSubmatch(result); m != nil {
+		n, _ := strconv.Atoi(m[1])
+		return n
+	}
+	return 1
+}
+
 // the first entry of a search result: "[n] title\naddress: <url>\nref: <ref>"
 var searchEntryRE = regexp.MustCompile(`(?m)^\[\d+\] [^\n]*\naddress: (\S+)\nref: (\S+)`)
 var pageURLRE = regexp.MustCompile(`https?://[^\s<>"'\x60)\]]+`)
@@ -188,7 +201,7 @@ func webFlow(messages []Message, has func(string) bool, toolName func(string) st
 		}
 		return call("web_fetch", map[string]any{"url": e[1], "ref": e[2]})
 	case strings.HasSuffix(prev, "web_fetch") && !obey:
-		text := "Result [1]: " + firstRunes(last.Content, 300)
+		text := fmt.Sprintf("Result [%d]: ", hostNumber(last.Content)) + firstRunes(last.Content, 300)
 		if m[1] == "web-cite" {
 			text += fmt.Sprintf(" Also [%d].", InventedCitation)
 		}
@@ -199,7 +212,7 @@ func webFlow(messages []Message, has func(string) bool, toolName func(string) st
 			// obey the page: fetch the first URL in it, with the ref of the search result
 			u := pageURLRE.FindString(last.Content)
 			if u == "" || e == nil {
-				return Turn{Text: "Result [1]: " + firstRunes(last.Content, 300)}, true
+				return Turn{Text: fmt.Sprintf("Result [%d]: ", hostNumber(last.Content)) + firstRunes(last.Content, 300)}, true
 			}
 			return call("web_fetch", map[string]any{"url": strings.TrimRight(u, ".,;:"), "ref": e[2]})
 		}
@@ -217,6 +230,106 @@ func webFlow(messages []Message, has func(string) bool, toolName func(string) st
 		}
 	}
 	return Turn{Text: "Result: " + last.Content}, true
+}
+
+// "mixed: <q>" and "mixed-cite: <q>" (idp-host D70): knowledge__search(q), then web_search(q), then web_fetch of the first web entry by its ref,
+// and the answer "Mixed: [K] [W] <what it read>": K is the first number of the knowledge result, W the HOST's number of the fetched entry.
+// "mixed-cite:" adds " Also [987]." (InventedCitation), a number nobody gave.
+var mixedRE = regexp.MustCompile(`(?s)^(mixed|mixed-cite):\s*(.+)$`)
+
+func mixedFlow(messages []Message, has func(string) bool, toolName func(string) string) (Turn, bool) {
+	var m []string
+	user := -1
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" {
+			m, user = mixedRE.FindStringSubmatch(messages[i].Content), i
+			break
+		}
+	}
+	if m == nil || !has("knowledge__search") || !has("web_search") || !has("web_fetch") {
+		return Turn{}, false
+	}
+	query := strings.TrimSpace(m[2])
+	call := func(tool string, args map[string]any) (Turn, bool) {
+		b, _ := json.Marshal(args)
+		return Turn{Reasoning: "next step of the mixed request", ToolCalls: []Call{{Name: toolName(tool), Args: string(b)}}}, true
+	}
+	var results []string
+	for _, x := range messages[user+1:] {
+		if x.Role == "tool" {
+			results = append(results, x.Content)
+		}
+	}
+	if n := len(results); n > 0 && strings.HasPrefix(results[n-1], "error") {
+		return Turn{Text: results[n-1]}, true
+	}
+	switch len(results) {
+	case 0:
+		return call("knowledge__search", map[string]any{"query": query})
+	case 1:
+		return call("web_search", map[string]any{"query": query})
+	case 2:
+		e := searchEntryRE.FindStringSubmatch(results[1])
+		if e == nil {
+			return Turn{Text: "No web results: " + results[1]}, true
+		}
+		return call("web_fetch", map[string]any{"url": e[1], "ref": e[2]})
+	}
+	k := 1
+	if kn := knowNumberRE.FindStringSubmatch(results[0]); kn != nil {
+		k, _ = strconv.Atoi(kn[1])
+	}
+	text := fmt.Sprintf("Mixed: [%d] [%d] %s", k, hostNumber(results[2]), firstRunes(results[2], 200))
+	if m[1] == "mixed-cite" {
+		text += fmt.Sprintf(" Also [%d].", InventedCitation)
+	}
+	return Turn{Text: text}, true
+}
+
+// "fan: <input A> ;; <input B>" (idp-host D70): in one step the offered agent__* tool is called once per ";;" segment with {"input": segment}, as
+// parallel tool calls; after the results the answer is "Fan: " and the results joined with " | ". Each child's answer carries its own [n].
+var fanRE = regexp.MustCompile(`(?s)^fan:\s*(.+)$`)
+
+func fanFlow(messages []Message, tools []string) (Turn, bool) {
+	var m []string
+	user := -1
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" {
+			m, user = fanRE.FindStringSubmatch(messages[i].Content), i
+			break
+		}
+	}
+	agentTool := ""
+	for _, t := range tools {
+		if strings.HasPrefix(t, "agent__") {
+			agentTool = t
+			break
+		}
+	}
+	if m == nil || agentTool == "" {
+		return Turn{}, false
+	}
+	var segments []string
+	for _, s := range strings.Split(m[1], ";;") {
+		if s = strings.TrimSpace(s); s != "" {
+			segments = append(segments, s)
+		}
+	}
+	var results []string
+	for _, x := range messages[user+1:] {
+		if x.Role == "tool" {
+			results = append(results, strings.TrimSpace(x.Content))
+		}
+	}
+	if len(results) == 0 {
+		var calls []Call
+		for _, s := range segments {
+			b, _ := json.Marshal(map[string]any{"input": s})
+			calls = append(calls, Call{Name: agentTool, Args: string(b)})
+		}
+		return Turn{Reasoning: "one sub-agent call per input", ToolCalls: calls}, true
+	}
+	return Turn{Text: "Fan: " + strings.Join(results, " | ")}, true
 }
 
 // the knowledge flows (idp-host D65): "know: <query>" searches and answers citing the numbers of what it found;
@@ -424,6 +537,12 @@ func DefaultScript(messages []Message, tools []string) Turn {
 		return name
 	}
 	if t, ok := editFlow(messages, has, toolName); ok {
+		return t
+	}
+	if t, ok := mixedFlow(messages, has, toolName); ok {
+		return t
+	}
+	if t, ok := fanFlow(messages, tools); ok {
 		return t
 	}
 	if t, ok := webFlow(messages, has, toolName); ok {

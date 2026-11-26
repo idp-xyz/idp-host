@@ -242,7 +242,10 @@ type turn struct {
 	marked     map[string]bool                      // the part of external that is only the gateway's marker (D51): no pattern of the operator names it
 	repeatable map[string]bool                      // gateway tool -> its annotations as listed now say that calling it again does no harm (D47)
 	readOnly   map[string]bool                      // gateway tool -> the gateway lists it with readOnlyHint true: it may run beside other calls (D53)
-	credMu     sync.Mutex                           // guards cred and credErr: the calls of a group ask for the bearer at once (D53)
+	credMu     ctxLock                              // guards cred and credErr: the calls of a group ask for the bearer at once (D53); a wait for it ends with the call
+	shownMu    sync.Mutex                           // guards shown
+	shown      map[string]string                    // the headings and sheets shown neutralised, by what the model reads, to what the document wrote (D82)
+	cmiMu      ctxLock                              // guards cmiCred and cmiFailed, apart from the gateway credential: neither waits for the other
 	credErr    error                                // a renewal that failed for good: asked again, the answer is the same (D53)
 	subagents  map[string]agent.EmbeddedSubagent    // by tool name (D22)
 	resources  map[string]map[string]agent.Resource // on-demand skill resources by skill and name (D23)
@@ -270,6 +273,27 @@ type turn struct {
 	kTools     []string                             // the knowledge tools this turn offers (setupKnowledge)
 	outSchema  map[string]json.RawMessage           // the outputSchema each outward tool listed, pinned for the turn (D71)
 }
+
+// ctxLock is a mutex whose wait ends with a context: a call that is cancelled or past its deadline does not stay queued behind a renewal that
+// may take half a minute. The zero value is ready.
+type ctxLock struct {
+	once sync.Once
+	ch   chan struct{}
+}
+
+func (l *ctxLock) init() { l.once.Do(func() { l.ch = make(chan struct{}, 1) }) }
+
+func (l *ctxLock) lock(ctx context.Context) error {
+	l.init()
+	select {
+	case l.ch <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (l *ctxLock) unlock() { <-l.ch }
 
 // Formats a gateway tool's input schema gives a property that takes a member's file (D37): the model writes
 // attachment:N or output there, and the HOST puts the run's ticket in its place just before the call.
@@ -852,8 +876,10 @@ func (t *turn) bearerFor(force bool, refused string) (string, error) {
 	if gw.StaticBearer != "" {
 		return gw.StaticBearer, nil
 	}
-	t.credMu.Lock()
-	defer t.credMu.Unlock()
+	if err := t.credMu.lock(t.callCtx); err != nil {
+		return "", errInterrupted
+	}
+	defer t.credMu.unlock()
 	if t.credErr != nil {
 		return "", t.credErr
 	}
@@ -1429,6 +1455,7 @@ func (t *turn) invoke(ctx context.Context, tc run.ToolCall, args json.RawMessage
 	// when the result is written (settleOutcome); the text the model reads has the HOST's numbers, never idp-web's.
 	if t.external[tc.Tool] {
 		wc := run.ParseWebCitations(res.StructuredContent)
+		wc.Cut = res.TextLen() > t.limits.ToolResultBytes // the text the model would have read was cut for D40: a header in it proves nothing
 		o.web = &wc
 		o.structured, o.schema = res.StructuredContent, t.outSchema[tc.Tool]
 	}
@@ -2485,6 +2512,17 @@ func (t *turn) guardedMessages() ([]agui.Message, error) {
 		t.notes = nil
 	}
 	nextNote := 0
+	// D79: the results of the caller's own tools are untrusted text like any other, in a thread that numbers
+	frontendCall := map[string]bool{}
+	if t.numbering() {
+		for _, m := range t.messages {
+			for _, c := range m.ToolCalls {
+				if t.frontend[c.Function.Name] {
+					frontendCall[c.ID] = true
+				}
+			}
+		}
+	}
 	for i, m := range t.messages {
 		for nextNote < len(t.notes) && t.notes[nextNote].after <= i { // D59: a note stays where it was written: after the thread as it was then
 			msgs = append(msgs, t.notes[nextNote].msg)
@@ -2493,6 +2531,10 @@ func (t *turn) guardedMessages() ([]agui.Message, error) {
 		body := m.Content
 		if s, ok := view.results[m.ID]; ok {
 			body = s
+		}
+		if m.Role == agui.RoleTool && frontendCall[m.ToolCallID] {
+			m.Content, _ = run.Neutralise(m.Content)
+			body, _ = run.Neutralise(body)
 		}
 		m = view.withShownArguments(m)
 		if m.Role == agui.RoleTool && m.Content != "" && in.ToolResults != guard.ModeOff { // an error-only result is the HOST's own text

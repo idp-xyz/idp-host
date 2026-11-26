@@ -46,3 +46,12 @@ func TestWhatIsRecordedOfAPassageFitsTheContractsLengths(t *testing.T) {
 		t.Errorf("%+v", got)
 	}
 }
+
+func TestTheSamePlaceWithOtherTextIsAnotherPassage(t *testing.T) {
+	a, _ := KnowledgeSource(1, Item{Kind: "knowledge", ID: "d", Excerpt: "Returns are accepted within 30 days."})
+	b, _ := KnowledgeSource(2, Item{Kind: "knowledge", ID: "d", Excerpt: "Returns are accepted within 30 days."})
+	c, _ := KnowledgeSource(3, Item{Kind: "knowledge", ID: "d", Excerpt: "Returns are accepted within 60 days."})
+	if a.Digest == "" || a.Digest != b.Digest || a.Digest == c.Digest {
+		t.Errorf("%q %q %q", a.Digest, b.Digest, c.Digest)
+	}
+}
