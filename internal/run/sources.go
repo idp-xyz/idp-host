@@ -18,7 +18,7 @@ import (
 
 // Bounds on what is recorded (D49).
 const (
-	MaxSources    = 100       // sources of one run; beyond that entries are dropped and counted
+	MaxSources    = 100       // web sources of one run, and knowledge sources of one run, each; beyond that entries are dropped and counted
 	MaxSourceN    = 1_000_000 // the largest citation number taken as sane: idp-web numbers per caller and keeps counting
 	MaxSourceURL  = 2048      // bytes of an address
 	MaxSourceText = 300       // runes of a title
@@ -82,6 +82,9 @@ type SourceSet struct {
 	Conflicts        int      `json:"conflicts,omitempty"` // a number given again with another address; the first address was kept
 	Checked          bool     `json:"checked,omitempty"`   // the citation check ran when the run completed
 	Unverified       []int    `json:"unverified,omitempty"`
+	// Unlisted: numbers the answer cites that the tree did give (they are below the counter) but that this list does not hold: a source
+	// past the cap of its kind, one of a parent or a sibling (D74).
+	Unlisted []int `json:"unlisted,omitempty"`
 	// Unnumbered counts the successful results of the run's outward tools that carried no structured citations, whose text went to
 	// the model as it was, with no number (D71).
 	Unnumbered int `json:"unnumbered,omitempty"`
@@ -263,7 +266,7 @@ func (s *SourceSet) Merge(b *SourceBatch) {
 			}
 			continue
 		}
-		if len(s.Items) >= MaxSources {
+		if s.count(in.Kind) >= MaxSources { // web and knowledge sources have a cap of their own
 			s.DroppedOverLimit++
 			continue
 		}
@@ -271,6 +274,17 @@ func (s *SourceSet) Merge(b *SourceBatch) {
 		copy(s.Items[i+1:], s.Items[i:])
 		s.Items[i] = in
 	}
+}
+
+// count is how many sources of a kind the set holds.
+func (s *SourceSet) count(kind string) int {
+	n := 0
+	for _, it := range s.Items {
+		if it.Kind == kind || it.Kind == "" && kind == KindWeb {
+			n++
+		}
+	}
+	return n
 }
 
 func earlier(a, b string) bool {
@@ -311,6 +325,12 @@ func (s *SourceSet) checkKnowing(answer string, given int) {
 	}
 	s.Checked = true
 	s.Unverified = unknown
+	s.Unlisted = nil
+	for _, n := range cited {
+		if _, ok := known[n]; !ok {
+			s.Unlisted = append(s.Unlisted, n)
+		}
+	}
 }
 
 // A group of numbers in square brackets: [3], [1, 2]. Numbers have no leading zero and at most six digits.
@@ -351,8 +371,9 @@ const maxUnverifiedDigits = 3
 //     is two marks. A range such as [1-3] is not a mark.
 //   - Not marks, whatever the numbers: anything inside a code block (fenced or inline); [n](...) and [n][...] preceded
 //     by a bracketed text, which are Markdown links; [x], [2026], [ ] and anything else that is not made of those numbers.
-//   - A group glued to a word ("array[1]") is a citation only if it names a known source, and is never reported as
-//     unknown, because it reads as an index. A number of more than three digits is never reported as unknown.
+//   - A group glued to an ASCII letter, digit or underscore ("array[1]", "word[3]") is an index and never a citation, whether or not
+//     a source has that number. One glued to other text (CJK: "文档[3]") is a citation. A number of more than three digits is never
+//     reported as unknown.
 func CitationMarks(answer string, known func(int) bool) (cited, unknown []int) {
 	text := withoutCode(answer)
 	seenCited, seenUnknown := map[int]bool{}, map[int]bool{}
@@ -372,6 +393,9 @@ func CitationMarks(answer string, known func(int) bool) (cited, unknown []int) {
 				glued = true
 			}
 		}
+		if glued {
+			continue // array[3], word[3]: an index, not a citation, whatever is numbered 3
+		}
 		for _, f := range strings.FieldsFunc(text[loc[2]:loc[3]], func(r rune) bool { return r == ',' || r == ' ' || r == '\t' }) {
 			n, err := strconv.Atoi(f)
 			if err != nil {
@@ -380,7 +404,7 @@ func CitationMarks(answer string, known func(int) bool) (cited, unknown []int) {
 			switch {
 			case known(n):
 				seenCited[n] = true
-			case !glued && len(f) <= maxUnverifiedDigits:
+			case len(f) <= maxUnverifiedDigits:
 				seenUnknown[n] = true
 			}
 		}
@@ -409,18 +433,52 @@ func keys(m map[int]bool) []int {
 // Event is the payload of idp.host/run.sources, the record at the end of a run (D49): the full list and what was not
 // recorded.
 func (s *SourceSet) Event() map[string]any {
-	items := s.Normalised()
-	unverified := s.Unverified
+	web, know := SplitSources(s.Items)
+	unverified, unlisted := s.Unverified, s.Unlisted
 	if unverified == nil {
 		unverified = []int{}
 	}
-	return map[string]any{"sources": items, "unverifiedCitations": unverified, "droppedInvalid": s.DroppedInvalid, "droppedOverLimit": s.DroppedOverLimit, "conflicts": s.Conflicts, "checked": s.Checked, "unnumberedResults": s.Unnumbered}
+	if unlisted == nil {
+		unlisted = []int{}
+	}
+	return map[string]any{"sources": web, "knowledgeSources": know, "unverifiedCitations": unverified, "unlistedCitations": unlisted, "droppedInvalid": s.DroppedInvalid,
+		"droppedOverLimit": s.DroppedOverLimit, "conflicts": s.Conflicts, "checked": s.Checked, "unnumberedResults": s.Unnumbered}
 }
 
-// Normalised is the list as it is shown: never nil, and every source has its kind (one stored before D70 has none and is a web
-// source).
-func (s *SourceSet) Normalised() []Source {
-	return NormaliseSources(s.Items)
+// WebSource is a web source as the run's representation and the event show it (contract RunSource): what it was before D70, with the
+// HOST's number in n and, for audit, idp-web's in webN.
+type WebSource struct {
+	N         int    `json:"n"`
+	Title     string `json:"title"`
+	URL       string `json:"url"`
+	FetchedAt string `json:"fetchedAt,omitempty"`
+	SHA256    string `json:"sha256,omitempty"`
+	WebN      int    `json:"webN,omitempty"`
+	Cited     bool   `json:"cited"`
+}
+
+// KnowledgeSource is a knowledge source as the representation shows it (contract KnowledgeSource): the passage's document and place.
+type KnowledgeSource struct {
+	N          int    `json:"n"`
+	Title      string `json:"title"`
+	DocumentID string `json:"documentId"`
+	Where      string `json:"where,omitempty"`
+	Source     string `json:"source,omitempty"`
+	Cited      bool   `json:"cited"`
+}
+
+// SplitSources divides a list of sources by kind for the representation: web sources keep the shape they always had, knowledge sources
+// are a list of their own (D75). Both are in the order of the numbers.
+func SplitSources(items []Source) (web []WebSource, knowledge []KnowledgeSource) {
+	web, knowledge = []WebSource{}, []KnowledgeSource{}
+	for _, it := range items {
+		if it.Kind == KindKnowledge {
+			knowledge = append(knowledge, KnowledgeSource{N: it.N, Title: it.Title, DocumentID: it.DocumentID, Where: it.Where, Source: it.Origin, Cited: it.Cited})
+		} else {
+			web = append(web, WebSource{N: it.N, Title: it.Title, URL: it.URL, FetchedAt: it.FetchedAt, SHA256: it.SHA256, WebN: it.WebN, Cited: it.Cited})
+		}
+	}
+	return web, knowledge
 }
 
 // NormaliseSources returns a copy of items in which every source has its kind.

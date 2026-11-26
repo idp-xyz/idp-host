@@ -184,7 +184,7 @@ func TestCitationMarksAreFoundByTheGrammarAndNothingElseIsReported(t *testing.T)
 		{"known and unknown together", "It rose [1][9] and [2, 8].", "[1 2]", "[8 9]"},
 		{"at the start of a line and in a list item", "- first [3]\n[2] second", "[2 3]", "[]"},
 		{"a footnote line", "[1]: https://a.example/ the page", "[1]", "[]"},
-		{"in Chinese text", "营业额为41,872[1]。另见[7]。", "[1]", "[7]"},
+		{"in Chinese text", "营业额为41,872元[1]。另见[7]。", "[1]", "[7]"},
 		{"a mark that repeats", "[4] and [4] and [4]", "[]", "[4]"},
 		{"a known large number", "see [12] and [123456]", "[12]", "[]"}, // an unknown of more than three digits is not reported
 		// what is not
@@ -199,7 +199,7 @@ func TestCitationMarksAreFoundByTheGrammarAndNothingElseIsReported(t *testing.T)
 		{"an index in a code block", "```go\nx := a[7]\ny := b[1]\n```\nno marks here", "[]", "[]"},
 		{"a code block with tildes, not closed", "text\n~~~\nz[9]\n[1]", "[]", "[]"},
 		{"an index glued to a word", "set arr[7] and x_2[5] and a.b[9]", "[]", "[]"},
-		{"a glued mark of a known source still counts", "the claim[2] holds", "[2]", "[]"},
+		{"a mark glued to a letter is an index, known or not", "the claim[2] holds", "[]", "[]"},
 		{"an empty pair, a checkbox, a nested pair", "[] [ ] [[7]] and [1 2] and [1;2]", "[]", "[7]"},
 		{"a mark with text in it", "[1 see above] [2nd]", "[]", "[]"},
 		{"full-width brackets are not marks", "【1】［2］", "[]", "[]"},

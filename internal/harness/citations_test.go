@@ -43,7 +43,7 @@ func TestWebAndKnowledgeResultsAreNumberedFromOneCounterAndTheModelReadsOnlyTheH
 	e, _ := knowEnv(t, handbook())
 	idpWebAt(e, "an ordinary excerpt", 7, 9)
 	e.model.Script = seq(call("knowledge__search", `{"query":"returns"}`), call("web_search", `{"query":"q"}`), call("knowledge__find", `{"documentId":"doc-1","text":"fuel"}`),
-		fakemodel.Turn{Text: "from the handbook [1], the web [4] [5], the find [6] and a number nobody gave [42]"})
+		fakemodel.Turn{Text: "from the handbook [1], the web [4] [5], the find [3] and a number nobody gave [42]"})
 	m := newWebRun(knowAndWebDef(), "go", "run_1", "tok", run.Input{ExternalTools: true, ContextCeiling: "restricted", ContextTrigger: "external-tools"})
 	runKnow(t, e, m)
 	if m.status != run.StatusCompleted {
@@ -62,26 +62,26 @@ func TestWebAndKnowledgeResultsAreNumberedFromOneCounterAndTheModelReadsOnlyTheH
 	if strings.Contains(msgs[1].Content, "[7]") || strings.Contains(msgs[1].Content, "[9]") {
 		t.Errorf("idp-web's numbers reached the model: %q", msgs[1].Content)
 	}
-	if !strings.Contains(msgs[2].Content, "[6] Returns policy") {
-		t.Errorf("the find goes on from the web numbers: %q", msgs[2].Content)
+	if !strings.Contains(msgs[2].Content, "[3] Returns policy") { // the passage the search numbered 3 keeps its number (D73)
+		t.Errorf("%q", msgs[2].Content)
 	}
 	src := sourcesOf(m)
-	if len(src) != 6 {
+	if len(src) != 5 {
 		t.Fatalf("%+v", src)
 	}
-	if fmt.Sprint(ns(src)) != "[1 2 3 4 5 6]" || src[3].Kind != run.KindWeb || src[3].WebN != 7 || src[4].WebN != 9 || src[0].Kind != run.KindKnowledge || src[0].DocumentID != "doc-1" {
+	if fmt.Sprint(ns(src)) != "[1 2 3 4 5]" || src[3].Kind != run.KindWeb || src[3].WebN != 7 || src[4].WebN != 9 || src[0].Kind != run.KindKnowledge || src[0].DocumentID != "doc-1" {
 		t.Errorf("%+v", src)
 	}
 	if ev := finalEvent(t, m); fmt.Sprint(ev["unverifiedCitations"]) != "[42]" {
 		t.Errorf("only the number nobody gave is flagged: %v", ev)
 	}
-	if !src[0].Cited || !src[3].Cited || !src[4].Cited || !src[5].Cited || src[1].Cited {
+	if !src[0].Cited || !src[2].Cited || !src[3].Cited || !src[4].Cited || src[1].Cited {
 		t.Errorf("cited marks %+v", src)
 	}
 	if n := eventsNamed(m, agui.CustomCitationsNumbered); len(n) != 1 || fmt.Sprint(n[0]["numbers"]) != "[map[n:4 webN:7] map[n:5 webN:9]]" {
 		t.Errorf("the audit event: %v", n)
 	}
-	if m.counter() != 7 {
+	if m.counter() != 6 {
 		t.Errorf("the counter is at %d", m.counter())
 	}
 }
@@ -117,7 +117,8 @@ func TestAWebResultWithoutStructuredCitationsIsPassedThroughAndRecordedAsUnnumbe
 	if err := e.h.Run(context.Background(), claim); err != nil {
 		t.Fatal(err)
 	}
-	if got := toolMessages2(m)[0].Content; got != "plain text with [3] inside" {
+	// an outward tool means the run numbers: what it returns carries no number of its own (D72), even without structured citations
+	if got := toolMessages2(m)[0].Content; !strings.HasPrefix(got, "plain text with ⟦3⟧ inside") {
 		t.Errorf("%q", got)
 	}
 	if ev := eventsNamed(m, agui.CustomCitationsUnnumbered); len(ev) != 1 || ev[0]["reason"] != "no_structured_citations" {

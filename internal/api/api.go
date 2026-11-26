@@ -712,7 +712,7 @@ func (a *API) createRun(r *http.Request, p authorization.Principal, ref, key str
 	}
 	out, replayed, err := a.Store.CreateRun(r.Context(), p.Tenant, postgres.CreateRunInput{ThreadID: in.ThreadID, RunID: in.RunID, AgentRef: ag.ID, Owner: p.Subject,
 		IdempotencyKey: key, Messages: in.Messages, Input: input, Credential: cred, FileTickets: tickets, TraceID: observability.TraceID(r.Context()), Traceparent: observability.Traceparent(r.Context()),
-		ReleaseID: releaseID, ExecutionRef: opts.ExecutionRef, ContextPackageID: packageID, Extra: extra, CMICredential: cmiCred, RewriteUsage: rewrote, RawHash: rawHash, CitationNext: input.CitationNext, Sources: input.CitedSources})
+		ReleaseID: releaseID, ExecutionRef: opts.ExecutionRef, ContextPackageID: packageID, Extra: extra, CMICredential: cmiCred, RewriteUsage: rewrote, RawHash: rawHash, CitationNext: input.CitationNext, CitationFirst: input.CitationFirst, Sources: input.CitedSources})
 	return out, replayed, err
 }
 
@@ -866,7 +866,17 @@ func (a *API) resolveContext(r *http.Request, p authorization.Principal, doc *ag
 	// stops; without them nothing is numbered
 	first := 0
 	if numbered {
+		// D70: the numbers go on from the thread's counter: the model reads the whole thread, and a follow-up run must not give a number
+		// that an earlier run of it already did
 		first = 1
+		if in.ThreadID != "" {
+			n, err := a.Store.CitationNext(r.Context(), p.Tenant, in.ThreadID)
+			if err != nil {
+				return skip("the thread's citation counter could not be read", err)
+			}
+			first = n
+		}
+		input.CitationFirst, input.ContextNumbered = first, true
 	}
 	entries, next := cmiclient.ContextFrom(pkg.Items, first)
 	var withheld *cmiclient.Screening
@@ -886,7 +896,7 @@ func (a *API) resolveContext(r *http.Request, p authorization.Principal, doc *ag
 	}
 	resolved := map[string]any{"packageId": pkg.PackageID, "digest": pkg.Digest, "items": len(pkg.Items), "appended": len(entries), "tokens": pkg.Tokens, "query": query}
 	if numbered {
-		resolved["firstIndex"], resolved["numbered"] = 1, next-1
+		resolved["firstIndex"], resolved["numbered"] = first, next-first
 	}
 	events = append(events, agui.Custom(agui.CustomContextResolved, resolved))
 	if withheld != nil && withheld.Withheld > 0 {

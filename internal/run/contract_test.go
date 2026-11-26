@@ -166,12 +166,13 @@ func exampleRuns(releaseID, digest string) []run.Run {
 		// found by the search, and the answer also wrote [8], which the tree never gave.
 		{ID: "run_01JD7Q3Z8M8T0G3C6N4V9S2A1F", ThreadID: "thr-ops-45", AgentID: "9e8d7c6b-0000-4000-8000-000000000002", ReleaseID: releaseID, ReleaseDigest: digest, Owner: "carol",
 			Status: run.StatusCompleted, StepCount: 4, DeadlineAt: at.Add(50 * time.Minute), CreatedAt: at.Add(40 * time.Minute), StartedAt: at.Add(40*time.Minute + time.Second), FinishedAt: at.Add(40*time.Minute + 20*time.Second),
-			Sources: []run.Source{
-				{N: 1, Kind: run.KindKnowledge, Title: "Customs handbook", DocumentID: "doc-handbook-12", Where: "page 3; Clearance > Times", Origin: "ops-handbook", Cited: true},
-				{N: 2, Kind: run.KindWeb, Title: "Port of Rotterdam: customs clearance times", URL: "https://www.portofrotterdam.example/en/customs", FetchedAt: "2026-11-03T13:41:07Z", WebN: 7,
+			Sources: []run.WebSource{
+				{N: 2, Title: "Port of Rotterdam: customs clearance times", URL: "https://www.portofrotterdam.example/en/customs", FetchedAt: "2026-11-03T13:41:07Z", WebN: 7,
 					SHA256: "5d41402abc4b2a76b9719d911017c592a1b2c3d4e5f60718293a4b5c6d7e8f90", Cited: true},
-				{N: 3, Kind: run.KindWeb, Title: "Duty rates, chapter 84", URL: "https://tariff.example/hs/84", WebN: 9},
-				{N: 4, Kind: run.KindWeb, Title: "报关单填写规范", URL: "https://customs.example.cn/guide?id=5", FetchedAt: "2026-11-03T13:41:30Z", WebN: 12, SHA256: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}},
+				{N: 3, Title: "Duty rates, chapter 84", URL: "https://tariff.example/hs/84", WebN: 9},
+				{N: 4, Title: "报关单填写规范", URL: "https://customs.example.cn/guide?id=5", FetchedAt: "2026-11-03T13:41:30Z", WebN: 12, SHA256: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}},
+			KnowledgeSources:    []run.KnowledgeSource{{N: 1, Title: "Customs handbook", DocumentID: "doc-handbook-12", Where: "page 3; Clearance > Times", Source: "ops-handbook", Cited: true}},
+			UnlistedCitations:   []int{5},
 			UnverifiedCitations: []int{8}},
 		{ID: "run_01JD7Q3Z8M8T0G3C6N4V9S2A1D", ThreadID: "thr-ops-43", AgentID: "9e8d7c6b-0000-4000-8000-000000000002", ReleaseID: releaseID, ReleaseDigest: digest, Owner: "carol",
 			Status: run.StatusFailed, StepCount: 12, CancelRequested: false, FailureCode: run.FailStepLimit, FailureMessage: "the run reached its limit of 12 steps",
@@ -360,7 +361,7 @@ func TestContractFieldsMatchGo(t *testing.T) {
 		"RunOptions": run.Options{}, "SubagentRef": agent.SubagentRef{}, "EmbeddedSubagent": agent.EmbeddedSubagent{}, "SkillMerge": agent.SkillMerge{}, "Resource": agent.Resource{},
 		"Guards": agent.Guards{}, "InputGuard": agent.InputGuard{}, "OutputGuard": agent.OutputGuard{}, "Evaluation": agent.Evaluation{}, "EvalCase": agent.EvalCase{}, "Expectation": agent.Expectation{},
 		"Routing": agent.Routing{}, "Candidate": agent.Candidate{}, "A2ARef": agent.A2ARef{}, "ContextPolicy": agent.ContextPolicy{},
-		"FileAttachment": run.Attachment{}, "FileDelivery": run.Delivery{}, "RunSource": run.Source{}}
+		"FileAttachment": run.Attachment{}, "FileDelivery": run.Delivery{}, "RunSource": run.WebSource{}, "KnowledgeSource": run.KnowledgeSource{}}
 	for def, zero := range closed {
 		d, ok := defs[def].(map[string]any)
 		if !ok {
@@ -650,29 +651,25 @@ func TestContractRejectsRunSourcesTheHostWouldNotRecord(t *testing.T) {
 	if err := k.validate("AgentRun", base(good())); err != nil {
 		t.Fatalf("a valid source is refused: %v", err)
 	}
-	if err := k.validate("AgentRun", base(map[string]any{"n": 2, "kind": "knowledge", "title": "t", "documentId": "d1", "where": "page 3", "source": "kb", "cited": true})); err != nil {
-		t.Fatalf("a knowledge source has no address and is valid: %v", err)
-	}
 	if err := k.validate("AgentRun", base(with2(good(), "webN", 7), good())); err != nil {
 		t.Fatalf("webN: %v", err)
 	}
 	with := func(key string, v any) map[string]any { m := good(); m[key] = v; return m }
 	cases := map[string][]map[string]any{
-		"n zero":                       {with("n", 0)},
-		"n a string":                   {with("n", "1")},
-		"url ftp":                      {with("url", "ftp://a.example/x")},
-		"url javascript":               {with("url", "javascript:alert(1)")},
-		"url with a space":             {with("url", "https://a.example/a b")},
-		"sha256 upper case":            {with("sha256", strings.Repeat("A", 64))},
-		"sha256 short":                 {with("sha256", "abc")},
-		"fetchedAt not a time":         {with("fetchedAt", "yesterday")},
-		"title too long":               {with("title", strings.Repeat("x", 301))},
-		"cited missing":                {{"n": 1, "title": "t", "url": "https://a.example/x"}},
-		"web without an address":       {{"n": 1, "title": "t", "cited": false}},
-		"web by kind without one":      {{"n": 1, "kind": "web", "title": "t", "cited": false}},
-		"knowledge without a document": {{"n": 1, "kind": "knowledge", "title": "t", "cited": false}},
-		"unknown kind":                 {with("kind", "video")},
-		"unknown field (excerpt)":      {with("excerpt", "page text")},
+		"n zero":                              {with("n", 0)},
+		"n a string":                          {with("n", "1")},
+		"url ftp":                             {with("url", "ftp://a.example/x")},
+		"url javascript":                      {with("url", "javascript:alert(1)")},
+		"url with a space":                    {with("url", "https://a.example/a b")},
+		"sha256 upper case":                   {with("sha256", strings.Repeat("A", 64))},
+		"sha256 short":                        {with("sha256", "abc")},
+		"fetchedAt not a time":                {with("fetchedAt", "yesterday")},
+		"title too long":                      {with("title", strings.Repeat("x", 301))},
+		"cited missing":                       {{"n": 1, "title": "t", "url": "https://a.example/x"}},
+		"web without an address":              {{"n": 1, "title": "t", "cited": false}},
+		"kind is not a field of a web source": {with("kind", "web")},
+		"a knowledge source in the web list":  {{"n": 1, "title": "t", "documentId": "d1", "cited": false}},
+		"unknown field (excerpt)":             {with("excerpt", "page text")},
 	}
 	for name, srcs := range cases {
 		if err := k.validate("AgentRun", base(srcs...)); err == nil {
@@ -691,6 +688,44 @@ func TestContractRejectsRunSourcesTheHostWouldNotRecord(t *testing.T) {
 			"status": "COMPLETED", "stepCount": 1, "cancelRequested": false, "deadlineAt": "2026-11-03T13:10:00Z", "createdAt": "2026-11-03T13:00:00Z", "unverifiedCitations": v})
 		if err := k.validate("AgentRun", raw); err == nil {
 			t.Errorf("unverifiedCitations %s: the schema accepts it", name)
+		}
+	}
+}
+
+// D75: the knowledge sources are a list of their own, closed and bounded as the HOST records them; and an AgentRun whose every value is as
+// long as the HOST can write it is valid against the contract (the cuts of what is recorded fit the schema's lengths).
+func TestContractAcceptsKnowledgeSourcesAndTheLongestValuesTheHostRecords(t *testing.T) {
+	k := loadContract(t)
+	runWith := func(extra map[string]any) []byte {
+		m := map[string]any{"runId": "run_1", "threadId": "thr_1", "agentId": "a", "releaseId": "r", "releaseDigest": "sha256:" + strings.Repeat("a", 64), "owner": "o",
+			"status": "COMPLETED", "stepCount": 1, "cancelRequested": false, "deadlineAt": "2026-11-03T13:10:00Z", "createdAt": "2026-11-03T13:00:00Z"}
+		for key, v := range extra {
+			m[key] = v
+		}
+		raw, _ := json.Marshal(m)
+		return raw
+	}
+	title := strings.Repeat("题", run.MaxSourceText)
+	ks := run.Source{N: 1000000, Kind: run.KindKnowledge, Title: cmiclientOneLine(strings.Repeat("题", 500), run.MaxSourceText), DocumentID: strings.Repeat("d", 128), Where: cmiclientOneLine(strings.Repeat("x", 3000), 1000), Origin: strings.Repeat("s", 64)}
+	ws := run.Source{N: 1000000, Kind: run.KindWeb, Title: title, URL: "https://a.example/" + strings.Repeat("p", 2048-len("https://a.example/")), WebN: 1000000, FetchedAt: "2026-11-03T13:41:07Z", SHA256: strings.Repeat("f", 64)}
+	web, know := run.SplitSources([]run.Source{ws, ks})
+	if err := k.validate("AgentRun", runWith(map[string]any{"sources": web, "knowledgeSources": know, "unverifiedCitations": []int{999}, "unlistedCitations": []int{1, 2}})); err != nil {
+		t.Fatalf("the longest values the HOST records: %v", err)
+	}
+	var manyK []run.KnowledgeSource
+	for i := 1; i <= 101; i++ {
+		manyK = append(manyK, run.KnowledgeSource{N: i, Title: "t", DocumentID: "d"})
+	}
+	for name, extra := range map[string]map[string]any{
+		"101 knowledge sources":                 {"knowledgeSources": manyK},
+		"a knowledge source without a document": {"knowledgeSources": []map[string]any{{"n": 1, "title": "t", "cited": false}}},
+		"a document id of 129":                  {"knowledgeSources": []run.KnowledgeSource{{N: 1, Title: "t", DocumentID: strings.Repeat("d", 129)}}},
+		"a where of 1001":                       {"knowledgeSources": []run.KnowledgeSource{{N: 1, Title: "t", DocumentID: "d", Where: strings.Repeat("w", 1001)}}},
+		"a knowledge field is unknown":          {"knowledgeSources": []map[string]any{{"n": 1, "title": "t", "documentId": "d", "cited": false, "url": "https://a.example/"}}},
+		"unlisted twice":                        {"unlistedCitations": []int{3, 3}},
+	} {
+		if err := k.validate("AgentRun", runWith(extra)); err == nil {
+			t.Errorf("%s: the schema accepts it", name)
 		}
 	}
 }

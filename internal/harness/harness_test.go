@@ -168,12 +168,7 @@ func (m *memStore) AnswerCited(_ context.Context, _ *run.Claim, id string, cite 
 	if err := m.check(); err != nil {
 		return err
 	}
-	tree := &run.TreeNumbers{Web: map[int]run.Source{}}
-	for _, s := range m.sources.Items {
-		if s.WebN > 0 && s.Kind != run.KindKnowledge {
-			tree.Web[s.WebN] = s
-		}
-	}
+	tree := &run.TreeNumbers{Known: run.KnownOf(m.sources.Items)}
 	first := m.counter()
 	a, err := cite(first, tree)
 	if err != nil {

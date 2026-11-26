@@ -1873,3 +1873,69 @@ KB8 之后发现的问题（D69-5 的"调查"）：知识条目的 `[n]` 由 HOS
 | 先搜后读保持 HOST 号 | 不查树里已有的号 | `TestAReadOfASearchedAddressKeepsItsHostNumber` |
 
 满尺寸读取通过 HOST 的传输：`TestAFullSizeReadOfIdpWebIsAccepted`（`mcpclient`）；端到端：`TestAMaximumSizeReadGoesThroughD40AsTheTextTheModelIsGiven`（原始结果约两倍大，模型读到的整段不截）。这些上限是常数，没有"拿掉"一说。
+
+
+**D70–D76 独立评审后的修订（2026-11-26，决策人委托维护方决定）。**对 127193d 的独立评审提出下列缺陷，决策人**委托维护方决定**，按下面改。迁移 0017 尚未推送，**就地修改了 0017（没有加 0018）**。它修订上面 D70（计数器的范围与锁）、D72（中和的范围与写法）、D75（运行表示里的知识来源）、D76（租约）的话，以这一节为准。
+
+| # | 决策（决策人委托维护方决定） | 理由 |
+|---|---|---|
+| D77 | **计数器属于线程，不属于运行树。**模型读的是整个线程，后续一个运行从 `[1]` 重新数，会与前面运行的 `[1]` 重号（评审复现：第二个运行引用 `[1]`，D49 把它记到错的来源上；旧版 idp-web 的编号从不回绕，所以这是退步）。新表 `citation_counters(tenant_id, thread_id, next, known jsonb)`（迁移 0017，RLS）：键是**根运行的线程**；线程里的每个运行（后续根运行、子 agent、孙 agent）都从这一行取号，运行开头那个包也是（`Store.CitationNext` 读线程的计数器，API 按它编号；`CreateRun` 在锁住这一行后核对计数器还是编号时的值，不是则 409"请再发一次"，线程同一时刻只有一个在途运行，实际碰不到）。`runs.citation_next` 删去。分配仍是原子的：`AnswerCited` 先锁**计数器那一行**、再锁运行自己的行，用计数器当前的值做出答案，把计数器移动答案用掉的个数并写回答案，一起提交；**只有这一行被这样锁**，根运行的行不再被任何分配锁住（"锁成本"问题随之消失，评审第 8 条）。锁持有到这个事务提交：计数器与答案必须一起提交才没有空洞，所以没有把答案的写入挪到锁外；写入只是几条语句，没有对外调用。`known` 记已编号的东西（网页地址：idp-web 的编号加地址；知识段落：文档加位置）到号的映射，**同一个地址或同一段再遇到沿用原号**，不用再扫整棵树（`treeNumbers` 删去），至多记 5000 项，超过的不再记、再遇到就再编一个号。D49 的有效号：小于**线程**计数器的都是线程里给过的号（知识与网页共用），子 agent、父运行、后续运行互相引用都有效。 | 一个模型一个线程一套号；锁只在一行上，不挡根运行的心跳与取消。 |
+| D78 | **D40 管的是最后给模型的文字，在写完、中和之后再限一次。**`⟦n⟧` 把每个 `[n]` 从 3 个字节变成 7 个字节，再加说明与来源表。文字改写路径、索引路径、结构路径都在最后再限：从末尾起整块地去掉（`NotShown` 与 `Used` 随之更新，没显示的不编号），只剩一块时截短并写明；索引路径限的是中和过的原文。评审的情形（16 KiB 的 `[1]` 重复）在限之内。 | 评审：限在中和之前量，中和之后会超。 |
+| D79 | **编号的运行里，一切不可信的结果都中和。**运行"编号"指：开了知识工具、第一个包编过号、或发布件有对外工具（`turn.numbering()`）。这样的运行里：对外工具没有结构化引用的结果（原来原样放行）、非对外的工具的结果（沙箱等）、出错的结果、**远端 A2A 子 agent 的回答**都经 `Neutralise`，有变动时加一句说明；**本地子 agent 的回答不中和**：它的号就是线程的号。没有编号的运行（既没有知识工具也没有对外工具）读到的文字一字不差。评审的情形：README 里的"see [2]"，同一运行里知识来源 2 存在。 | 页面、文件、远端 agent 都能写 `[2]`，在编过号的运行里就会被当成知识来源 2。 |
+| D80 | **`Neutralise` 先把写法归一再匹配。**一组是：开括号（`[ ［ 【 〔 〖 〘 〚 ⦋ ⦍ ⦏ ﹝ ❲ ⁅ ⟬`，或前面带反斜杠）、至少一个数字（任何文字的数字）、只有数字、任何空白（含不换行空格与全角空格）、不可见的格式字符（零宽等，Cf）、逗号分号顿号、各种连字符与破折号、Markdown 的强调符号（`* _` 与反引号）、闭括号（以上闭括号之一，或带反斜杠）。输出 `⟦…⟧`，里面的内容原样保留（`[**3**]` 成 `⟦**3**⟧`）。`⟦ ⟧` 不是开括号，所以可以再中和一次。"其他 Ps/Pe 对里看着像方括号的"取上面的集合，没有把所有 Unicode 括号都算进来（圆括号、尖括号、引号不算，`(3)` 不是引用）。字符数不保持（`[3]` 的 3 个字符变成 3 个，`\[3\]` 的 5 个变成 3 个，但字节变多），长度由 D78 的再限处理。 | 评审确认的漏洞：转义的 `\[3\]`、括号里的零宽字符、NBSP、全角空格、`[*3*]`、`[3—4]`、`[3；4]`、`〖3〗` 等。 |
+| D81 | **知识来源。**(a) 同一线程里同一段（文档 id 加位置）再遇到沿用原号，不取新号；位置为空的不去重（两个没有位置的不一定是同一段）。同一文档同一位置的两块不同文字会共用一个号：位置是标题路径加页码，这是已知的粗，写在这里。运行开头的包与刷新不去重（它们在知识工具之前）。(b) 网页来源与知识来源各自至多 100 条（`MaxSources` 按种类数），超出的计入 `droppedOverLimit`。(c) D49 的核对多一个结果：**回答里引用了、线程里给过（小于计数器）、但两个列表里都没有的号**记为 `unlistedCitations`（事件 `idp.host/run.sources` 与运行的表示），与 `unverifiedCitations`（没人给过的号）分开，供 Workspace 提醒"请核对"而不是"编造"。子运行引用父运行的号也会出现在子运行自己的 `unlistedCitations` 里。 | 评审第 7 条。 |
+| D82 | **模型发回来的标识要还原。**`knowledge__read` 的 `locator.headings`、`locator.sheet` 与 `knowledge__find` 的 `text`：模型读到的是中和过的 `Annex ⟦2⟧`，发给 CMI 之前把 `⟦`、`⟧` 换回 `[`、`]`（`restoreBrackets`）。残余的歧义：原文本身有 `⟦`、`⟧` 的文档很少，那样的标题发给 CMI 带的是方括号，找不到。 | 评审第 9 条：不还原，带方括号的标题永远读不到。 |
+| D83 | **文字改写路径遇到任何歧义就走索引（来源表加中和过的原文），不再"取靠后的"。**歧义：块头（编号加地址行）重复出现、中间缺一块、末尾的块头被 D40 截掉了、顺序不对。D71 里"同一个块有两种读法时取靠后的"作废。 | 评审：取靠后的仍会被构造的摘录骗到。 |
+| D84 | **租约只由取得它的运行还。**租约旁新加一个随机令牌（`credential_renew_token`、`cmi_renew_token`）：还租约与写回时的清租约只在令牌还是自己的时才做；租约到期被别的运行接手后，原持有者既不清别人的租约、其结果仍写回（比较并交换在凭据本身上，已完成的轮换不能丢；这是对"也在比较并交换里比较令牌"的一处有意偏离，理由如此）。等待的预算是租约加最长的一次调用加一秒（`renewBudget` 32 秒，租约 16 秒），所以崩掉的持有者的租约到期后，等待者能接手并还来得及做自己的调用；调用本身另有 15 秒的限（`boundedRefresh`）。续期的事务遇到死锁（SQLSTATE 40P01）重试一次。`SaveCredential` 先锁持有者再锁自己。 | 评审：租约被接手后原持有者会清掉新持有者的租约；等待预算不比租约长，接不了手。 |
+| D85 | **小修。**(a) 契约不削弱 `sources`：`url` 仍必需，条目只有网页来源，可选 `webN`；知识来源在**新的可选数组 `knowledgeSources`**（`n`、`title`、`documentId`、`where`、`source`、`cited`），消费者按 `n` 合并；`kind` 不再是 `RunSource` 的字段；`sha256` 的说明写明是 idp-web 给它自己那段文字的摘要，不是 HOST 写给模型的文字的摘要；`knowledgeSources` 至多 100 条，`unlistedCitations` 新增。(b) 记下来的长度合契约：`OneLine` 截断后含省略号至多 n 个字符，文档 id 不截（空的、超过 128 个字符的不记，这个段落仍有号），`where` 至多 1000、`source` 至多 64；有一个测试用各字段最长的值校验 AgentRun。(c) D49 的语法：粘在 ASCII 字母、数字、下划线后面的 `[3]`（`word[3]`、`array[3]`）不是引用，不管有没有来源是 3；粘在中日韩文字后的（`文档[3]`）是。(d) 第一个包编了号但没有知识条目的运行，之后刷新带进来的条目仍编号并中和（`Input.ContextNumbered` 随运行存储，原来靠条目描述里的号判断）。(e) `citations: []`（没有结果的搜索）不记为"没有编号"。(f) 同一线程里同一个来源（网页或知识）再遇到的号不变。 | 评审的小项。 |
+
+**迁移 0017（就地修改）：需要停机。**停 API 与 worker，运行 `idp-host migrate`，再启动：回填读线程里每一条工具结果（`thread_messages` 里 role 为 tool 的消息，找行首的 `[n] `），所以要在没有写入时做，耗时随工具结果的总量增长。回填按租户逐个做（行级安全对表所有者也生效），并要求回填后线程的计数器是：线程里任何运行已给出的最大编号加一，取事件里的知识编号、来源表里 idp-web 的编号、工具结果里模型读到的块头号三者之大（来源表最多记 100 条，超出的只在工具结果里）。没有给出过号的线程没有计数器行。测试：以不是超级用户、不绕过行级安全、拥有这些表的角色，对两个租户跑一遍（`TestTheMigrationBackfillWorksForANonSuperuserOwner…`）。
+
+**拿掉一个控制、看测试失败**（D77–D85 的每一行，在仓库的隔离副本里一次改一处）
+
+| 控制 | 拿掉的东西 | 失败的测试 |
+|---|---|---|
+| 后续运行的第一个包从线程的计数器起编（D77） | 恒从 1 | `TestAFollowUpRunInAThreadGoesOnFromTheThreadsNumbersOnPostgres` |
+| 第一个包把计数器移到它的号之后 | 起点恒为 1 | 同上、`TestSeveralChildren…` |
+| 计数器是线程的（根运行的线程） | 按运行自己的 | `TestTheCounterIsTakenRootFirst…`、`TestSeveralChildren…` |
+| 先锁计数器行、再锁自己的行 | 先锁自己的行 | `TestTheCounterIsTakenRootFirstAndNeverGivenTwiceOnPostgres` |
+| 计数器移动答案用掉的个数 | 不移动 | 同上、`TestSeveralChildren…` |
+| 核对认线程的号（D74） | 存储只传 0 | `TestAFollowUpRunInAThreadGoesOnFromTheThreadsNumbersOnPostgres` |
+| 迁移：工具结果里的块头号 | 去掉 | `TestMigrationContinuesThreadsInUseFromTheirMaximumOnPostgres` |
+| 迁移：来源表里 idp-web 的号 | 去掉 | 同上 |
+| 迁移：事件里的知识编号 | 去掉 | 同上 |
+| 迁移：树里的子运行 | 只看根运行 | 同上 |
+| 迁移：按租户逐个做 | 去掉 `set_config` | `TestTheMigrationBackfillWorksForANonSuperuserOwnerWithRowLevelSecurityOnPostgres` |
+| 中和转义的括号（D80） | 去掉 | `TestNeutraliseCoversEveryShapeAModelCouldReadAsACitation` |
+| 中和括号里的不可见字符 | 去掉 Cf | 同上 |
+| 中和不换行空格、全角空格 | 只认普通空格 | 同上 |
+| 中和 Markdown 强调 | 去掉 `* _` 与反引号 | 同上 |
+| 中和连字符与破折号 | 去掉 | 同上 |
+| 中和其他方括号 | 只认三种 | 同上 |
+| 再限：整块去掉末尾的块（D78） | 不再去 | `TestWhatTheModelIsGivenIsWithinD40EvenAfterNeutralisation` |
+| 再限：文字改写的输出 | 不限 | 同上 |
+| 再限：索引与它的原文 | 不限 | 同上 |
+| 有歧义就走索引（D83） | 取第一个读法 | `TestAnAmbiguousTextIsNotRewrittenButListedAndNeutralised` |
+| 缺块头就走索引 | 去掉 | `TestACutResultIsListedNotRewrittenAndWhatItListsIsWhatItNumbers` |
+| 粘在单词后的 `[3]` 不是引用（D85 c） | 去掉 | `TestANumberGluedToAWordIsNotACitationButOneGluedToCJKTextIs`、`TestCitationMarks…` |
+| 网页与知识各一个上限（D81 b） | 合用一个 | `TestKnowledgeAndWebSourcesHaveCapsOfTheirOwnAndAValidNumberNotListedIsSaid` |
+| 给过但没列出的号单独说（D81 c） | 不记 | 同上 |
+| 同一段再遇到沿用原号（D81 a） | 不查 | `TestThePassageTheThreadHasNumberedKeepsItsNumberWhenItComesAgain` |
+| 编号的运行中和工具结果（D79） | 去掉 | `TestARunThatNumbersNeutralisesWhatEveryToolReturnsAndNothingElse` |
+| 没有结构化引用的对外结果也中和 | 去掉 | 同上、`TestAWebResultWithoutStructured…` |
+| 远端 agent 的回答中和（本地的不中和） | 去掉 | `TestARemoteAgentsAnswerIsNeutralisedAndALocalSubagentsIsNot` |
+| 标题还原（D82） | 不还原 | `TestAHeadingTheModelReadWithBracketsGoesBackToTheCMIAsItWas` |
+| 要找的文字还原 | 不还原 | 同上 |
+| 第一个包编了号没有条目的运行，刷新仍编号（D85 d） | 看条目描述 | `TestARefreshOfAFirstPackageThatNumberedNothingStillNumbersAndNeutralises` |
+| 空的引用列表不记为"没有编号"（D85 e） | 记 | `TestAnEmptyListOfCitationsIsASearchThatFoundNothingNotAResultWithoutNumbers` |
+| 文档 id 不截 | 超长的也记 | `TestWhatIsRecordedOfAPassageFitsTheContractsLengths` |
+| 截断后含省略号至多 n 个字符 | 多一个 | 同上 |
+| 租约只由持有者还（D84，续期失败） | 不比令牌 | `TestALeaseIsGivenBackOnlyByTheRunThatTookItOnPostgres` |
+| 租约只由持有者还（写回） | 不比令牌 | 同上 |
+| `SaveCredential` 先锁持有者 | 去掉这一锁 | `TestSaveCredentialLocksTheHolderFirstOnPostgres` |
+| 契约：`sources` 的 `url` 仍必需 | 去掉 | `TestContractRejectsRunSourcesTheHostWouldNotRecord` |
+| 契约：知识来源的长度 | 去掉 `documentId` 的上限 | `TestContractAcceptsKnowledgeSourcesAndTheLongestValuesTheHostRecords` |
+
+**没有证明的（如实写下）：**(1) 续期事务遇到死锁重试一次（需要制造死锁）；(2) 等待预算 32 秒与租约 16 秒是常数，没有测试；(3) `known` 的持久化（写进 `citation_counters.known`）只被内存替身的去重测试与 `TestKnowledgeToolsOnPostgres`（搜索与查找沿用开头那个包的号）间接覆盖，没有拿掉 `moveCounter` 里写 `known` 的那一行单独看；(4) `known` 到 5000 项的上限；(5) D81 (a) 的"粗"（同一位置的两块文字共用一个号）；(6) 迁移在大数据量上的耗时只测了合成数据。
+
+**迁移 0017 回填耗时（合成数据，PostgreSQL 17，本机容器，一个连接）：**每个线程一棵树（一个根运行与两个子运行），每个运行 6 条工具结果（每条约 8 KB 文字，行首有 `[n] ` 块头），每个根运行的事件里有一条知识编号事件。1000 个线程（3000 个运行、18000 条工具结果）3.1 秒；5000 个线程（15000 个运行、90000 条工具结果，未压缩约 720 MB 文字）10.8 秒；基本是线性的，约每个线程 2 毫秒、每万条工具结果 1.2 秒。外推：十万个线程、两百万条工具结果约 4 分钟。生产数据的消息大小与线程形状不同，应先在备份的副本上跑一次（`IDP_TEST_BACKFILL_THREADS=n go test -run TestMigrationBackfillTime ./tests/integration/` 用合成数据；真数据直接在副本上 `idp-host migrate` 并计时）。

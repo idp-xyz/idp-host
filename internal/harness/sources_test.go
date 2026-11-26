@@ -308,7 +308,7 @@ func TestARunThatSearchedAndReadHasItsSourcesCitedAndUnverifiedMarked(t *testing
 		t.Errorf("unverified %v: [7] is not a source; [2026], [x] and the link are not citations", m.sources.Unverified)
 	}
 	ev := finalEvent(t, m)
-	if len(ev["sources"].([]run.Source)) != 3 || fmt.Sprint(ev["unverifiedCitations"]) != "[7]" || ev["droppedInvalid"] != 0 || ev["droppedOverLimit"] != 0 || ev["conflicts"] != 0 || ev["checked"] != true {
+	if len(ev["sources"].([]run.WebSource)) != 3 || fmt.Sprint(ev["unverifiedCitations"]) != "[7]" || ev["droppedInvalid"] != 0 || ev["droppedOverLimit"] != 0 || ev["conflicts"] != 0 || ev["checked"] != true {
 		t.Errorf("%v", ev)
 	}
 	// the event comes before the end of the run and nothing came during it

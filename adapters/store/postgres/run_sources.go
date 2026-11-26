@@ -71,7 +71,7 @@ func (s *Store) CheckSources(ctx context.Context, c *run.Claim, answer string) e
 			return err
 		}
 		// D74: the numbers of the whole run tree are valid, whichever run of it was given them
-		given, err := citationsGiven(ctx, tx, c.RunID)
+		given, err := citationsGiven(ctx, tx, c.TenantID, c.RunID)
 		if err != nil {
 			return err
 		}
@@ -111,9 +111,14 @@ func attachSources(ctx context.Context, tx pgx.Tx, runs ...*run.Run) error {
 		if err := json.Unmarshal(raw, &set); err != nil {
 			return err
 		}
-		byID[id].Sources, byID[id].UnverifiedCitations = run.NormaliseSources(set.Items), set.Unverified
-		if len(set.Items) == 0 {
-			byID[id].Sources = nil
+		web, know := run.SplitSources(set.Items)
+		r := byID[id]
+		r.Sources, r.KnowledgeSources, r.UnverifiedCitations, r.UnlistedCitations = web, know, set.Unverified, set.Unlisted
+		if len(web) == 0 {
+			r.Sources = nil
+		}
+		if len(know) == 0 {
+			r.KnowledgeSources = nil
 		}
 	}
 	return rows.Err()

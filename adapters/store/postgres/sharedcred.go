@@ -2,11 +2,14 @@ package postgres
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"idp-host/internal/credential"
 	"idp-host/internal/run"
@@ -26,6 +29,28 @@ import (
 // renewLease is how long a renewal may take before another run may take over.
 const renewLease = 16 * time.Second // just above the longest renewal (the harness gives the call 15 s), so a waiter can take over from a crashed holder in its own budget
 
+// RenewBudget is how long a run may spend on one renewal, waiting included: the lease, the longest call to the authorization server (the harness
+// gives it 15 s) and a second to spare, so that a run that waits behind a holder that crashed can take the lease over when it runs out and still
+// make its own call.
+const RenewBudget = renewLease + 15*time.Second + time.Second
+
+// withDeadlockRetry runs a short transaction again once when the database chose it to end a deadlock (SQLSTATE 40P01): the other
+// transaction is just as short, and the renewal of a credential shared by a tree should not fail for that.
+func withDeadlockRetry(fn func() error) error {
+	err := fn()
+	var pe *pgconn.PgError
+	if errors.As(err, &pe) && pe.Code == "40P01" {
+		err = fn()
+	}
+	return err
+}
+
+func newLeaseToken() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
 // renewPoll is how long a run waits before it looks again for a renewal that another run is making.
 const renewPoll = 100 * time.Millisecond
 
@@ -41,6 +66,7 @@ type credSnap struct {
 type credKind struct {
 	refCol   string // the column of a sub-agent run that names the run holding the credential
 	leaseCol string // the column of the holder that carries the renewal lease
+	tokenCol string // the column of the holder that says who holds the lease: a random token, given back only by the run that took it
 	valueCol string // the column the compare and swap watches: NULL when the holder has no credential
 	cols     string // what a read of the holder selects, in the order dests scans it
 	dests    func(*credSnap) []any
@@ -52,7 +78,7 @@ type credKind struct {
 
 // cmiKind is the member's credential for the CMI: one sealed document in cmi_credential (D68).
 var cmiKind = credKind{
-	refCol: "cmi_credential_ref", leaseCol: "cmi_renewing_until", valueCol: "cmi_credential", cols: "cmi_credential",
+	refCol: "cmi_credential_ref", leaseCol: "cmi_renewing_until", tokenCol: "cmi_renew_token", valueCol: "cmi_credential", cols: "cmi_credential",
 	dests: func(c *credSnap) []any { return []any{&c.sealed} },
 	open:  func(s *Store, c credSnap) (*credential.Token, error) { return s.openToken(c.sealed) },
 	write: func(s *Store, next *credential.Token) (string, []any, error) {
@@ -64,7 +90,7 @@ var cmiKind = credKind{
 
 // gatewayKind is the run's delegated credential for the gateway: the access token, its expiry and the refresh token apart (D8, D38).
 var gatewayKind = credKind{
-	refCol: "credential_ref", leaseCol: "credential_renewing_until", valueCol: "credential", cols: "credential, credential_expires_at, credential_refresh",
+	refCol: "credential_ref", leaseCol: "credential_renewing_until", tokenCol: "credential_renew_token", valueCol: "credential", cols: "credential, credential_expires_at, credential_refresh",
 	dests: func(c *credSnap) []any { return []any{&c.sealed, &c.expires, &c.refresh} },
 	open: func(s *Store, c credSnap) (*credential.Token, error) {
 		if s.Box == nil {
@@ -146,22 +172,26 @@ func (s *Store) RenewRunCredential(ctx context.Context, c *run.Claim, seen *cred
 }
 
 func (s *Store) renewShared(ctx context.Context, c *run.Claim, k credKind, seen *credential.Token, force bool, renew func(ctx context.Context, refreshToken string) (*credential.Token, error)) (*credential.Token, error) {
+	token := newLeaseToken() // who holds the lease: given back only by the run that took it
 	for {
-		snap, lease, holder, err := s.takeRenewal(ctx, c, k)
+		var snap credSnap
+		var lease bool
+		var holder string
+		err := withDeadlockRetry(func() (e error) { snap, lease, holder, e = s.takeRenewal(ctx, c, k, token); return e })
 		if err != nil {
 			return nil, err
 		}
 		cur, err := k.open(s, snap)
 		if err != nil {
 			if lease {
-				_ = s.dropRenewal(context.WithoutCancel(ctx), c, k, holder) // a lease taken must not outlive a credential nobody can open
+				_ = s.dropRenewal(context.WithoutCancel(ctx), c, k, holder, token) // a lease taken must not outlive a credential nobody can open
 			}
 			return nil, err
 		}
 		switch {
 		case cur != nil && seen != nil && cur.AccessToken != seen.AccessToken:
 			if lease {
-				if err := s.dropRenewal(ctx, c, k, holder); err != nil {
+				if err := s.dropRenewal(ctx, c, k, holder, token); err != nil {
 					return nil, err
 				}
 			}
@@ -171,7 +201,7 @@ func (s *Store) renewShared(ctx context.Context, c *run.Claim, k credKind, seen 
 				return cur, nil // another run is renewing and this token still works: use it meanwhile
 			}
 			// (a forced renewal is one the service refused the stored token for: it waits for the holder's result, it does not take that token again)
-			// another run is renewing and this token has expired: look again shortly
+			// another run is renewing and this token has expired: look again shortly; when the holder crashed the lease runs out and this run takes it
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
@@ -181,7 +211,7 @@ func (s *Store) renewShared(ctx context.Context, c *run.Claim, k credKind, seen 
 		}
 		next, rerr := renew(ctx, cur.RefreshToken) // nothing is locked here
 		if rerr != nil {
-			if err := s.dropRenewal(context.WithoutCancel(ctx), c, k, holder); err != nil && !errors.Is(err, run.ErrFenced) {
+			if err := s.dropRenewal(context.WithoutCancel(ctx), c, k, holder, token); err != nil && !errors.Is(err, run.ErrFenced) {
 				return nil, err
 			}
 			return nil, rerr
@@ -189,7 +219,7 @@ func (s *Store) renewShared(ctx context.Context, c *run.Claim, k credKind, seen 
 		if next.RefreshToken == "" {
 			next.RefreshToken = cur.RefreshToken
 		}
-		if err := s.storeRenewed(context.WithoutCancel(ctx), c, k, holder, snap.sealed, next); err != nil {
+		if err := s.storeRenewed(context.WithoutCancel(ctx), c, k, holder, snap.sealed, token, next); err != nil {
 			return nil, err
 		}
 		return next, nil
@@ -198,7 +228,7 @@ func (s *Store) renewShared(ctx context.Context, c *run.Claim, k credKind, seen 
 
 // takeRenewal reads the credential and tries to take the renewal lease on the holder's row, in one short transaction. lease says whether
 // it was taken (and then the snapshot is the credential to renew); without it the snapshot is what is stored now.
-func (s *Store) takeRenewal(ctx context.Context, c *run.Claim, k credKind) (snap credSnap, lease bool, holder string, err error) {
+func (s *Store) takeRenewal(ctx context.Context, c *run.Claim, k credKind, token string) (snap credSnap, lease bool, holder string, err error) {
 	err = s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
 		snap, lease = credSnap{}, false
 		var err error
@@ -207,8 +237,8 @@ func (s *Store) takeRenewal(ctx context.Context, c *run.Claim, k credKind) (snap
 		}
 		// the holder's row first, then our own (owned): the order a cancel locks them in
 		// the database's clock decides (the lease is shared by processes whose clocks differ)
-		row := tx.QueryRow(ctx, `UPDATE runs SET `+k.leaseCol+` = now() + $2::interval WHERE id = $1 AND `+k.valueCol+` IS NOT NULL AND (`+k.leaseCol+` IS NULL OR `+k.leaseCol+` < now()) RETURNING `+k.cols,
-			holder, fmt.Sprintf("%d seconds", int(renewLease/time.Second)))
+		row := tx.QueryRow(ctx, `UPDATE runs SET `+k.leaseCol+` = now() + $2::interval, `+k.tokenCol+` = $3 WHERE id = $1 AND `+k.valueCol+` IS NOT NULL AND (`+k.leaseCol+` IS NULL OR `+k.leaseCol+` < now()) RETURNING `+k.cols,
+			holder, fmt.Sprintf("%d seconds", int(renewLease/time.Second)), token)
 		switch e := row.Scan(k.dests(&snap)...); {
 		case e == nil:
 			lease = true
@@ -231,41 +261,48 @@ func (s *Store) takeRenewal(ctx context.Context, c *run.Claim, k credKind) (snap
 	return snap, lease, holder, err
 }
 
-// dropRenewal gives the lease back without a result. It is not subject to the claim's fence: the lease is the caller's own, and a
+// dropRenewal gives the lease back without a result, if this run still holds it (its token is the one on the row: a lease that ran out and
+// was taken by another run is that run's, and is not cleared). It is not subject to the claim's fence: the lease is the caller's own, and a
 // claim lost meanwhile must not leave it held for a full lease.
-func (s *Store) dropRenewal(ctx context.Context, c *run.Claim, k credKind, holder string) error {
-	return s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `UPDATE runs SET `+k.leaseCol+` = NULL WHERE id = $1`, holder)
-		return err
+func (s *Store) dropRenewal(ctx context.Context, c *run.Claim, k credKind, holder, token string) error {
+	return withDeadlockRetry(func() error {
+		return s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `UPDATE runs SET `+k.leaseCol+` = NULL, `+k.tokenCol+` = NULL WHERE id = $1 AND `+k.tokenCol+` = $2`, holder, token)
+			return err
+		})
 	})
 }
 
 // storeRenewed writes the renewed credential if the holder still holds the one that was read (compare and swap) and gives the lease
-// back. A credential that was cleared or replaced meanwhile is not restored: the renewed token is dropped and the caller has none.
-func (s *Store) storeRenewed(ctx context.Context, c *run.Claim, k credKind, holder string, was []byte, next *credential.Token) error {
+// back if it is still this run's. A credential that was cleared or replaced meanwhile is not restored: the renewed token is dropped and the
+// caller has none. The write does not depend on the lease: a renewal the authorization server has completed is stored even if the lease ran
+// out and another run took it (with a rotating refresh token the old one is dead, and not storing the new one would kill the credential the
+// runs share); the compare and swap on the credential is what stops a stale write.
+func (s *Store) storeRenewed(ctx context.Context, c *run.Claim, k credKind, holder string, was []byte, token string, next *credential.Token) error {
 	set, args, err := k.write(s, next)
 	if err != nil {
 		return err
 	}
 	swapped := true
-	err = s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
-		// $1 the holder, $2.. the new values, the last one the value the swap compares with
-		all := append(append([]any{holder}, args...), was)
-		tag, err := tx.Exec(ctx, `UPDATE runs SET `+set+`, `+k.leaseCol+` = NULL WHERE id = $1 AND `+k.valueCol+` = $`+fmt.Sprint(len(all)), all...)
-		if err != nil {
-			return err
-		}
-		// no fence check: a renewal the authorization server has completed is stored even if the claim was lost meanwhile (with a rotating
-		// refresh token the old one is dead, and not storing the new one would kill the credential the runs share); the compare and swap
-		// already stops a stale write
-		if tag.RowsAffected() == 0 {
-			// the credential changed under the renewal: the lease is still given back (this transaction commits), so that it does not
-			// stay on the row for a full term
-			swapped = false
-			_, err := tx.Exec(ctx, `UPDATE runs SET `+k.leaseCol+` = NULL WHERE id = $1`, holder)
-			return err
-		}
-		return nil
+	err = withDeadlockRetry(func() error {
+		swapped = true
+		return s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
+			// $1 the holder, $2.. the new values, then the value the swap compares with, then the lease token
+			all := append(append([]any{holder}, args...), was, token)
+			cmp, tok := len(all)-1, len(all)
+			tag, err := tx.Exec(ctx, `UPDATE runs SET `+set+`, `+k.leaseCol+` = CASE WHEN `+k.tokenCol+` = $`+fmt.Sprint(tok)+` THEN NULL ELSE `+k.leaseCol+` END, `+
+				k.tokenCol+` = CASE WHEN `+k.tokenCol+` = $`+fmt.Sprint(tok)+` THEN NULL ELSE `+k.tokenCol+` END WHERE id = $1 AND `+k.valueCol+` = $`+fmt.Sprint(cmp), all...)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() == 0 {
+				// the credential changed under the renewal: the lease is still given back (this transaction commits), if it is ours
+				swapped = false
+				_, err := tx.Exec(ctx, `UPDATE runs SET `+k.leaseCol+` = NULL, `+k.tokenCol+` = NULL WHERE id = $1 AND `+k.tokenCol+` = $2`, holder, token)
+				return err
+			}
+			return nil
+		})
 	})
 	if err == nil && !swapped {
 		return k.gone()

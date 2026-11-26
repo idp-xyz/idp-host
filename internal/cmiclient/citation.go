@@ -24,7 +24,7 @@ func OneLine(s string, n int) string {
 	if utf8.RuneCountInString(s) <= n {
 		return s
 	}
-	return string([]rune(s)[:n]) + "…"
+	return string([]rune(s)[:max(n-1, 0)]) + "…" // at most n characters, the ellipsis included
 }
 
 // Where describes a locator in words.
@@ -59,14 +59,22 @@ func Where(l *Locator) string {
 	return strings.Join(parts, "; ")
 }
 
+// MaxDocumentID is the longest document id the HOST records (the contract's maxLength).
+const MaxDocumentID = 128
+
 // KnowledgeSource is the record of knowledge item it numbered n: the title (or the ref when it has none), the document and the
-// place in it, and the CMI source. Never the passage's text (D49: only labels are kept).
-func KnowledgeSource(n int, it Item) run.Source {
+// place in it, and the CMI source; each cut to what the contract allows. Never the passage's text (D49: only labels are kept). A
+// document id is an identifier and is never cut: one that is empty or too long is not recorded (ok false), though the passage still
+// has its number.
+func KnowledgeSource(n int, it Item) (src run.Source, ok bool) {
+	if it.ID == "" || utf8.RuneCountInString(it.ID) > MaxDocumentID || strings.ContainsFunc(it.ID, unicode.IsControl) {
+		return run.Source{}, false
+	}
 	title := OneLine(it.Title, run.MaxSourceText)
 	if title == "" {
 		title = OneLine(it.Ref, run.MaxSourceText)
 	}
-	return run.Source{N: n, Kind: run.KindKnowledge, Title: title, DocumentID: OneLine(it.ID, 128), Where: Where(it.Locator), Origin: OneLine(it.Source, 64)}
+	return run.Source{N: n, Kind: run.KindKnowledge, Title: title, DocumentID: it.ID, Where: OneLine(Where(it.Locator), 1000), Origin: OneLine(it.Source, 64)}, true
 }
 
 // KnowledgeSources are the records of the knowledge items ContextFrom numbers first, first+1, ... (the items of kind knowledge, in
@@ -79,7 +87,9 @@ func KnowledgeSources(items []Item, first int) []run.Source {
 	n := first
 	for _, it := range items {
 		if it.Kind == "knowledge" {
-			out = append(out, KnowledgeSource(n, it))
+			if src, ok := KnowledgeSource(n, it); ok {
+				out = append(out, src)
+			}
 			n++
 		}
 	}

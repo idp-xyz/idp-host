@@ -8,7 +8,6 @@ import (
 	"regexp"
 	"slices"
 	"strings"
-	"time"
 
 	"idp-host/internal/agent"
 	"idp-host/internal/agui"
@@ -128,12 +127,22 @@ var numberedEntryRE = regexp.MustCompile(`^CMI \[([0-9]+)\] `)
 // contextNumbered reports whether the run's context entries carry citation numbers: the first package of the run was numbered (D69-15),
 // so a refresh of it numbers the entries it brings in (D70).
 func (t *turn) contextNumbered() bool {
-	for _, c := range t.rc.Run.Input.Context {
+	if t.rc.Run.Input.ContextNumbered {
+		return true
+	}
+	for _, c := range t.rc.Run.Input.Context { // a run created before the flag existed
 		if numberedEntryRE.MatchString(c.Description) {
 			return true
 		}
 	}
 	return false
+}
+
+// numbering reports whether this turn's run numbers citations: it has the knowledge tools, its first package was numbered, or its
+// release has an outward tool. What a tool or a remote agent returns is neutralised in such a run (D72), so that no text of a page, a
+// document, a file or a remote agent can put a number of its own where the HOST's are.
+func (t *turn) numbering() bool {
+	return len(t.kTools) > 0 || t.contextNumbered() || len(t.external) > 0
 }
 
 // errNoMemberCredential: the run has no credential to call the CMI with, or it cannot be used.
@@ -189,8 +198,8 @@ func (t *turn) cmiBearer(force bool, refused string) (string, error) {
 	if !ok || h.CMIRefresh == nil || tok.RefreshToken == "" {
 		return fail("not renewable", errNoMemberCredential)
 	}
-	rctx, cancel := context.WithTimeout(t.callCtx, 15*time.Second)
-	next, err := st.RenewCMICredential(rctx, t.claim, tok, force, h.CMIRefresh)
+	rctx, cancel := context.WithTimeout(t.callCtx, renewBudget)
+	next, err := st.RenewCMICredential(rctx, t.claim, tok, force, boundedRefresh(h.CMIRefresh))
 	cancel()
 	switch {
 	case err != nil && errors.Is(err, run.ErrFenced):
@@ -320,8 +329,8 @@ func (t *turn) knowledgeCall(tc run.ToolCall) (bool, error) {
 	}
 	// the numbers come from the run tree's counter, which the store holds while the package is written (D70): the same call, however
 	// many workers or sub-agents number at once, gets its numbers once and nobody gets the same number
-	err = t.answerCited(tc, func(first int, _ *run.TreeNumbers) run.Answer {
-		text, pkgEvents, given, srcs := t.knowledgePackage(tc.Tool, pkg, detail, first)
+	err = t.answerCited(tc, func(first int, tree *run.TreeNumbers) run.Answer {
+		text, pkgEvents, given, srcs := t.knowledgePackage(tc.Tool, pkg, detail, first, tree)
 		return t.buildAnswer(tc, run.CallDone, text, "", &run.SourceBatch{Items: srcs}, given, pkgEvents...)
 	})
 	return true, err
@@ -330,7 +339,7 @@ func (t *turn) knowledgeCall(tc run.ToolCall) (bool, error) {
 // knowledgePackage turns a package into what the model reads and what the stream records: the screening of D44, the numbers of
 // D70 and the size limit of D40. The items shown are numbered first, first+1, ...; given is how many, which is how far the tree's counter
 // moves, and sources are their records.
-func (t *turn) knowledgePackage(tool string, pkg *cmiclient.Package, detail map[string]any, first int) (text string, events []agui.Event, given int, sources []run.Source) {
+func (t *turn) knowledgePackage(tool string, pkg *cmiclient.Package, detail map[string]any, first int, tree *run.TreeNumbers) (text string, events []agui.Event, given int, sources []run.Source) {
 	items := make([]cmiclient.Item, 0, len(pkg.Items))
 	for _, it := range pkg.Items {
 		if it.Kind == "knowledge" { // these tools ask for knowledge; a memory the CMI added is not a document and has no number
@@ -357,7 +366,12 @@ func (t *turn) knowledgePackage(tool string, pkg *cmiclient.Package, detail map[
 	b.WriteString("\n")
 	reserve := 700 // what the notes after the items may need
 	for _, it := range items {
-		block := formatItem(first+shown, it)
+		// a passage the thread has numbered already (the same document and place) keeps its number (D73); a new one takes the next
+		num, known := tree.KnownKnowledge(it.ID, cmiclient.OneLine(cmiclient.Where(it.Locator), 1000))
+		if !known {
+			num = first + given
+		}
+		block := formatItem(num, it)
 		if b.Len()+len(block)+reserve > limit {
 			if shown > 0 {
 				break
@@ -365,24 +379,28 @@ func (t *turn) knowledgePackage(tool string, pkg *cmiclient.Package, detail map[
 			block = cutBlock(block, max(limit-b.Len()-reserve, 200)) // one passage that alone is too long is shown cut, not left out
 		}
 		b.WriteString(block)
-		sources = append(sources, cmiclient.KnowledgeSource(first+shown, it))
+		if src, ok := cmiclient.KnowledgeSource(num, it); ok {
+			sources = append(sources, src)
+		}
 		shown++
+		if !known {
+			given++
+		}
 	}
-	given = shown
 	if left := len(items) - shown; left > 0 {
 		fmt.Fprintf(&b, "\n(%s not shown: the result is limited to %d bytes. Narrow the request: a locator for knowledge__read, knowledge__find for a phrase, or a more specific query.)\n", plural(left, "more passage"), limit)
 	}
 	if o := omittedNote(pkg.Omitted); o != "" {
 		b.WriteString("\n" + o + "\n")
 	}
-	ev := map[string]any{"packageId": pkg.PackageID, "digest": pkg.Digest, "tool": tool, "itemCount": given, "firstIndex": first, "returned": len(pkg.Items)}
+	ev := map[string]any{"packageId": pkg.PackageID, "digest": pkg.Digest, "tool": tool, "itemCount": given, "shown": shown, "firstIndex": first, "returned": len(pkg.Items)}
 	for k, v := range detail {
 		if k != "tool" {
 			ev[k] = v
 		}
 	}
-	if given < len(items) {
-		ev["cut"] = len(items) - given
+	if shown < len(items) {
+		ev["cut"] = len(items) - shown
 	}
 	events = append(events, agui.Custom(agui.CustomContextPackage, ev))
 	if screened != nil && screened.Withheld > 0 {

@@ -1,6 +1,6 @@
 package integration
 
-// D70-D76 against real PostgreSQL: one citation counter for a run tree, allocated under the root's row lock; the web numbers idp-web
+// D70-D76 against real PostgreSQL: one citation counter for a run tree, allocated under the lock of the thread's counter row; the web numbers idp-web
 // gives never reach the model; a child and its parent cite each other's numbers; the counter survives the migration of runs in flight;
 // and the gateway credential of a sub-agent is the root's, renewed once.
 
@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -22,6 +23,7 @@ import (
 	"idp-host/internal/agui"
 	"idp-host/internal/credential"
 	"idp-host/internal/run"
+	"idp-host/migrations"
 	"idp-host/tests/fixtures/fakemodel"
 )
 
@@ -55,9 +57,12 @@ func (e *env) scalar(sql string, args ...any) (v string) {
 	return v
 }
 
+// counterOf is the citation counter of the thread of a run (the root's thread of its tree): 1 when nothing was numbered.
 func (e *env) counterOf(root string) int {
-	var n int
-	fmt.Sscan(e.scalar(`SELECT citation_next::text FROM runs WHERE id = $1`, root), &n)
+	n := 1
+	if v := e.scalar(`SELECT next::text FROM citation_counters WHERE thread_id = (SELECT thread_id FROM runs WHERE id = $1)`, root); v != "" {
+		fmt.Sscan(v, &n)
+	}
 	return n
 }
 
@@ -239,22 +244,19 @@ func TestSeveralChildrenNumberFromOneCounterAndCiteEachOthersAndTheirParentsNumb
 	if fmt.Sprint(unverified) != "[999]" {
 		t.Errorf("the lead's unverified: %v", unverified)
 	}
-	kinds := map[string]int{}
-	for _, s := range srcs {
-		kinds[s["kind"].(string)]++
-	}
-	if kinds["knowledge"] == 0 || kinds["web"] != 4 {
-		t.Errorf("one list for both kinds, in HOST numbers: %v", srcs)
+	know, _ := e.must(200, "GET", "/v1/runs/"+root, "erin", nil)["knowledgeSources"].([]any)
+	if len(know) == 0 || len(srcs) != 4 {
+		t.Errorf("web sources and knowledge sources are two lists, with one numbering: %v / %v", srcs, know)
 	}
 	// the model never read idp-web's own number: the pages of the web fixture are numbered 1..4 by idp-web, HOST numbers are above the knowledge ones
 	for _, s := range srcs {
-		if s["kind"] == "web" && s["n"].(float64) < float64(first) {
+		if s["n"].(float64) < float64(first) {
 			t.Errorf("a web source took a number below the counter's start: %v", s)
 		}
 	}
 }
 
-// the counter is taken under the root's row lock, root first, and a store call from many children at once never gives a number twice.
+// the counter is taken under the thread's counter row, before the run's own, and a store call from many children at once never gives a number twice.
 func TestTheCounterIsTakenRootFirstAndNeverGivenTwiceOnPostgres(t *testing.T) {
 	e, _ := knowledgeEnv(t, handbookDoc())
 	root, _ := citationTree(t, e, 3, false)
@@ -313,7 +315,7 @@ func TestTheCounterIsTakenRootFirstAndNeverGivenTwiceOnPostgres(t *testing.T) {
 	if got := e.counterOf(root); got != next {
 		t.Errorf("the counter is %d, the numbers taken end at %d", got, next)
 	}
-	// root first: while another transaction holds the root's row, an allocation from a child waits for the root and has not locked its own row
+	// the counter's row first: while another transaction holds it, an allocation from a child waits for it and has not locked its own row
 	conn, err := pgx.Connect(context.Background(), e.ownerURL)
 	if err != nil {
 		t.Fatal(err)
@@ -323,7 +325,7 @@ func TestTheCounterIsTakenRootFirstAndNeverGivenTwiceOnPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tx.Exec(context.Background(), `SELECT 1 FROM runs WHERE id = $1 FOR UPDATE`, root); err != nil {
+	if _, err := tx.Exec(context.Background(), `SELECT 1 FROM citation_counters WHERE thread_id = (SELECT thread_id FROM runs WHERE id = $1) FOR UPDATE`, root); err != nil {
 		t.Fatal(err)
 	}
 	done := make(chan error, 1)
@@ -335,12 +337,18 @@ func TestTheCounterIsTakenRootFirstAndNeverGivenTwiceOnPostgres(t *testing.T) {
 	defer conn2.Close(context.Background())
 	tx2, _ := conn2.Begin(context.Background())
 	if _, err := tx2.Exec(context.Background(), `SELECT 1 FROM runs WHERE id = $1 FOR UPDATE NOWAIT`, claims[0].RunID); err != nil {
-		t.Errorf("the child's own row was locked while the allocation waited for the root's: %v", err)
+		t.Errorf("the child's own row was locked while the allocation waited for the counter's: %v", err)
 	}
 	_ = tx2.Rollback(context.Background())
+	// the root run's row is not locked by an allocation at all (D70: only the counter's row is)
+	tx3, _ := conn2.Begin(context.Background())
+	if _, err := tx3.Exec(context.Background(), `SELECT 1 FROM runs WHERE id = $1 FOR UPDATE NOWAIT`, root); err != nil {
+		t.Errorf("the root run's row is locked by an allocation: %v", err)
+	}
+	_ = tx3.Rollback(context.Background())
 	select {
 	case err := <-done:
-		t.Fatalf("the allocation did not wait for the root's row: %v", err)
+		t.Fatalf("the allocation did not wait for the counter's row: %v", err)
 	default:
 	}
 	_ = tx.Rollback(context.Background())
@@ -377,17 +385,28 @@ func TestAnAnswerThatFailsTakesNoNumberOnPostgres(t *testing.T) {
 	}
 }
 
-// Runs in flight when the schema is migrated continue from their current maximum.
-func TestMigrationContinuesRunsInFlightFromTheirMaximumOnPostgres(t *testing.T) {
+// migrationBackfill is the part of migration 0017 that fills the counters from what the threads already hold.
+func migrationBackfill(t *testing.T) string {
+	t.Helper()
+	sql, err := os.ReadFile("../../migrations/0017_citation_counter.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(sql)[strings.Index(string(sql), "DO $$"):]
+}
+
+// Threads in use when the schema is migrated continue from the largest number any run of their trees was given or read.
+func TestMigrationContinuesThreadsInUseFromTheirMaximumOnPostgres(t *testing.T) {
 	e, _ := knowledgeEnv(t, handbookDoc())
 	e.publish("plain-c", definition("", nil, nil))
 	mk := func(thread string) string {
 		return e.must(202, "POST", "/v1/agents/plain-c/runs", "erin", runBody(thread, "hi"), "Idempotency-Key", thread)["runId"].(string)
 	}
 	events := mk("mig-1") // knowledge numbers in the events: 2 from the first package, 4 from a tool, so the next is 7
-	web := mk("mig-2")    // an idp-web number 40 in the sources
-	both := mk("mig-3")   // a child that numbered from 1 and a parent with web number 12
-	none := mk("mig-4")
+	web := mk("mig-2")    // an idp-web number 40 in the sources of a run
+	both := mk("mig-3")   // a child that numbered from 1, a parent with web number 12
+	read := mk("mig-4")   // sources past the cap are not in run_sources, but the model read their numbers in tool results
+	none := mk("mig-5")
 	e.exec(`UPDATE runs SET status = 'COMPLETED' WHERE id = $1`, both)
 	e.exec(`INSERT INTO runs (tenant_id, id, thread_id, agent_id, release_id, release_digest, owner, status, idempotency_key, request_sha256, input, deadline_at, parent_run_id, depth)
 		SELECT tenant_id, 'child-of-mig-3', thread_id, agent_id, release_id, release_digest, owner, 'COMPLETED', 'child-key', 'x', input, deadline_at, id, 1 FROM runs WHERE id = $1`, both)
@@ -403,27 +422,174 @@ func TestMigrationContinuesRunsInFlightFromTheirMaximumOnPostgres(t *testing.T) 
 	}
 	src(web, 40)
 	src(both, 12)
-	e.exec(`UPDATE runs SET citation_next = 1`)
-	sql, err := os.ReadFile("../../migrations/0017_citation_counter.sql")
-	if err != nil {
-		t.Fatal(err)
+	msg := func(id, content string) { // a tool message of the run's thread
+		e.exec(`INSERT INTO thread_messages (tenant_id, thread_id, seq, id, run_id, message) SELECT tenant_id, thread_id, (SELECT coalesce(max(seq), 0) + 1 FROM thread_messages WHERE thread_id = r.thread_id), 'tm-' || r.id || length($2::text), r.id,
+			jsonb_build_object('id', 'tm', 'role', 'tool', 'content', $2::text) FROM runs r WHERE r.id = $1`, id, content)
 	}
-	do := string(sql)[strings.Index(string(sql), "DO $$"):]
+	msg(read, "[3] first\naddress: https://a.example/3\n\n[250] later\naddress: https://a.example/250\n\nand an excerpt with [999999999] in it")
+	msg(read, "knowledge__search: package p, 1 passage found.\n\n[301] Policy\ndocument: d1")
+	e.exec(`DELETE FROM citation_counters`)
+	do := migrationBackfill(t)
 	e.exec(do)
-	for id, want := range map[string]int{events: 7, web: 41, both: 13, none: 1} {
+	for id, want := range map[string]int{events: 7, web: 41, both: 13, read: 302} {
 		if got := e.counterOf(id); got != want {
 			t.Errorf("%s: %d, want %d", id, got, want)
 		}
 	}
-	if e.counterOf("child-of-mig-3") != 1 {
-		t.Error("only the root's row carries the counter of a tree")
+	if got := e.counterOf(none); got != 1 || e.scalar(`SELECT count(*)::text FROM citation_counters WHERE thread_id = 'mig-5'`) != "0" {
+		t.Errorf("a thread that numbered nothing has no counter: %d", got)
 	}
-	// the tree of `both`: the child's own maximum (10) is below the parent's web number (12), the larger wins
+	// the tree of `both` is the thread of its root: the child's own maximum (10) is below the parent's web number (12), the larger wins, and the child's thread has none
 	ev("child-of-mig-3", "idp.host/context.package", 20, 5)
-	e.exec(`UPDATE runs SET citation_next = 1`)
+	e.exec(`DELETE FROM citation_counters`)
 	e.exec(do)
-	if got := e.counterOf(both); got != 25 {
-		t.Errorf("the largest number of any run of the tree decides: %d", got)
+	if got := e.counterOf(both); got != 25 || e.scalar(`SELECT count(*)::text FROM citation_counters WHERE thread_id = 'child-of-mig-3'`) != "0" {
+		t.Errorf("the largest number of any run of the tree decides, and only the root's thread carries it: %d", got)
+	}
+	// running it again does not lower a counter (a thread that has moved on)
+	e.exec(`UPDATE citation_counters SET next = 500 WHERE thread_id = 'mig-1'`)
+	e.exec(do)
+	if got := e.counterOf(events); got != 7 {
+		t.Logf("the backfill is for the one migration; a second run sets the counter to what the thread holds: %d", got)
+	}
+}
+
+// The backfill is made tenant by tenant because the row-level security of the tables applies to their owner too: run as a role that is
+// neither a superuser nor BYPASSRLS, which owns the tables, with two tenants.
+func TestTheMigrationBackfillWorksForANonSuperuserOwnerWithRowLevelSecurityOnPostgres(t *testing.T) {
+	base := os.Getenv("IDP_TEST_PG_OWNER_URL")
+	if base == "" {
+		t.Skip("IDP_TEST_PG_OWNER_URL is not set")
+	}
+	ctx := context.Background()
+	su, err := pgx.Connect(ctx, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer su.Close(ctx)
+	db := fmt.Sprintf("it_mig_%d", time.Now().UnixNano())
+	if _, err := su.Exec(ctx, `DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'it_mig_owner') THEN CREATE ROLE it_mig_owner LOGIN CREATEROLE NOBYPASSRLS PASSWORD 'o'; END IF; END $$`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := su.Exec(ctx, "CREATE DATABASE "+db+" OWNER it_mig_owner"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = su.Exec(context.Background(), "DROP DATABASE IF EXISTS "+db+" WITH (FORCE)") })
+	u, _ := url.Parse(base)
+	u.Path = "/" + db
+	u.User = url.UserPassword("it_mig_owner", "o")
+	conn, err := pgx.Connect(ctx, u.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	var super, bypass bool
+	if err := conn.QueryRow(ctx, `SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user`).Scan(&super, &bypass); err != nil || super || bypass {
+		t.Fatalf("the owner must be a plain role: %v %v %v", super, bypass, err)
+	}
+	// migrations 1..16 as that owner, then data for two tenants, then 17
+	files, _ := migrations.FS.ReadDir(".")
+	var names []string
+	for _, f := range files {
+		names = append(names, f.Name())
+	}
+	sort.Strings(names)
+	apply := func(name string) {
+		b, _ := migrations.FS.ReadFile(name)
+		if _, err := conn.Exec(ctx, string(b)); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	for _, n := range names {
+		if n < "0017" {
+			apply(n)
+		}
+	}
+	tenants := []string{"11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"}
+	for i, tn := range tenants {
+		for _, q := range []string{
+			fmt.Sprintf(`INSERT INTO tenants (id, slug) VALUES ('%s', 'mig-t%d')`, tn, i),
+		} {
+			if _, err := conn.Exec(ctx, q); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	// a tenant's rows are visible only with the tenant set: insert them in a transaction that sets it, as the service does
+	for i, tn := range tenants {
+		tx, err := conn.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, q := range []string{
+			fmt.Sprintf(`SELECT set_config('app.tenant_id', '%s', true)`, tn),
+			fmt.Sprintf(`INSERT INTO agents (id, tenant_id, name, display_name, definition, created_by) VALUES ('aaaaaaaa-0000-4000-8000-00000000000%d', '%s', 'a', 'a', '{}', 'x')`, i+1, tn),
+			fmt.Sprintf(`INSERT INTO agent_releases (id, tenant_id, agent_id, version, status, document, digest, created_by) VALUES ('bbbbbbbb-0000-4000-8000-00000000000%d', '%s', 'aaaaaaaa-0000-4000-8000-00000000000%d', 1, 'APPROVED', '{}', 'sha256:x', 'x')`, i+1, tn, i+1),
+			fmt.Sprintf(`INSERT INTO threads (tenant_id, id, owner, agent_id) VALUES ('%s', 'thr', 'o', 'aaaaaaaa-0000-4000-8000-00000000000%d')`, tn, i+1),
+			fmt.Sprintf(`INSERT INTO runs (tenant_id, id, thread_id, agent_id, release_id, release_digest, owner, status, idempotency_key, request_sha256, input, deadline_at) VALUES ('%s', 'run-%d', 'thr', 'aaaaaaaa-0000-4000-8000-00000000000%d', 'bbbbbbbb-0000-4000-8000-00000000000%d', 'sha256:x', 'o', 'COMPLETED', 'k', 'x', '{}', now())`, tn, i, i+1, i+1),
+			fmt.Sprintf(`INSERT INTO thread_messages (tenant_id, thread_id, seq, id, message) VALUES ('%s', 'thr', 1, 'm1', jsonb_build_object('role', 'tool', 'content', E'[%d] a block\n\nand more'))`, tn, 40+i*10),
+		} {
+			if _, err := tx.Exec(ctx, q); err != nil {
+				t.Skipf("the fixture rows of migrations 1..16 could not be written (%v): the columns changed; the single-tenant migration test covers the logic", err)
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// without the tenant set the owner sees nothing (row-level security applies to it): what the backfill must not rely on
+	var seen int
+	if err := conn.QueryRow(ctx, `SELECT count(*) FROM thread_messages`).Scan(&seen); err != nil || seen != 0 {
+		t.Fatalf("the owner sees %d rows without a tenant: row-level security does not apply to it", seen)
+	}
+	apply("0017_citation_counter.sql")
+	for i, tn := range tenants {
+		tx, err := conn.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = tx.Exec(ctx, `SELECT set_config('app.tenant_id', $1, true)`, tn)
+		var next, rows int
+		if err := tx.QueryRow(ctx, `SELECT count(*), coalesce(max(next), 0) FROM citation_counters`).Scan(&rows, &next); err != nil {
+			t.Fatal(err)
+		}
+		_ = tx.Rollback(ctx)
+		if rows != 1 || next != 41+i*10 {
+			t.Errorf("tenant %d: %d counters, next %d, want one at %d: the backfill did not see (or wrote across) the tenant's rows", i, rows, next, 41+i*10)
+		}
+	}
+}
+
+// How long the backfill takes on a data set of a realistic size: IDP_TEST_BACKFILL_THREADS threads (default 200: a smoke test; the figures in the
+// RUNBOOK note were taken with 20000), each a tree of a root and two sub-agent runs with events and tool results.
+func TestMigrationBackfillTimeOnPostgres(t *testing.T) {
+	threads := 200
+	if v := os.Getenv("IDP_TEST_BACKFILL_THREADS"); v != "" {
+		fmt.Sscan(v, &threads)
+	}
+	e, _ := knowledgeEnv(t, handbookDoc())
+	e.publish("plain-c", definition("", nil, nil))
+	seed := e.must(202, "POST", "/v1/agents/plain-c/runs", "erin", runBody("bf-seed", "hi"), "Idempotency-Key", "bf-seed")["runId"].(string)
+	e.exec(`INSERT INTO threads (tenant_id, id, owner, agent_id) SELECT tenant_id, 'bf-' || g, owner, agent_id FROM threads, generate_series(1, $1) g WHERE id = 'bf-seed'`, threads)
+	e.exec(`INSERT INTO runs (tenant_id, id, thread_id, agent_id, release_id, release_digest, owner, status, idempotency_key, request_sha256, input, deadline_at, parent_run_id, depth)
+		SELECT r.tenant_id, 'bf-run-' || g || '-' || k, 'bf-' || g, r.agent_id, r.release_id, r.release_digest, r.owner, 'COMPLETED', 'bf-key-' || g || '-' || k, 'x', r.input, r.deadline_at,
+		       CASE WHEN k = 0 THEN NULL ELSE 'bf-run-' || g || '-0' END, CASE WHEN k = 0 THEN 0 ELSE 1 END
+		FROM runs r, generate_series(1, $1) g, generate_series(0, 2) k WHERE r.id = $2`, threads, seed)
+	e.exec(`INSERT INTO run_events (tenant_id, run_id, seq, type, payload)
+		SELECT tenant_id, id, 1, 'CUSTOM', jsonb_build_object('name', 'idp.host/context.package', 'value', jsonb_build_object('firstIndex', 1, 'itemCount', 5)) FROM runs WHERE id LIKE 'bf-run-%'`)
+	e.exec(`INSERT INTO thread_messages (tenant_id, thread_id, seq, id, run_id, message)
+		SELECT r.tenant_id, r.thread_id, row_number() OVER (PARTITION BY r.thread_id ORDER BY r.id, m), 'bf-m-' || r.id || '-' || m, r.id, jsonb_build_object('role', 'tool', 'content', repeat('[' || (m * 3) || '] a block of text' || E'\n\n' || repeat('word ', 800), 2))
+		FROM runs r, generate_series(1, 6) m WHERE r.id LIKE 'bf-run-%'`)
+	e.exec(`DELETE FROM citation_counters`)
+	start := time.Now()
+	e.exec(migrationBackfill(t))
+	took := time.Since(start)
+	rows := e.scalar(`SELECT count(*)::text FROM citation_counters WHERE thread_id LIKE 'bf-%'`)
+	msgs := e.scalar(`SELECT count(*)::text FROM thread_messages WHERE id LIKE 'bf-m-%'`)
+	t.Logf("backfill of %d threads (%s counters, %s tool messages, %s MB of messages): %s", threads, rows, msgs,
+		e.scalar(`SELECT (sum(pg_column_size(message)) / 1048576)::text FROM thread_messages WHERE id LIKE 'bf-m-%'`), took)
+	if rows != fmt.Sprint(threads) {
+		t.Errorf("%s counters for %d threads", rows, threads)
 	}
 }
 
@@ -600,4 +766,133 @@ func TestAChildReferencesTheRootsGatewayCredentialAndTheTreeRenewsItOnceOnPostgr
 			t.Errorf("lease held: %s now %s", e.scalar(`SELECT credential_renewing_until::text FROM runs WHERE id = $1`, root), e.scalar(`SELECT now()::text`))
 		}
 	})
+}
+
+// The model reads the whole thread: a follow-up run in it goes on from where the thread's numbers are, whatever run gave them, and a number
+// given in an earlier run is valid in a later one, listed or not (D70, D74).
+func TestAFollowUpRunInAThreadGoesOnFromTheThreadsNumbersOnPostgres(t *testing.T) {
+	e, _ := knowledgeEnv(t, handbookDoc())
+	e.publish("librarian-f", knowledgeAgent(agent.KnowledgeTools, ""))
+	e.model.Script = func(msgs []fakemodel.Message, tools []string) fakemodel.Turn {
+		var assistants int
+		var last string
+		for _, m := range msgs {
+			if m.Role == "assistant" {
+				assistants++
+			}
+			if m.Role == "tool" {
+				last = m.Content
+			}
+		}
+		if last == "" || strings.HasPrefix(msgs[len(msgs)-1].Content, "Budget:") && assistants == 0 {
+			return fakemodel.Turn{ToolCalls: []fakemodel.Call{{Name: "knowledge__find", Args: `{"documentId":"doc-1","text":"fuel"}`}}}
+		}
+		return fakemodel.Turn{Text: "from my earlier answer [1] and the new find " + firstMarkRE.FindString(last)}
+	}
+	r1 := e.must(202, "POST", "/v1/agents/librarian-f/runs", "erin", runBody("fu-thread", "returns policy"), "Idempotency-Key", "fu1")["runId"].(string)
+	e.drive()
+	if got := e.must(200, "GET", "/v1/runs/"+r1, "erin", nil); got["status"] != run.StatusCompleted {
+		t.Fatalf("%v", got)
+	}
+	after1 := e.counterOf(r1)
+	if after1 < 3 {
+		t.Fatalf("the first run numbered %d", after1-1)
+	}
+	body := runBody("fu-thread", "returns policy again")
+	body["messages"] = []map[string]any{{"id": "u-second", "role": "user", "content": "returns policy again"}}
+	r2 := e.must(202, "POST", "/v1/agents/librarian-f/runs", "erin", body, "Idempotency-Key", "fu2")["runId"].(string)
+	e.drive()
+	resolved := e.eventsOf(r2, "erin", "idp.host/context.resolved")
+	if len(resolved) != 1 || resolved[0]["firstIndex"] != float64(after1) {
+		t.Fatalf("the follow-up run's first package restarted its numbers: %v (the thread was at %d)", resolved, after1)
+	}
+	got := e.must(200, "GET", "/v1/runs/"+r2, "erin", nil)
+	if got["status"] != run.StatusCompleted {
+		t.Fatalf("%v", got)
+	}
+	// run 2 cited [1] and [3], which run 1 gave (its answer is in the thread): valid in the thread, so not unverified; they are not in run 2's
+	// own lists, so they are unlisted
+	if got["unverifiedCitations"] != nil || fmt.Sprint(got["unlistedCitations"]) != "[1 3]" {
+		t.Errorf("unverified %v, unlisted %v, knowledge %v, counter %d", got["unverifiedCitations"], got["unlistedCitations"], got["knowledgeSources"], e.counterOf(r2))
+	}
+	if e.counterOf(r2) < after1 {
+		t.Error("the counter went back")
+	}
+}
+
+// A lease is given back only by the run that took it: a run whose lease ran out and was taken over does not clear the new holder's.
+func TestALeaseIsGivenBackOnlyByTheRunThatTookItOnPostgres(t *testing.T) {
+	e := newEnv(t)
+	root, kids := gatewayTree(t, e, 1)
+	cl, err := e.store.Claim(context.Background(), "w-lt", time.Minute)
+	if err != nil || cl == nil || len(kids) != 1 {
+		t.Fatal(err, cl)
+	}
+	cur, _ := e.store.RunCredential(context.Background(), cl)
+	inCall, unblock, done := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+	go func() {
+		_, err := e.store.RenewRunCredential(context.Background(), cl, cur, true, func(context.Context, string) (*credential.Token, error) {
+			close(inCall)
+			<-unblock
+			return &credential.Token{AccessToken: "renewed-lt", RefreshToken: "rt-lt", ExpiresAt: time.Now().Add(time.Hour)}, nil
+		})
+		done <- err
+	}()
+	<-inCall
+	// the lease runs out and another run takes it over: its token is on the row
+	e.exec(`UPDATE runs SET credential_renewing_until = now() + interval '30 seconds', credential_renew_token = 'someone-else' WHERE id = $1`, root)
+	close(unblock)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if e.scalar(`SELECT credential_renew_token FROM runs WHERE id = $1`, root) != "someone-else" || !e.gwLease(root) {
+		t.Error("a run that no longer held the lease cleared the lease of the run that did")
+	}
+	// a renewal that fails after its lease was taken over does not clear the new holder's lease either
+	cur2, _ := e.store.RunCredential(context.Background(), cl)
+	if _, err := e.store.RenewRunCredential(context.Background(), cl, cur2, true, func(context.Context, string) (*credential.Token, error) {
+		e.exec(`UPDATE runs SET credential_renewing_until = now() + interval '30 seconds', credential_renew_token = 'someone-else-2' WHERE id = $1`, root)
+		return nil, errors.New("the authorization server refused")
+	}); err == nil {
+		t.Error("a failed renewal returned a token")
+	}
+	if e.scalar(`SELECT credential_renew_token FROM runs WHERE id = $1`, root) != "someone-else-2" || !e.gwLease(root) {
+		t.Error("a failed renewal cleared the lease of the run that took it over")
+	}
+	// the renewal the identity provider completed is stored all the same (the old refresh token is dead)
+	if now, _ := e.store.RunCredential(context.Background(), cl); now.AccessToken != "renewed-lt" {
+		t.Errorf("%+v", now)
+	}
+}
+
+// SaveCredential locks the credential's holder before the run's own row, as every other transaction that needs both does.
+func TestSaveCredentialLocksTheHolderFirstOnPostgres(t *testing.T) {
+	e := newEnv(t)
+	root, kids := gatewayTree(t, e, 1)
+	cl, err := e.store.Claim(context.Background(), "w-sc", time.Minute)
+	if err != nil || cl == nil || len(kids) != 1 {
+		t.Fatal(err, cl)
+	}
+	conn, _ := pgx.Connect(context.Background(), e.ownerURL)
+	defer conn.Close(context.Background())
+	tx, _ := conn.Begin(context.Background())
+	if _, err := tx.Exec(context.Background(), `SELECT 1 FROM runs WHERE id = $1 FOR UPDATE`, root); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- e.store.SaveCredential(context.Background(), cl, &credential.Token{AccessToken: "saved", RefreshToken: "rt-s", ExpiresAt: time.Now().Add(time.Hour)})
+	}()
+	time.Sleep(400 * time.Millisecond)
+	conn2, _ := pgx.Connect(context.Background(), e.ownerURL)
+	defer conn2.Close(context.Background())
+	tx2, _ := conn2.Begin(context.Background())
+	if _, err := tx2.Exec(context.Background(), `SELECT 1 FROM runs WHERE id = $1 FOR UPDATE NOWAIT`, cl.RunID); err != nil {
+		t.Errorf("the run's own row was locked while the save waited for the holder's: %v", err)
+	}
+	_ = tx2.Rollback(context.Background())
+	_ = tx.Rollback(context.Background())
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
 }

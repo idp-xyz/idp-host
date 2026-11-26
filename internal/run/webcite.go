@@ -13,9 +13,10 @@ package run
 import (
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // How the text of a web result was made (WebRendered.Mode).
@@ -32,7 +33,8 @@ type WebCitations struct {
 	Items    []Source
 	Invalid  int
 	Excess   int
-	Declared int // entries in the array, valid or not
+	Declared int  // entries in the array, valid or not
+	Present  bool // the result has a citations array, even an empty one
 }
 
 // ParseWebCitations reads structuredContent.citations (platform ADR-0003 D9) as ParseCitations does and also says how many entries
@@ -50,7 +52,7 @@ func ParseWebCitations(structured json.RawMessage) WebCitations {
 	if json.Unmarshal(doc.Citations, &entries) != nil {
 		return out
 	}
-	out.Declared = len(entries)
+	out.Declared, out.Present = len(entries), true
 	seen := map[int]string{}
 	for i, raw := range entries {
 		if i >= maxScanned {
@@ -113,19 +115,20 @@ func RenderWeb(text string, c WebCitations, first int, known func(webN int, url 
 	}
 	if len(c.Items) == 0 {
 		t, n := Neutralise(text)
-		return WebRendered{Text: t + neutralisedNote(n), NotShown: 0, Mode: WebNeutralised}
+		return WebRendered{Text: capText(t+neutralisedNote(n), limit), Mode: WebNeutralised}
 	}
 	cites := c.Items
 	pos, ok := headerPositions(text, cites)
 	if !ok {
 		return renderIndexed(text, cites, first, known, limit)
 	}
-	var out WebRendered
-	out.Mode = WebRewritten
-	out.NotShown = len(cites) - len(pos)
-	var b strings.Builder
-	changed := 0
-	next := first
+	type block struct {
+		text  string
+		isNew bool
+		src   Source
+	}
+	blocks := make([]block, 0, len(pos))
+	changed, next := 0, first
 	for j := range pos {
 		end := len(text)
 		if j+1 < len(pos) {
@@ -137,17 +140,51 @@ func RenderWeb(text string, c WebCitations, first int, known func(webN int, url 
 		}
 		src := cites[j]
 		src.WebN, src.N = src.N, n
-		out.Sources = append(out.Sources, src)
 		token := "[" + strconv.Itoa(cites[j].N) + "]"
-		seg := text[pos[j]+len(token) : end]
-		neutral, k := Neutralise(seg)
+		neutral, k := Neutralise(text[pos[j]+len(token) : end])
 		changed += k
-		b.WriteString("[" + strconv.Itoa(n) + "]")
-		b.WriteString(neutral)
+		blocks = append(blocks, block{"[" + strconv.Itoa(n) + "]" + neutral, isNew, src})
 	}
-	out.Used = next - first
-	out.Text = b.String() + neutralisedNote(changed)
+	// D40 applies to what the model is given: after the numbers are written and the page's own are neutralised (which makes each of them
+	// longer). Whole blocks from the end are left out until it fits; what is left out is not numbered.
+	size := func() int {
+		t := 0
+		for _, b := range blocks {
+			t += len(b.text)
+		}
+		if changed > 0 {
+			t += len(neutralisedNote(1))
+		}
+		return t
+	}
+	out := WebRendered{Mode: WebRewritten}
+	for limit > 0 && len(blocks) > 1 && size() > limit {
+		blocks = blocks[:len(blocks)-1]
+		out.NotShown++
+	}
+	var b strings.Builder
+	for _, bl := range blocks {
+		b.WriteString(bl.text)
+		out.Sources = append(out.Sources, bl.src)
+		if bl.isNew {
+			out.Used++
+		}
+	}
+	out.Text = capText(b.String()+neutralisedNote(changed), limit)
 	return out
+}
+
+// capText cuts s to at most limit bytes at a character boundary, and says so; limit 0 is no limit.
+func capText(s string, limit int) string {
+	if limit <= 0 || len(s) <= limit {
+		return s
+	}
+	note := fmt.Sprintf("\n[truncated: %d of %d bytes shown]", 0, len(s))
+	cut := max(limit-len(note)-8, 0)
+	for cut > 0 && cut < len(s) && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + fmt.Sprintf("\n[truncated: %d of %d bytes shown]", cut, len(s))
 }
 
 // number is the HOST's number for a cited source: the one the tree already gave this address, else next (isNew).
@@ -167,40 +204,27 @@ func neutralisedNote(n int) string {
 	return "\n\n(Numbers in square brackets inside the text above that are not the number at the head of a source were shown as ⟦n⟧: they are the page's own, not citation numbers.)"
 }
 
-// headerPositions finds where the block of each citation starts (the longest prefix of the citations whose blocks are all found), or
-// false when the first one does not start the text.
+// headerPositions finds where the block of each citation starts, or false when the text is not plainly what idp-web writes: the first
+// block does not start the text, or some block's header is missing (a middle one, one cut off by D40's limit) or found more than once
+// (a block's own excerpt repeats a later block's header and address), or they are not in the order of the citations. Where there is any
+// ambiguity the text is not rewritten; the caller lists the sources and neutralises the text instead.
 func headerPositions(text string, cites []Source) ([]int, bool) {
 	if len(cites) == 0 || !strings.HasPrefix(text, "["+strconv.Itoa(cites[0].N)+"] ") {
 		return nil, false
 	}
-	cands := make([][]int, len(cites))
+	pos := make([]int, len(cites))
 	for i := 1; i < len(cites); i++ {
-		cands[i] = headerCandidates(text, cites[i])
-	}
-	for k := len(cites); k >= 1; k-- {
-		pos := make([]int, k)
-		bound := len(text) + 1
-		good := true
-		for i := k - 1; i >= 1; i-- {
-			p := -1
-			for j := len(cands[i]) - 1; j >= 0; j-- {
-				if cands[i][j] < bound {
-					p = cands[i][j]
-					break
-				}
-			}
-			if p < 0 {
-				good = false
-				break
-			}
-			pos[i], bound = p, p
+		c := headerCandidates(text, cites[i])
+		if len(c) != 1 || c[0] <= pos[i-1] {
+			return nil, false
 		}
-		if good {
-			pos[0] = 0
-			return pos, true
-		}
+		pos[i] = c[0]
 	}
-	return nil, false
+	// the first block's own number must not come back as a header either
+	if len(headerCandidates(text, cites[0])) != 0 {
+		return nil, false
+	}
+	return pos, true
 }
 
 // headerCandidates are the places in text where a block of this citation could begin: after a blank line, its number and a space,
@@ -265,25 +289,80 @@ func renderIndexed(text string, cites []Source, first int, known func(int, strin
 		b.WriteString(" (they were shown as ⟦n⟧)")
 	}
 	b.WriteString(".\n\n")
+	head := b.Len()
 	b.WriteString(neutral)
 	out.Text = b.String()
+	if limit > 0 && len(out.Text) > limit {
+		out.Text = out.Text[:head] + capText(neutral, limit-head)
+	}
 	return out
 }
 
-// A bracketed number as a model might read it as a citation: a number, or several separated by commas, in square brackets or one of
-// the full-width and lenticular look-alikes, with spaces allowed inside.
-var bracketedNumberRE = regexp.MustCompile(`[\[［【〔][ \t]*\p{Nd}[\p{Nd} \t,;，、\-–]*[\]］】〕]`)
+// NeutraliseText is Neutralise for a whole text that the model reads: with the note that says what ⟦n⟧ is, and within limit (D40).
+func NeutraliseText(text string, limit int) string {
+	t, n := Neutralise(text)
+	return capText(t+neutralisedNote(n), limit)
+}
 
-// Neutralise turns every bracketed number in text from a page or a document ([3], [1, 2], 【4】, [ 5 ]) into ⟦3⟧: still readable as
-// what the page wrote, but not a number the model can cite and not one the HOST's check of the answer would take for a citation. It
-// returns the number of groups changed. It is applied to everything a tool result holds that the HOST did not write, so that a page
-// (or a document) cannot put a citation number in front of the model, which is what a fake citation list in an excerpt would be.
+// The brackets a model might read as square brackets around a citation: the ASCII ones, the full-width and lenticular look-alikes and
+// the other Ps/Pe pairs of Unicode that are drawn as square brackets. Any opening one may be closed by any closing one.
+const openBrackets = "[［【〔〖〘〚⦋⦍⦏﹝❲⁅⟬"
+const closeBrackets = "]］】〕〗〙〛⦌⦎⦐﹞❳⁆⟭"
+
+// inBracket is what may stand between the brackets of a number as a model reads it: digits of any script, spaces of any kind (NBSP and the
+// ideographic space too), the invisible format characters (zero-width and the like), the separators, dashes and Markdown emphasis marks.
+func inBracket(r rune) bool {
+	return unicode.IsDigit(r) || unicode.IsSpace(r) || unicode.Is(unicode.Cf, r) || strings.ContainsRune(",;，、；*_`-‐‑‒–—―~", r)
+}
+
+// Neutralise turns every bracketed number in text from a page or a document ([3], [1, 2], 【4】, [ 5 ], \[3\], [**3**], [３], [3–4],
+// [\u200b3]) into ⟦3⟧: still readable as what the page wrote, but not a number the model can cite and not one the HOST's check of the
+// answer would take for a citation. A group is a bracket (or an escaped one) that opens, at least one digit and only digits, spaces,
+// invisible characters, separators, dashes and emphasis marks, and a bracket that closes (or an escaped one); the matching is done on the
+// text as it is, character by character, so that nothing that reads as a number slips through by being written another way. It returns the
+// number of groups changed. It is applied to everything a tool result holds that the HOST did not write, so that a page (or a document)
+// cannot put a citation number in front of the model, which is what a fake citation list in an excerpt would be. The ⟦ ⟧ of its own
+// output are not brackets of this kind, so it can be applied twice.
 func Neutralise(text string) (string, int) {
+	if !strings.ContainsAny(text, openBrackets) {
+		return text, 0
+	}
+	rs := []rune(text)
+	var b strings.Builder
 	n := 0
-	out := bracketedNumberRE.ReplaceAllStringFunc(text, func(m string) string {
-		n++
-		r := []rune(m)
-		return "⟦" + string(r[1:len(r)-1]) + "⟧"
-	})
-	return out, n
+	for i := 0; i < len(rs); {
+		start, j := i, 0
+		switch {
+		case rs[i] == '\\' && i+1 < len(rs) && strings.ContainsRune(openBrackets, rs[i+1]):
+			j = i + 2
+		case strings.ContainsRune(openBrackets, rs[i]):
+			j = i + 1
+		}
+		if j > 0 {
+			k, digits := j, false
+			for k < len(rs) && inBracket(rs[k]) {
+				digits = digits || unicode.IsDigit(rs[k])
+				k++
+			}
+			end := 0
+			switch {
+			case !digits || k >= len(rs):
+			case rs[k] == '\\' && k+1 < len(rs) && strings.ContainsRune(closeBrackets, rs[k+1]):
+				end = k + 2
+			case strings.ContainsRune(closeBrackets, rs[k]):
+				end = k + 1
+			}
+			if end > 0 {
+				b.WriteString("⟦")
+				b.WriteString(string(rs[j:k]))
+				b.WriteString("⟧")
+				n++
+				i = end
+				continue
+			}
+		}
+		b.WriteRune(rs[start])
+		i = start + 1
+	}
+	return b.String(), n
 }

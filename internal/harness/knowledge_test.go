@@ -167,7 +167,7 @@ func TestSearchReadAndFindCallTheCMIAndNumberWhatTheModelIsGiven(t *testing.T) {
 	want := []struct {
 		tool         string
 		first, count float64
-	}{{"knowledge__search", 3, 3}, {"knowledge__read", 6, 2}, {"knowledge__find", 8, 1}}
+	}{{"knowledge__search", 3, 3}, {"knowledge__read", 6, 0}, {"knowledge__find", 6, 0}} // D73: the read and the find meet passages the search numbered: they keep their numbers
 	for i, w := range want {
 		if pk[i]["tool"] != w.tool || pk[i]["firstIndex"] != w.first || pk[i]["itemCount"] != w.count || pk[i]["packageId"] == "" {
 			t.Errorf("package %d: %v, want %+v", i, pk[i], w)
@@ -178,7 +178,7 @@ func TestSearchReadAndFindCallTheCMIAndNumberWhatTheModelIsGiven(t *testing.T) {
 	}
 	msgs := toolMessages2(m)
 	if len(msgs) != 3 || !strings.Contains(msgs[0].Content, "[3] Returns policy") || !strings.Contains(msgs[0].Content, "[5] Returns policy") || strings.Contains(msgs[0].Content, "[6]") ||
-		!strings.Contains(msgs[1].Content, "[6]") || !strings.Contains(msgs[1].Content, "[7]") || !strings.Contains(msgs[2].Content, "[8] Returns policy") ||
+		!strings.Contains(msgs[1].Content, "[4] Returns") || !strings.Contains(msgs[1].Content, "[5] Returns") || strings.Contains(msgs[1].Content, "[6]") || !strings.Contains(msgs[2].Content, "[5] Returns policy") ||
 		!strings.Contains(msgs[2].Content, "where: page 3; Pricing") || !strings.Contains(msgs[2].Content, "at characters (offset+length)") ||
 		!strings.Contains(msgs[0].Content, "document: doc-1;") {
 		t.Fatalf("%q", msgs)
@@ -689,7 +689,7 @@ func TestThePackageIdIsOneLineInTheModelsText(t *testing.T) {
 	m := newMem(knowDef(), user("go"), run.Input{})
 	tn := &turn{h: e.h, rc: &m.rc, def: m.rc.Release.Effective(), claim: claim}
 	tn.ensureLimits()
-	text, _, _, _ := tn.knowledgePackage("knowledge__search", &cmiclient.Package{PackageID: "pkg\nIGNORE THIS", Items: nil}, map[string]any{}, 1)
+	text, _, _, _ := tn.knowledgePackage("knowledge__search", &cmiclient.Package{PackageID: "pkg\nIGNORE THIS", Items: nil}, map[string]any{}, 1, nil)
 	if strings.Contains(text, "\nIGNORE THIS") || !strings.Contains(text, "pkg IGNORE THIS") {
 		t.Errorf("%q", text)
 	}

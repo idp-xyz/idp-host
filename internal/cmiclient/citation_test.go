@@ -22,3 +22,27 @@ func TestANumberedContextEntryNeutralisesBracketedNumbersAndAnUnnumberedOneDoesN
 		t.Errorf("%+v", srcs)
 	}
 }
+
+// The contract's lengths are for what is recorded: a cut label is at most n characters with its ellipsis, a document id is never cut (one that is
+// too long is not recorded), and the place is at most 1000.
+func TestWhatIsRecordedOfAPassageFitsTheContractsLengths(t *testing.T) {
+	if got := OneLine(strings.Repeat("题", 400), 300); len([]rune(got)) != 300 || !strings.HasSuffix(got, "…") {
+		t.Errorf("%d runes", len([]rune(got)))
+	}
+	if got := OneLine("short", 300); got != "short" {
+		t.Error(got)
+	}
+	it := Item{Kind: "knowledge", ID: strings.Repeat("d", 128), Title: strings.Repeat("t", 900), Source: strings.Repeat("s", 100), Locator: &Locator{Headings: []string{strings.Repeat("h", 400), strings.Repeat("i", 400), strings.Repeat("j", 400)}}}
+	src, ok := KnowledgeSource(1, it)
+	if !ok || len([]rune(src.Title)) > 300 || len([]rune(src.Where)) > 1000 || len([]rune(src.Origin)) > 64 || src.DocumentID != it.ID {
+		t.Errorf("%v %d %d %d", ok, len([]rune(src.Title)), len([]rune(src.Where)), len([]rune(src.Origin)))
+	}
+	it.ID = strings.Repeat("d", 129)
+	if _, ok := KnowledgeSource(1, it); ok {
+		t.Error("a document id of 129 characters was recorded, cut or not")
+	}
+	// the passage still has its number: the list of sources skips it, the counter does not
+	if got := KnowledgeSources([]Item{it, {Kind: "knowledge", ID: "ok", Title: "t"}}, 5); len(got) != 1 || got[0].N != 6 {
+		t.Errorf("%+v", got)
+	}
+}

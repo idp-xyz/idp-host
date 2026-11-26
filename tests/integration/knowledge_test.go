@@ -165,12 +165,13 @@ func TestKnowledgeToolsOnPostgres(t *testing.T) {
 		}
 		resolved := e.eventsOf(id, "erin", agui.CustomContextResolved)
 		pk := e.eventsOf(id, "erin", agui.CustomContextPackage)
-		// the first retrieval matched the three blocks and carol's note (4 entries), numbered 1-4; the tools go on from 5
+		// the first retrieval matched the three blocks and carol's note (4 entries), numbered 1-4; the search meets the same passages (D73: they
+		// keep their numbers; one is new, 5), and the find's passage is one of them (no new number, the counter is at 6)
 		if len(resolved) != 1 || resolved[0]["packageId"] != got["contextPackageId"] || resolved[0]["firstIndex"] != float64(1) || resolved[0]["numbered"] != float64(4) || resolved[0]["query"] != "know-dig: returns | fuel surcharge" {
 			t.Fatalf("%v %v", resolved, got["contextPackageId"])
 		}
-		if len(pk) != 2 || pk[0]["tool"] != "knowledge__search" || pk[0]["firstIndex"] != float64(5) || pk[0]["itemCount"] != float64(4) || pk[0]["query"] != "returns" ||
-			pk[1]["tool"] != "knowledge__find" || pk[1]["firstIndex"] != float64(9) || pk[1]["itemCount"] != float64(1) || pk[1]["documentId"] != "doc-1" || pk[1]["text"] != "fuel surcharge" || pk[0]["packageId"] == resolved[0]["packageId"] {
+		if len(pk) != 2 || pk[0]["tool"] != "knowledge__search" || pk[0]["firstIndex"] != float64(5) || pk[0]["itemCount"] != float64(1) || pk[0]["shown"] != float64(4) || pk[0]["query"] != "returns" ||
+			pk[1]["tool"] != "knowledge__find" || pk[1]["firstIndex"] != float64(6) || pk[1]["itemCount"] != float64(0) || pk[1]["documentId"] != "doc-1" || pk[1]["text"] != "fuel surcharge" || pk[0]["packageId"] == resolved[0]["packageId"] {
 			t.Fatalf("%v", pk)
 		}
 		// every CMI call was made as the member, and the knowledge tools reached the three endpoints they should
@@ -196,7 +197,7 @@ func TestKnowledgeToolsOnPostgres(t *testing.T) {
 				answer = m.Content
 			}
 		}
-		if !strings.Contains(answer, "[9] Returns policy") || !strings.Contains(answer, `<untrusted source="tool_result">`) {
+		if !strings.Contains(answer, "[3] Returns policy") || !strings.Contains(answer, `<untrusted source="tool_result">`) {
 			t.Errorf("%q", answer)
 		}
 		msgs := e.must(200, "GET", "/v1/threads/kb-1/messages", "erin", nil)
@@ -371,8 +372,9 @@ func TestKnowledgeNumbersSurviveAHandOverOnPostgres(t *testing.T) {
 	}
 	resolved := e.eventsOf(id, "erin", agui.CustomContextResolved)
 	pk := e.eventsOf(id, "erin", agui.CustomContextPackage)
-	// "returns" matched the three blocks (1-3); the search for "refunds" matched one (4); the find, sent again by worker 2, is 5
-	if resolved[0]["numbered"] != float64(3) || len(pk) != 2 || pk[0]["firstIndex"] != float64(4) || pk[0]["itemCount"] != float64(1) || pk[1]["firstIndex"] != float64(5) || pk[1]["itemCount"] != float64(1) {
+	// "returns" matched the three blocks (1-3); the search for "refunds" and the find, sent again by worker 2, meet passages that have their numbers
+	// (2 and 3): no new number is taken, the counter stays at 4 across the hand-over
+	if resolved[0]["numbered"] != float64(3) || len(pk) != 2 || pk[0]["firstIndex"] != float64(4) || pk[0]["itemCount"] != float64(0) || pk[1]["firstIndex"] != float64(4) || pk[1]["itemCount"] != float64(0) {
 		t.Fatalf("%v %v", resolved, pk)
 	}
 	var seen string
@@ -381,7 +383,7 @@ func TestKnowledgeNumbersSurviveAHandOverOnPostgres(t *testing.T) {
 			seen += m.Content
 		}
 	}
-	if !strings.Contains(seen, "[4] Returns policy") || !strings.Contains(seen, "[5] Returns policy") || strings.Count(seen, "[5] Returns policy") != 1 {
+	if !strings.Contains(seen, "[2] Returns policy") || !strings.Contains(seen, "[3] Returns policy") || strings.Contains(seen, "[4] Returns policy") {
 		t.Errorf("%q", seen)
 	}
 	if evs := e.eventsOf(id, "erin", agui.CustomToolInterrupted); len(evs) != 1 || evs[0]["resent"] != true || evs[0]["tool"] != "knowledge__find" {

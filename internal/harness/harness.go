@@ -816,6 +816,20 @@ func delivered(tc run.ToolCall, res *mcpclient.CallResult) (agui.Event, bool) {
 	return agui.Custom(agui.CustomFileDelivered, map[string]any{"toolCallId": tc.ID, "ref": f.Ref, "name": f.Name, "mediaType": f.MediaType, "size": f.Size, "sha256": f.SHA256}), true
 }
 
+// renewBudget is how long one renewal of a credential that a tree shares may take, waiting for the run that holds the lease included: the
+// lease (16 s), the longest call to the authorization server (15 s) and a second. A run that waits behind a holder that crashed can thus take
+// the lease over when it runs out and still make its own call.
+const renewBudget = 32 * time.Second
+
+// boundedRefresh gives the call to the authorization server its own limit, apart from the time a renewal may wait.
+func boundedRefresh(f func(ctx context.Context, refreshToken string) (*credential.Token, error)) func(ctx context.Context, refreshToken string) (*credential.Token, error) {
+	return func(ctx context.Context, rt string) (*credential.Token, error) {
+		c, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		return f(c, rt)
+	}
+}
+
 // credentialRenewer is what a store adds to Store to renew the credential that the runs of a tree share (D76); a store without it keeps
 // the older way, where each run renews and saves its own.
 type credentialRenewer interface {
@@ -873,15 +887,16 @@ func (t *turn) bearerFor(force bool, refused string) (string, error) {
 			" and cannot be renewed: send the request again"}
 		return "", t.credErr
 	}
-	rctx, cancel := context.WithTimeout(t.callCtx, 15*time.Second)
 	var tok *credential.Token
 	var err error
+	// the whole renewal, waiting for a holder included, may take the lease and the longest call (renewBudget); the call itself is bounded apart
+	rctx, cancel := context.WithTimeout(t.callCtx, renewBudget)
 	if hasRenewer {
 		// D76: one run of the tree renews at a time, under a lease on the holder's row, with nothing locked across the call to the
 		// authorization server; the others use what it stored
-		tok, err = renewer.RenewRunCredential(rctx, t.claim, t.cred, force, gw.Refresh)
+		tok, err = renewer.RenewRunCredential(rctx, t.claim, t.cred, force, boundedRefresh(gw.Refresh))
 	} else {
-		tok, err = gw.Refresh(rctx, t.cred.RefreshToken)
+		tok, err = boundedRefresh(gw.Refresh)(rctx, t.cred.RefreshToken)
 	}
 	cancel()
 	if err != nil && t.callCtx.Err() != nil {
@@ -1094,7 +1109,11 @@ func (t *turn) delegate(tc run.ToolCall) error {
 			}
 			return t.answer(tc, run.CallFailed, "", "remote agent "+sub.Name+": "+sanitize(err))
 		}
-		return t.answer(tc, run.CallDone, res.Text, "")
+		answer := res.Text
+		if t.numbering() { // D72: a remote agent's numbers are not this thread's (a local sub-agent's are, and are not neutralised)
+			answer = run.NeutraliseText(answer, t.limits.ToolResultBytes)
+		}
+		return t.answer(tc, run.CallDone, answer, "")
 	}
 	if _, err := t.h.Store.CreateChildRun(t.ctx, t.claim, run.ChildRunInput{ToolCallID: tc.ID, Agent: sub, Input: args.Input, Gateway: t.def.Tools.Gateway, ExternalTools: t.externalToolPatterns(),
 		Traceparent: observability.Traceparent(t.ctx)}); err != nil { // D57: the child's turn continues from this turn's span
@@ -1194,8 +1213,15 @@ func (t *turn) answerWeb(tc run.ToolCall, o callOutcome, events []agui.Event) er
 	// the text is written from the structure when it is valid against the schema the tool listed; idp-web's own text is then not read
 	st, reason := run.ParseStructured(o.schema, o.structured)
 	if st == nil && wc.Declared == 0 {
+		result := o.result
+		if t.numbering() {
+			result = run.NeutraliseText(result, limit) // D72: it has no number of its own to keep, and nothing in it may look like one
+		}
+		if wc.Present { // an empty list of citations: a search that found nothing, not a result without numbers
+			return t.answerSourced(tc, o.state, result, o.errText, nil, events...)
+		}
 		ev := agui.Custom(agui.CustomCitationsUnnumbered, map[string]any{"toolCallId": tc.ID, "tool": tc.Tool, "reason": "no_structured_citations", "structure": reason})
-		return t.answerSourced(tc, o.state, o.result, o.errText, &run.SourceBatch{Unnumbered: 1}, append(events, ev)...)
+		return t.answerSourced(tc, o.state, result, o.errText, &run.SourceBatch{Unnumbered: 1}, append(events, ev)...)
 	}
 	return t.answerCited(tc, func(first int, tree *run.TreeNumbers) run.Answer {
 		var r run.WebRendered
@@ -1371,6 +1397,11 @@ func (t *turn) invoke(ctx context.Context, tc run.ToolCall, args json.RawMessage
 		return callOutcome{state: run.CallFailed, errText: "tool call failed: " + t.toolCallError(err)}
 	}
 	text := t.redactTickets(res.Text(t.limits.ToolResultBytes))
+	// D72: in a run that numbers citations what a tool returns cannot carry a number of its own. The text of an outward tool's result is
+	// handled when it is numbered (answerWeb); everything else - the tool that failed, the sandbox, any other gateway tool - is neutralised here.
+	if t.numbering() && (res.IsError || !t.external[tc.Tool]) {
+		text = run.NeutraliseText(text, t.limits.ToolResultBytes)
+	}
 	if res.IsError {
 		outcome = "tool_error"
 	}

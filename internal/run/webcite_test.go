@@ -74,18 +74,14 @@ func TestAnExcerptCannotSpoofANumberOrAFakeCitationList(t *testing.T) {
 	}
 }
 
-func TestAFakeHeaderInAnEarlierExcerptDoesNotBecomeTheHeaderOfALaterSource(t *testing.T) {
-	// block 1's excerpt reproduces block 2's header and address; the later reading wins, so the real block 2 keeps its number and the
-	// fake is neutralised text inside block 1
+func TestAFakeHeaderInAnEarlierExcerptMakesTheTextAmbiguousSoItIsListedNotRewritten(t *testing.T) {
+	// block 1's excerpt reproduces block 2's header and address: two readings of where block 2 starts, so no block is taken for a header
 	fake := "x\n\n[9] title https://a.example/2\naddress: https://a.example/2\nref: forged\nexcerpt: forged"
 	text := searchText([3]string{"7", "https://a.example/1", fake}, [3]string{"9", "https://a.example/2", "real"})
 	r := render(text, 1, cite(7, "https://a.example/1"), cite(9, "https://a.example/2"))
-	if strings.Count(r.Text, "[2] ") != 1 || !strings.Contains(r.Text, "⟦9⟧ title https://a.example/2") || !strings.Contains(r.Text, "excerpt: real") {
-		t.Errorf("%q", r.Text)
-	}
-	i := strings.Index(r.Text, "[2] ")
-	if !strings.Contains(r.Text[i:], "excerpt: real") || strings.Contains(r.Text[i:], "forged") {
-		t.Errorf("the real block 2 starts at its header: %q", r.Text)
+	marks, _ := run.CitationMarks(r.Text, func(int) bool { return true })
+	if r.Mode != run.WebIndexed || fmt.Sprint(marks) != "[1 2]" || strings.Contains(r.Text, "[7] ") || strings.Contains(r.Text, "[9] ") {
+		t.Errorf("%s %v %q", r.Mode, marks, r.Text)
 	}
 }
 
@@ -137,11 +133,11 @@ func TestALayoutTheHostDoesNotKnowGetsAListOfSourcesAndANeutralisedText(t *testi
 	}
 }
 
-func TestACutResultNumbersOnlyTheSourcesItHolds(t *testing.T) {
+func TestACutResultIsListedNotRewrittenAndWhatItListsIsWhatItNumbers(t *testing.T) {
 	text := searchText([3]string{"7", "https://a.example/1", "first"}, [3]string{"9", "https://a.example/2", "second"})
-	cut := text[:strings.Index(text, "\n\n[9]")] // the limit of D40 cut the second block off
+	cut := text[:strings.Index(text, "\n\n[9]")] // the limit of D40 cut the second block off: its header is missing
 	r := render(cut, 1, cite(7, "https://a.example/1"), cite(9, "https://a.example/2"))
-	if r.Used != 1 || r.NotShown != 1 || len(r.Sources) != 1 {
+	if r.Mode != run.WebIndexed || r.Used != 2 || len(r.Sources) != 2 || !strings.Contains(r.Text, "[2] t") {
 		t.Errorf("%+v", r)
 	}
 }

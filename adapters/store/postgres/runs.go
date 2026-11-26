@@ -34,12 +34,13 @@ type CreateRunInput struct {
 	CMICredential  *credential.Token // the member's CMI credential for the knowledge tools (D68), sealed before storage
 	// CitationNext is the number the run tree's counter starts at (D70): one past the knowledge items the first package numbered, 1 when
 	// it numbered none. Sources are the records of those items. The run is the root of its tree.
-	CitationNext int
-	Sources      []run.Source
-	TraceID      string
-	Traceparent  string // the W3C traceparent of the request, for the worker's turn to continue (D57)
-	ReleaseID    string // the approved release to run; "" = the agent's current release
-	ExecutionRef string // the caller's execution reference (EER), recorded on the run
+	CitationNext  int
+	CitationFirst int // the number the thread's counter was at when the package was numbered; the run is refused if it moved (D70)
+	Sources       []run.Source
+	TraceID       string
+	Traceparent   string // the W3C traceparent of the request, for the worker's turn to continue (D57)
+	ReleaseID     string // the approved release to run; "" = the agent's current release
+	ExecutionRef  string // the caller's execution reference (EER), recorded on the run
 	// D32: the CMI package the run's context came from, and the events that record how it was
 	// resolved (or why it was skipped), appended right after RUN_STARTED
 	ContextPackageID string
@@ -281,8 +282,8 @@ func (s *Store) CreateRun(ctx context.Context, tenant string, in CreateRunInput)
 				ctxPkg = in.ContextPackageID
 			}
 			if _, err := tx.Exec(ctx, `INSERT INTO runs (tenant_id, id, thread_id, agent_id, release_id, release_digest, owner, status, idempotency_key, request_sha256, input,
-			credential, credential_expires_at, trace_id, deadline_at, execution_ref, context_package_id, file_tickets, credential_refresh, traceparent, cmi_credential, request_raw_sha256, tokens_used, citation_next) VALUES ($1, $2, $3, $4, $5, $6, $7, 'QUEUED', $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, nullif($21, ''), $22, $23)`,
-				tenant, runID, threadID, a.ID, releaseID, env.Digest, in.Owner, in.IdempotencyKey, hash, inputRaw, cred, credExp, trace, deadline, execRef, ctxPkg, tickets, credRefresh, traceparent, cmiCred, in.RawHash, rewriteTokens(in.RewriteUsage), max(in.CitationNext, 1)); err != nil {
+			credential, credential_expires_at, trace_id, deadline_at, execution_ref, context_package_id, file_tickets, credential_refresh, traceparent, cmi_credential, request_raw_sha256, tokens_used) VALUES ($1, $2, $3, $4, $5, $6, $7, 'QUEUED', $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, nullif($21, ''), $22)`,
+				tenant, runID, threadID, a.ID, releaseID, env.Digest, in.Owner, in.IdempotencyKey, hash, inputRaw, cred, credExp, trace, deadline, execRef, ctxPkg, tickets, credRefresh, traceparent, cmiCred, in.RawHash, rewriteTokens(in.RewriteUsage)); err != nil {
 				if isUniqueViolation(err) {
 					if strings.Contains(constraintOf(err), "idempotency") {
 						return errRetry // the same request raced; the retry replays it
@@ -291,9 +292,21 @@ func (s *Store) CreateRun(ctx context.Context, tenant string, in CreateRunInput)
 				}
 				return err
 			}
-			if len(in.Sources) > 0 { // D70: the knowledge items of the first package that were numbered
-				if err := saveSources(ctx, tx, tenant, runID, &run.SourceSet{Items: in.Sources}); err != nil {
+			if in.CitationNext > 0 { // D70: the first package was numbered: the thread's counter moves past its numbers
+				next, known, err := lockCounter(ctx, tx, tenant, threadID)
+				if err != nil {
 					return err
+				}
+				if next != max(in.CitationFirst, 1) {
+					return fail("CONFLICT", "the thread's citation numbers moved while the request was handled; send it again")
+				}
+				if err := moveCounter(ctx, tx, tenant, threadID, in.CitationNext, known, in.Sources); err != nil {
+					return err
+				}
+				if len(in.Sources) > 0 {
+					if err := saveSources(ctx, tx, tenant, runID, &run.SourceSet{Items: in.Sources}); err != nil {
+						return err
+					}
 				}
 			}
 			if u := in.RewriteUsage; u != nil {
@@ -1354,11 +1367,15 @@ func (s *Store) SaveCredential(ctx context.Context, c *run.Claim, tok *credentia
 		return err
 	}
 	return s.InTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
-		if _, err := s.owned(ctx, tx, c); err != nil {
-			return err
-		}
+		// the holder's row first, then the run's own (owned): the order of every other transaction that needs both
 		holder, err := holderOf(ctx, tx, gatewayKind, c.RunID)
 		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `SELECT 1 FROM runs WHERE id = $1 FOR UPDATE`, holder); err != nil {
+			return err
+		}
+		if _, err := s.owned(ctx, tx, c); err != nil {
 			return err
 		}
 		_, err = tx.Exec(ctx, `UPDATE runs SET `+set+` WHERE id = $1`, append([]any{holder}, args...)...)

@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"time"
 
 	"idp-host/internal/agent"
@@ -129,22 +130,50 @@ type Answer struct {
 // compute: no call to another service, no wait, and it may be called more than once.
 type CiteFunc func(first int, tree *TreeNumbers) (Answer, error)
 
-// TreeNumbers is what the run tree has already numbered that a later result may share: a web address read again keeps its number.
+// TreeNumbers is what the thread's counter already numbered that a later result may share (D70, D71, D73): a web address read again
+// and a knowledge passage met again keep their numbers.
 type TreeNumbers struct {
-	// Web maps the number idp-web gave an address to the source the HOST numbered for it.
-	Web map[int]Source
+	// Known maps WebKey and KnowledgeKey to the number the HOST gave.
+	Known map[string]int
 }
 
-// KnownWeb returns the HOST's number for the address idp-web numbered webN, when the tree has numbered it already.
+// WebKey is the key of a web source in TreeNumbers: idp-web's number for the address and the address.
+func WebKey(webN int, url string) string { return "w:" + strconv.Itoa(webN) + ":" + url }
+
+// KnowledgeKey is the key of a knowledge passage: the document and the place in it.
+func KnowledgeKey(documentID, where string) string { return "k:" + documentID + "\x1f" + where }
+
+// KnownWeb returns the HOST's number for the address idp-web numbered webN, when the thread has numbered it already.
 func (t *TreeNumbers) KnownWeb(webN int, url string) (int, bool) {
 	if t == nil {
 		return 0, false
 	}
-	s, ok := t.Web[webN]
-	if !ok || s.URL != url {
+	n, ok := t.Known[WebKey(webN, url)]
+	return n, ok
+}
+
+// KnownKnowledge returns the number of a passage the thread has numbered already (same document, same place). A passage with no place is
+// never known: two of them are not the same passage.
+func (t *TreeNumbers) KnownKnowledge(documentID, where string) (int, bool) {
+	if t == nil || where == "" {
 		return 0, false
 	}
-	return s.N, true
+	n, ok := t.Known[KnowledgeKey(documentID, where)]
+	return n, ok
+}
+
+// KnownOf lists what the sources of an answer add to the known numbers of the thread.
+func KnownOf(items []Source) map[string]int {
+	out := map[string]int{}
+	for _, s := range items {
+		switch {
+		case s.Kind == KindKnowledge && s.DocumentID != "" && s.Where != "":
+			out[KnowledgeKey(s.DocumentID, s.Where)] = s.N
+		case s.Kind != KindKnowledge && s.WebN > 0 && s.URL != "":
+			out[WebKey(s.WebN, s.URL)] = s.N
+		}
+	}
+	return out
 }
 
 // ErrCMICredentialUnusable: the run has a member credential for the CMI that cannot be used (it cannot be opened, or renewed). The
@@ -223,8 +252,12 @@ type Input struct {
 	// CitationNext and CitedSources carry from the resolution of the first package to the creation of the run (D70): the number the
 	// run tree's counter starts at, and the records of the knowledge items the package numbered. They are not part of the input that is
 	// stored or hashed.
-	CitationNext int      `json:"-"`
-	CitedSources []Source `json:"-"`
+	CitationNext  int      `json:"-"`
+	CitationFirst int      `json:"-"`
+	CitedSources  []Source `json:"-"`
+	// ContextNumbered: the first package of the run was numbered (D69-15), even if it had no knowledge item to give a number to, so a
+	// refresh of it numbers what it brings in and neutralises it (D70). Stored with the run; not part of the contract.
+	ContextNumbered bool `json:"contextNumbered,omitempty"`
 }
 
 // ToolExecutionCaller: the caller executes every tool. The run offers the model only the caller's
@@ -259,16 +292,18 @@ type Run struct {
 	ContextPackageID string    `json:"contextPackageId,omitempty"` // the CMI package the run's context came from (D32)
 	// D49: the web sources the run's tools returned, by number, and the numbers the final answer cites that are not among
 	// them. Data about the run for the member to check an answer against; never given to a model.
-	Sources             []Source  `json:"sources,omitempty"`
-	UnverifiedCitations []int     `json:"unverifiedCitations,omitempty"`
-	EvaluationID        string    `json:"-"`
-	CredentialExpiresAt time.Time `json:"-"`
-	TraceID             string    `json:"traceId,omitempty"`
-	Traceparent         string    `json:"-"` // the W3C traceparent of the request that created the run; the worker's turn continues it (D57)
-	DeadlineAt          time.Time `json:"deadlineAt"`
-	CreatedAt           time.Time `json:"createdAt"`
-	StartedAt           time.Time `json:"startedAt,omitzero"`
-	FinishedAt          time.Time `json:"finishedAt,omitzero"`
+	Sources             []WebSource       `json:"sources,omitempty"`
+	KnowledgeSources    []KnowledgeSource `json:"knowledgeSources,omitempty"` // D75: the knowledge passages the run's tree numbered, in a list of their own
+	UnverifiedCitations []int             `json:"unverifiedCitations,omitempty"`
+	UnlistedCitations   []int             `json:"unlistedCitations,omitempty"` // cited, given by the tree, but not in either list
+	EvaluationID        string            `json:"-"`
+	CredentialExpiresAt time.Time         `json:"-"`
+	TraceID             string            `json:"traceId,omitempty"`
+	Traceparent         string            `json:"-"` // the W3C traceparent of the request that created the run; the worker's turn continues it (D57)
+	DeadlineAt          time.Time         `json:"deadlineAt"`
+	CreatedAt           time.Time         `json:"createdAt"`
+	StartedAt           time.Time         `json:"startedAt,omitzero"`
+	FinishedAt          time.Time         `json:"finishedAt,omitzero"`
 }
 
 // Event is one persisted AG-UI event of a run.
